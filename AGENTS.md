@@ -56,8 +56,46 @@ reintroduces it.
   scroll-hijacking).
 - `apps/desktop/src-tauri` — "Cubo Core": Tauri shell, axum bridge on port
   8765, rqbit torrent engine, ffmpeg remux pipeline (`transcode.rs`).
+- `apps/site` — standalone marketing site (cubo.spheceo.com, Vercel project
+  `cubo-site`). Deliberately has NO workspace dependencies so it deploys in
+  isolation.
 - `packages/core` — shared TypeScript types + TMDB/Torrentio client.
 - `packages/ui` — shared presentational components and theme tokens.
+
+## Releases and auto-updates
+
+The repo is public and MIT licensed; releases are GitHub Releases on this
+repo, built by `.github/workflows/release.yml`.
+
+- **Release ritual:** bump `version` in
+  `apps/desktop/src-tauri/tauri.conf.json`, `Cargo.toml`, and
+  `apps/desktop/package.json` (keep them identical), commit, then
+  `git tag vX.Y.Z && git push origin vX.Y.Z`. CI builds macOS (Apple Silicon +
+  Intel) and Windows installers, signs updater artifacts, publishes the
+  release with `latest.json`, and uploads stable-named download aliases
+  (`cubo-macos-apple-silicon.dmg`, `cubo-macos-intel.dmg`,
+  `cubo-windows-x64-setup.exe`) that the marketing site links to.
+- **Auto-updater:** `tauri-plugin-updater` polls
+  `releases/latest/download/latest.json` (endpoint + pubkey in
+  tauri.conf.json). The private signing key lives outside the repo
+  (`~/.tauri/cubo_updater.key` on the maintainer machine) and in the Actions
+  secrets `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+  Losing it means shipped apps can never update again — guard it. The in-app
+  UI is `apps/web/components/update-banner.tsx` (desktop runtime only).
+- **ffmpeg sidecars:** `node apps/desktop/scripts/fetch-ffmpeg.mjs` downloads
+  static ffmpeg/ffprobe into `src-tauri/binaries/` (gitignored) with
+  target-triple names; `bundle.externalBin` packs them next to the app binary,
+  where `transcode.rs::find_tool` looks first. Run it before any local
+  `tauri build`. The static builds are GPL — fine to distribute as separate
+  subprocess executables alongside MIT Cubo, never link them.
+
+## Parked work
+
+- **Captions/subtitles in the player need timing alignment work**: external
+  subtitle tracks are timed against the original file, but remuxed HLS
+  playlists start at a seek offset (`timeOffset`), so cues must be shifted by
+  that offset (and validated against the audio) before subtitles feel right on
+  remuxed sources. Not started yet — deliberately.
 
 ## Verification commands
 
