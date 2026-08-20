@@ -247,6 +247,23 @@ main {
   color: var(--faint);
 }
 
+.fine-print p {
+  margin: 0 0 0.75rem;
+}
+
+.command {
+  display: inline-block;
+  margin: 0 0 0.9rem;
+  padding: 0.55rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  color: var(--muted);
+  user-select: all;
+}
+
 footer {
   display: flex;
   flex-wrap: wrap;
