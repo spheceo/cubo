@@ -1,101 +1,108 @@
 import type { MediaSummary } from '@cubo/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { IoChevronBack, IoChevronForward } from 'react-icons/io5';
 import type { LinkComponent } from './link';
 import { MediaCard } from './media-card';
+
+const CARD_WIDTH = 'w-[38vw] shrink-0 sm:w-[24vw] md:w-[14vw] xl:w-[11vw]';
 
 export function SectionRow({
   title,
   items,
   hrefFor,
   linkComponent,
+  limit = 12,
 }: {
   title: string;
   items: MediaSummary[];
   hrefFor: (item: MediaSummary) => string;
   linkComponent?: LinkComponent;
+  limit?: number;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
-  const [atStart, setAtStart] = useState(true);
-  const [atEnd, setAtEnd] = useState(true);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
 
   const sync = useCallback(() => {
     const el = scroller.current;
     if (!el) return;
-    setAtStart(el.scrollLeft <= 1);
-    setAtEnd(el.scrollLeft + el.clientWidth >= el.scrollWidth - 1);
+    setCanScrollLeft(el.scrollLeft > 4);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 4);
   }, []);
 
   useEffect(() => {
-    sync();
-    window.addEventListener('resize', sync);
-    return () => window.removeEventListener('resize', sync);
-  }, [sync, items]);
-
-  function page(direction: -1 | 1) {
     const el = scroller.current;
     if (!el) return;
-    el.scrollBy({ left: direction * el.clientWidth * 0.8, behavior: 'smooth' });
+    sync();
+    el.addEventListener('scroll', sync, { passive: true });
+    const observer = new ResizeObserver(sync);
+    observer.observe(el);
+    return () => {
+      el.removeEventListener('scroll', sync);
+      observer.disconnect();
+    };
+  }, [sync]);
+
+  function page(direction: 'left' | 'right') {
+    const el = scroller.current;
+    if (!el) return;
+    const amount = el.clientWidth * 0.75;
+    el.scrollBy({ left: direction === 'left' ? -amount : amount, behavior: 'smooth' });
   }
 
   if (items.length === 0) return null;
 
   return (
-    <section className="group/row">
-      <div className="mb-4 flex items-center justify-between gap-4 sm:mb-5">
-        <h2 className="text-base font-medium tracking-[-0.015em] text-fg sm:text-lg">
-          {title}
-        </h2>
-        <div className="hidden items-center gap-1.5 opacity-0 transition-opacity duration-200 group-hover/row:opacity-100 focus-within:opacity-100 sm:flex">
-          <ScrollButton direction={-1} disabled={atStart} onClick={page} />
-          <ScrollButton direction={1} disabled={atEnd} onClick={page} />
-        </div>
-      </div>
+    <section className="space-y-5">
+      <h2 className="text-3xl font-bold">{title}</h2>
 
-      <div className="relative">
-        <div
-          ref={scroller}
-          onScroll={sync}
-          className="no-scrollbar -mx-5 flex snap-x snap-mandatory gap-3 overflow-x-auto px-5 pb-3 sm:-mx-2 sm:gap-4 sm:px-2"
-        >
-          {items.map((item) => (
-            <div key={`${item.mediaType}-${item.id}`} className="snap-start">
-              <MediaCard item={item} href={hrefFor(item)} linkComponent={linkComponent} />
-            </div>
+      <div className="group/row relative">
+        <ScrollEdge direction="left" enabled={canScrollLeft} onClick={page} />
+
+        <div ref={scroller} className="no-scrollbar flex gap-3 overflow-x-auto pb-2">
+          {items.slice(0, limit).map((item) => (
+            <MediaCard
+              key={`${item.mediaType}-${item.id}`}
+              item={item}
+              href={hrefFor(item)}
+              linkComponent={linkComponent}
+              className={CARD_WIDTH}
+            />
           ))}
         </div>
+
+        <ScrollEdge direction="right" enabled={canScrollRight} onClick={page} />
       </div>
     </section>
   );
 }
 
-function ScrollButton({
+function ScrollEdge({
   direction,
-  disabled,
+  enabled,
   onClick,
 }: {
-  direction: -1 | 1;
-  disabled: boolean;
-  onClick: (direction: -1 | 1) => void;
+  direction: 'left' | 'right';
+  enabled: boolean;
+  onClick: (direction: 'left' | 'right') => void;
 }) {
+  const left = direction === 'left';
+
   return (
     <button
       type="button"
-      aria-label={direction === -1 ? 'Scroll left' : 'Scroll right'}
-      disabled={disabled}
+      aria-label={left ? 'Scroll left' : 'Scroll right'}
       onClick={() => onClick(direction)}
-      className="flex size-8 cursor-pointer items-center justify-center rounded-full border border-line text-muted transition hover:border-line-strong hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:border-line disabled:hover:text-muted"
+      className={`absolute top-0 z-10 hidden h-full w-28 cursor-pointer items-center transition-opacity duration-200 md:flex ${
+        left ? '-left-4 justify-start pl-1' : '-right-4 justify-end pr-1'
+      } ${enabled ? 'opacity-0 group-hover/row:opacity-100' : 'pointer-events-none opacity-0'}`}
+      style={{
+        background: `linear-gradient(to ${left ? 'right' : 'left'}, var(--color-background) 30%, transparent)`,
+      }}
     >
-      <svg
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className={`size-3.5 ${direction === -1 ? 'rotate-180' : ''}`}
-      >
-        <path d="M6 3.5 10.5 8 6 12.5" />
-      </svg>
+      <span className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-white/[0.08] text-white backdrop-blur-sm transition-colors hover:bg-white/[0.14]">
+        {left ? <IoChevronBack size={18} /> : <IoChevronForward size={18} />}
+      </span>
     </button>
   );
 }

@@ -1,17 +1,28 @@
+/**
+ * Cubo's video player. Part of the verified-working playback pipeline
+ * (see AGENTS.md) — two properties here are load-bearing:
+ *
+ * 1. Remuxed (HLS) sources always play through hls.js, never the native HLS
+ *    stack, because native players treat Core's growing playlist as live.
+ * 2. All displayed, reported, and sought positions are ABSOLUTE movie time:
+ *    a remux playlist starts `timeOffset` seconds into the source, and seeks
+ *    outside the converted window hand off to `onSeekOutside` so the owner
+ *    can restart the converter at the target.
+ */
 import {
-  ArrowClockwise,
-  ArrowCounterClockwise,
-  CaretLeft,
-  GearSix,
-  Pause,
-  PictureInPicture,
-  Play,
-  SpeakerHigh,
-  SpeakerLow,
-  SpeakerSlash,
-  CornersIn,
-  CornersOut,
-} from '@phosphor-icons/react';
+  IoContract,
+  IoExpand,
+  IoPause,
+  IoPlay,
+  IoPlayBack,
+  IoPlayForward,
+  IoSettingsSharp,
+  IoTabletLandscape,
+  IoVolumeHigh,
+  IoVolumeLow,
+  IoVolumeMute,
+} from 'react-icons/io5';
+import { IoIosArrowBack } from 'react-icons/io';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from '@/components/link';
 import { LogoLoader } from './logo-loader';
@@ -35,6 +46,9 @@ export type PlayerSubtitle = {
 
 export function VideoPlayer({
   src,
+  hls = false,
+  durationHint = null,
+  timeOffset = 0,
   title,
   subtitle,
   logoPath,
@@ -44,9 +58,17 @@ export function VideoPlayer({
   activeSubtitleId,
   initialTime = 0,
   onPlaybackProgress,
+  onSeekOutside,
   onError,
 }: {
   src: string;
+  /** True when `src` is an HLS playlist from Core's remux pipeline. */
+  hls?: boolean;
+  /** Full source duration reported by Core while a growing HLS playlist is incomplete. */
+  durationHint?: number | null;
+  /** Seconds into the source where this HLS playlist begins (seek restart).
+   *  All reported and displayed times are offset by this amount. */
+  timeOffset?: number;
   title: string;
   subtitle: string | null;
   logoPath: string | null;
@@ -61,6 +83,9 @@ export function VideoPlayer({
     watchedDeltaSeconds: number,
     sessionStarted: boolean,
   ) => void;
+  /** Called with an absolute target when a seek lands outside the converted
+   *  window, so the owner can restart the converter at that position. */
+  onSeekOutside?: (absoluteSeconds: number) => void;
   onError: () => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -92,6 +117,70 @@ export function VideoPlayer({
   const [pipSupported, setPipSupported] = useState(false);
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
+
+  // Callbacks and the offset live in refs so the media-source effect and the
+  // stable seek helpers never go stale or rerun on unrelated renders.
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const onSeekOutsideRef = useRef(onSeekOutside);
+  onSeekOutsideRef.current = onSeekOutside;
+  const timeOffsetRef = useRef(timeOffset);
+  timeOffsetRef.current = timeOffset;
+
+  const resolveDuration = useCallback(
+    (video: HTMLVideoElement) => {
+      if (hls && durationHint && Number.isFinite(durationHint)) return durationHint;
+      if (Number.isFinite(video.duration) && video.duration > 0) return video.duration;
+      return durationHint && Number.isFinite(durationHint) ? durationHint : 0;
+    },
+    [durationHint, hls],
+  );
+
+  useEffect(() => {
+    setDuration(hls && durationHint && Number.isFinite(durationHint) ? durationHint : 0);
+    setCurrentTime(0);
+    setBufferedRanges([]);
+    setWaiting(true);
+  }, [src, hls, durationHint]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (!hls) {
+      video.src = src;
+      return () => {
+        video.removeAttribute('src');
+      };
+    }
+
+    // Remuxed sources ALWAYS go through hls.js — never the native HLS stack.
+    // Core's playlist grows while ffmpeg works, and native players (Safari,
+    // WKWebView in the desktop app) treat a growing playlist as a live
+    // broadcast: play() snaps to the live edge and seeking is confined to a
+    // sliding window. hls.js with an explicit startPosition keeps normal
+    // video-on-demand behaviour.
+    let cancelled = false;
+    let instance: import('hls.js').default | null = null;
+    void import('hls.js').then(({ default: Hls }) => {
+      if (cancelled) return;
+      if (!Hls.isSupported()) {
+        onErrorRef.current();
+        return;
+      }
+      instance = new Hls({ startPosition: 0 });
+      instance.loadSource(src);
+      instance.attachMedia(video);
+      instance.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) onErrorRef.current();
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      instance?.destroy();
+    };
+  }, [src, hls]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -128,16 +217,23 @@ export function VideoPlayer({
   const reportPlayback = useCallback(
     (sessionStarted = false) => {
       const video = videoRef.current;
-      if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
+      if (!video) return;
+      const fullDuration = resolveDuration(video);
+      if (fullDuration <= 0) return;
       const now = performance.now();
       const watchedDelta = lastProgressWallTime.current
         ? Math.min(30, Math.max(0, (now - lastProgressWallTime.current) / 1000))
         : 0;
       lastProgressWallTime.current = video.paused ? 0 : now;
       lastProgressReport.current = now;
-      onPlaybackProgress(video.currentTime, video.duration, watchedDelta, sessionStarted);
+      onPlaybackProgress(
+        timeOffsetRef.current + video.currentTime,
+        fullDuration,
+        watchedDelta,
+        sessionStarted,
+      );
     },
-    [onPlaybackProgress],
+    [onPlaybackProgress, resolveDuration],
   );
 
   useEffect(() => {
@@ -159,12 +255,40 @@ export function VideoPlayer({
     }
   }, []);
 
+  /** Seeks to an absolute source position. Inside the converted window it is
+   *  an ordinary seek; outside it (with slack near the frontier, where waiting
+   *  a moment is faster than restarting ffmpeg) the owner restarts the
+   *  converter at the target — no more clamping to a spot before the target
+   *  and hanging there. */
+  const seekToAbsolute = useCallback(
+    (absoluteSeconds: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const offset = timeOffsetRef.current;
+      const local = absoluteSeconds - offset;
+      const seekable = video.seekable;
+
+      if (hls && onSeekOutsideRef.current && seekable.length > 0) {
+        const seekableStart = seekable.start(0);
+        const seekableEnd = seekable.end(seekable.length - 1);
+        if (local < seekableStart - 1 || local > seekableEnd + 10) {
+          onSeekOutsideRef.current(Math.max(0, absoluteSeconds));
+          return;
+        }
+      }
+      video.currentTime = clampToSeekable(video, local);
+    },
+    [hls],
+  );
+
   const seekBy = useCallback((seconds: number) => {
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = Math.max(0, Math.min(video.duration || 0, video.currentTime + seconds));
+    const fullDuration = resolveDuration(video);
+    const absolute = timeOffsetRef.current + video.currentTime + seconds;
+    seekToAbsolute(Math.max(0, Math.min(fullDuration || Infinity, absolute)));
     revealControls();
-  }, [revealControls]);
+  }, [resolveDuration, revealControls, seekToAbsolute]);
 
   const toggleFullscreen = useCallback(() => {
     if (document.fullscreenElement) void document.exitFullscreen();
@@ -186,7 +310,15 @@ export function VideoPlayer({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return;
+      if (
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        target?.closest('button, a, input, select, textarea, [contenteditable="true"], [role="button"]')
+      ) {
+        return;
+      }
 
       const video = videoRef.current;
       if (!video) return;
@@ -245,8 +377,10 @@ export function VideoPlayer({
 
   function commitSeek(ratio: number) {
     const video = videoRef.current;
-    if (!video || !Number.isFinite(video.duration)) return;
-    video.currentTime = ratio * video.duration;
+    if (!video) return;
+    const fullDuration = resolveDuration(video);
+    if (fullDuration <= 0) return;
+    seekToAbsolute(ratio * fullDuration);
   }
 
   function scheduleScrub(ratio: number) {
@@ -260,7 +394,7 @@ export function VideoPlayer({
     });
   }
 
-  const shownTime = scrubTime ?? currentTime;
+  const shownTime = scrubTime ?? timeOffset + currentTime;
   const playedRatio = duration ? Math.min(1, shownTime / duration) : 0;
   const volumeLevel = muted || volume === 0 ? 'muted' : volume < 0.5 ? 'low' : 'high';
 
@@ -275,7 +409,6 @@ export function VideoPlayer({
     >
       <video
         ref={videoRef}
-        src={src}
         autoPlay
         playsInline
         crossOrigin="anonymous"
@@ -310,8 +443,13 @@ export function VideoPlayer({
         onProgress={(event) => syncBuffered(event.currentTarget)}
         onDurationChange={(event) => {
           const video = event.currentTarget;
-          setDuration(video.duration || 0);
-          if (!initialSeekApplied.current && initialTime > 5 && video.duration > initialTime) {
+          const fullDuration = resolveDuration(video);
+          setDuration(fullDuration);
+          // Direct sources know their full duration up front, so the resume
+          // seek is safe here. HLS resume is handled once by the playlist
+          // loader — reacting to growing durations here caused playback to
+          // suddenly jump forward mid-watch.
+          if (!hls && !initialSeekApplied.current && initialTime > 5 && fullDuration > initialTime) {
             initialSeekApplied.current = true;
             video.currentTime = initialTime;
           }
@@ -348,8 +486,8 @@ export function VideoPlayer({
           aria-label="Play"
           className="absolute inset-0 flex cursor-pointer items-center justify-center bg-black/40"
         >
-          <span className="flex size-20 items-center justify-center rounded-full border border-white/20 bg-black/50 text-white backdrop-blur-sm transition hover:bg-black/70">
-            <Play weight="fill" className="ml-1 size-8" />
+          <span className="flex size-20 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-md transition-colors hover:bg-black/75">
+            <IoPlay size={34} className="ml-1" />
           </span>
         </button>
       ) : null}
@@ -362,13 +500,15 @@ export function VideoPlayer({
       >
         <Link
           href={backHref}
-          className="pointer-events-auto flex min-w-0 items-center gap-3 text-white/80 transition-colors hover:text-white"
+          className="pointer-events-auto flex min-w-0 items-center gap-4 text-white transition-colors hover:text-white/80"
         >
-          <CaretLeft className="size-5 shrink-0" />
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-black/55 backdrop-blur-md">
+            <IoIosArrowBack size={22} />
+          </span>
           <span className="min-w-0">
-            <span className="block truncate text-sm font-medium">{title}</span>
+            <span className="block truncate font-semibold">{title}</span>
             {subtitle ? (
-              <span className="block truncate text-[0.72rem] text-white/45">{subtitle}</span>
+              <span className="block truncate text-sm text-white/45">{subtitle}</span>
             ) : null}
           </span>
         </Link>
@@ -413,8 +553,8 @@ export function VideoPlayer({
           <div ref={barRef} className="relative h-[3px] w-full rounded-full bg-white/15">
             {duration > 0
               ? bufferedRanges.map((range, index) => {
-                  const start = Math.max(0, Math.min(1, range.start / duration));
-                  const end = Math.max(start, Math.min(1, range.end / duration));
+                  const start = Math.max(0, Math.min(1, (range.start + timeOffset) / duration));
+                  const end = Math.max(start, Math.min(1, (range.end + timeOffset) / duration));
                   return (
                     <span
                       key={`${range.start}-${range.end}-${index}`}
@@ -450,24 +590,24 @@ export function VideoPlayer({
 
         <div className="flex items-center gap-1.5 sm:gap-2.5">
           <ControlButton label={playing ? 'Pause' : 'Play'} onClick={togglePlay}>
-            {playing ? <Pause weight="fill" className="size-5" /> : <Play weight="fill" className="size-5" />}
+            {playing ? <IoPause size={21} /> : <IoPlay size={21} />}
           </ControlButton>
 
           <ControlButton label="Back 10 seconds" onClick={() => seekBy(-SKIP_SECONDS)}>
-            <ArrowCounterClockwise className="size-5" />
+            <IoPlayBack size={21} />
           </ControlButton>
           <ControlButton label="Forward 10 seconds" onClick={() => seekBy(SKIP_SECONDS)}>
-            <ArrowClockwise className="size-5" />
+            <IoPlayForward size={21} />
           </ControlButton>
 
           <div className="group/vol flex items-center gap-2">
             <ControlButton label={muted ? 'Unmute' : 'Mute'} onClick={toggleMute}>
               {volumeLevel === 'muted' ? (
-                <SpeakerSlash className="size-5" />
+                <IoVolumeMute size={21} />
               ) : volumeLevel === 'low' ? (
-                <SpeakerLow className="size-5" />
+                <IoVolumeLow size={21} />
               ) : (
-                <SpeakerHigh className="size-5" />
+                <IoVolumeHigh size={21} />
               )}
             </ControlButton>
             <input
@@ -525,7 +665,7 @@ export function VideoPlayer({
             </div>
 
             <ControlButton label="Playback settings" onClick={onOpenSettings}>
-              <GearSix className="size-5" />
+              <IoSettingsSharp size={20} />
             </ControlButton>
 
             {pipSupported ? (
@@ -538,7 +678,7 @@ export function VideoPlayer({
                   else void video.requestPictureInPicture().catch(() => undefined);
                 }}
               >
-                <PictureInPicture className="size-5" />
+                <IoTabletLandscape size={21} />
               </ControlButton>
             ) : null}
 
@@ -546,13 +686,24 @@ export function VideoPlayer({
               label={fullscreen ? 'Exit full screen' : 'Full screen'}
               onClick={toggleFullscreen}
             >
-              {fullscreen ? <CornersIn className="size-5" /> : <CornersOut className="size-5" />}
+              {fullscreen ? <IoContract size={21} /> : <IoExpand size={21} />}
             </ControlButton>
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+/** Keeps a seek target inside what the source can actually serve. Direct
+ *  streams are fully seekable so this is a no-op; on a growing HLS playlist it
+ *  lands the seek at the conversion frontier instead of being ignored. */
+function clampToSeekable(video: HTMLVideoElement, target: number): number {
+  const seekable = video.seekable;
+  if (seekable.length === 0) return target;
+  const start = seekable.start(0);
+  const end = seekable.end(seekable.length - 1);
+  return Math.max(start, Math.min(target, Math.max(start, end - 0.5)));
 }
 
 function ControlButton({

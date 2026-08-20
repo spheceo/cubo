@@ -1,60 +1,153 @@
-import {
-  backdropUrl,
-  titleHref,
-  watchHref,
-  type MediaDetails,
-} from '@cubo/core';
-import { Info, Play } from '@phosphor-icons/react';
-import { useRef } from 'react';
+import { backdropUrl, titleHref, watchHref, type MediaDetails } from '@cubo/core';
+import gsap from 'gsap';
+import { useEffect, useRef, useState } from 'react';
+import { IoMdInformationCircleOutline } from 'react-icons/io';
+import { IoPlay } from 'react-icons/io5';
 import { Link } from '@/components/link';
-import { WatchLaterButton } from './watch-later-button';
 import { watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
+import { WatchLaterButton } from './watch-later-button';
 
-export function FeaturedHero({ item }: { item: MediaDetails }) {
-  const heroRef = useRef<HTMLElement>(null);
-  const image = backdropUrl(item.backdropPath, 'original');
-  const year = item.releaseDate.slice(0, 4);
-  const kind = item.mediaType === 'tv' ? 'TV Show' : 'Film';
+function formatRuntime(minutes: number | null): string | null {
+  if (!minutes) return null;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return `${hours > 0 ? `${hours}h ` : ''}${rest > 0 ? `${rest}m` : ''}`.trim();
+}
+
+/** Kino splits titles on a colon so the subtitle carries the display weight. */
+function HeroTitle({ title }: { title: string }) {
+  const [main, ...rest] = title.split(':');
+
+  if (rest.length === 0) {
+    return <h1 className="text-5xl font-bold sm:text-7xl lg:text-8xl">{title}</h1>;
+  }
 
   return (
-    <section ref={heroRef} className="relative isolate flex min-h-[42rem] items-end overflow-hidden bg-black sm:min-h-[48rem] lg:min-h-[min(92vh,58rem)]">
-      {image ? (
-        <img src={image} alt="" fetchPriority="high" className="absolute inset-0 -z-30 h-full w-full object-cover object-center" />
-      ) : null}
-      <AutoPreview item={item} />
+    <div className="flex-col font-bold">
+      <h3 className="text-2xl sm:text-3xl">{main} :</h3>
+      <h1 className="text-5xl sm:text-7xl lg:text-8xl">{rest.join(':').trim()}</h1>
+    </div>
+  );
+}
 
-      <div className="absolute inset-0 -z-10 bg-linear-to-t from-black via-black/55 to-black/12" />
-      <div className="absolute inset-0 -z-10 bg-linear-to-r from-black/88 via-black/24 to-black/5" />
-      <div className="absolute inset-x-0 bottom-0 -z-10 h-40 bg-linear-to-t from-ink to-transparent" />
+export function FeaturedHero({ item }: { item: MediaDetails }) {
+  const artworkRef = useRef<HTMLImageElement>(null);
+  const detailsRef = useRef<HTMLDivElement>(null);
+  const descriptionRef = useRef<HTMLDivElement>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const hasPreviewed = useRef(false);
+  const image = backdropUrl(item.backdropPath, 'w1280');
+  const year = item.releaseDate.slice(0, 4);
+  const kind = item.mediaType === 'tv' ? 'Featured Show' : 'Featured Movie';
+  const firstSeason = item.mediaType === 'tv' ? (item.seasons[0]?.seasonNumber ?? 1) : undefined;
+  const playHref =
+    item.mediaType === 'tv' ? watchHref(item, firstSeason ?? 1, 1) : watchHref(item);
 
-      <div className="shell w-full pb-16 pt-36 sm:pb-20 lg:pb-24">
-        <div className="max-w-3xl">
-          <p className="flex items-center gap-2.5 text-[0.68rem] font-medium uppercase tracking-[0.15em] text-white/55">
-            <span className="size-1.5 rounded-full bg-accent" />
-            Featured {kind.toLowerCase()}
-          </p>
-          <h1 className="mt-5 text-balance text-5xl font-semibold leading-[0.94] tracking-[-0.065em] text-white sm:text-7xl lg:text-[6.75rem]">
-            {item.title}
-          </h1>
-          <p className="mt-6 text-sm font-medium text-white/65">
-            {year} <span className="mx-2 text-white/25">·</span> {kind}
-          </p>
-          <p className="mt-5 line-clamp-3 max-w-xl text-sm leading-relaxed text-white/62 sm:text-[0.98rem]">
-            {item.overview}
-          </p>
-          <div className="mt-8 flex flex-wrap items-center gap-3">
-            <Link href={watchHref(item)} className="inline-flex items-center gap-2.5 rounded-full bg-white px-6 py-3 text-sm font-semibold text-black transition duration-300 hover:scale-[1.02] hover:bg-accent">
-              <Play weight="fill" className="size-3.5" />
-              Watch now
-            </Link>
-            <WatchLaterButton item={watchLaterItem(item)} iconOnly />
-            <Link href={titleHref(item)} aria-label={`More information about ${item.title}`} className="inline-flex size-11 items-center justify-center rounded-full border border-white/14 bg-white/8 text-white/80 backdrop-blur-md transition hover:border-white/30 hover:bg-white/14 hover:text-white">
-              <Info className="size-5" />
-            </Link>
+  const details = [
+    year,
+    item.mediaType === 'tv'
+      ? item.numberOfSeasons
+        ? `${item.numberOfSeasons} ${item.numberOfSeasons === 1 ? 'Season' : 'Seasons'}`
+        : null
+      : formatRuntime(item.runtime),
+  ].filter(Boolean) as string[];
+
+  // Kino clears the metadata out of the way once a preview is playing, then
+  // brings it back when the clip finishes.
+  useEffect(() => {
+    // Nothing to restore until a preview has actually taken over once.
+    if (!previewing && !hasPreviewed.current) return;
+    hasPreviewed.current = true;
+
+    const targets = [detailsRef.current, descriptionRef.current].filter(Boolean);
+    if (targets.length === 0) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    const delay = previewing ? 2.8 : 0;
+    const tween = gsap.to(targets, {
+      autoAlpha: previewing ? 0 : 1,
+      height: previewing ? 0 : 'auto',
+      marginTop: previewing ? 0 : '',
+      y: previewing ? 20 : 0,
+      duration: previewing ? 1 : 0.9,
+      delay,
+      ease: previewing ? 'power3.inOut' : 'power2.out',
+    });
+    const artwork = gsap.to(artworkRef.current, {
+      opacity: previewing ? 0 : 1,
+      duration: 1.2,
+      ease: 'power2.out',
+    });
+
+    return () => {
+      tween.kill();
+      artwork.kill();
+    };
+  }, [previewing]);
+
+  return (
+    <div className="relative h-[82dvh] overflow-hidden">
+      <div className="relative h-full w-full overflow-hidden">
+        {image ? (
+          <img
+            ref={artworkRef}
+            src={image}
+            alt=""
+            fetchPriority="high"
+            className="absolute inset-0 h-full w-full object-cover"
+          />
+        ) : (
+          <div className="absolute inset-0 bg-surface" />
+        )}
+        <AutoPreview
+          item={item}
+          videoClassName="absolute inset-0 h-full w-full object-cover"
+          controlClassName="absolute bottom-10 right-10 z-20"
+          onActiveChange={setPreviewing}
+        />
+
+        <div className="relative z-10 flex h-full w-full flex-col justify-end px-6 pb-6 pt-10 sm:px-10">
+          <div className="w-[600px] max-w-full space-y-5">
+            <HeroTitle title={item.title} />
+
+            <div ref={detailsRef} className="overflow-hidden">
+              <div className="flex items-center gap-2">
+                <h2 className="text-xl font-semibold">{kind}</h2>
+                {details.map((detail) => (
+                  <div key={detail} className="flex items-center gap-2">
+                    <p>•</p>
+                    <p>{detail}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div ref={descriptionRef} className="overflow-hidden">
+              <p className="line-clamp-3">{item.overview}</p>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <Link href={playHref}>
+                <span className="flex h-12 w-48 cursor-pointer items-center justify-center gap-2 rounded-full bg-white font-semibold text-black">
+                  <IoPlay size={20} />
+                  Watch Now
+                </span>
+              </Link>
+              <WatchLaterButton item={watchLaterItem(item)} />
+              <Link
+                href={titleHref(item)}
+                aria-label={`More information about ${item.title}`}
+                className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control"
+              >
+                <IoMdInformationCircleOutline size={25} />
+              </Link>
+            </div>
           </div>
         </div>
+
+        <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-[#14141499] to-[#14141433]" />
       </div>
-    </section>
+    </div>
   );
 }

@@ -17,6 +17,7 @@ import {
   embeddedCoreEndpoint,
   getLibrary,
   isDesktopRuntime,
+  removeHistoryItem,
   setWatchLater,
   type LocalEngineConnection,
 } from '@/lib/local-engine';
@@ -26,6 +27,8 @@ const STORAGE_KEY = 'cubo.coreEndpoint';
 
 interface CoreContextValue {
   connection: LocalEngineConnection | null;
+  /** True once the startup connection attempt has finished (either way). */
+  connectionChecked: boolean;
   endpoint: string;
   /** True when this page is served by Cubo Core itself (port 8765). */
   isHosted: boolean;
@@ -37,6 +40,7 @@ interface CoreContextValue {
   connect: () => Promise<LocalEngineConnection>;
   refreshLibrary: () => Promise<CoreLibrarySnapshot | null>;
   updateWatchLater: (item: WatchLaterItem, saved: boolean) => Promise<void>;
+  removeFromHistory: (key: string) => Promise<void>;
 }
 
 const CoreContext = createContext<CoreContextValue | null>(null);
@@ -49,6 +53,7 @@ export function useCore(): CoreContextValue {
 
 export function CoreProvider({ children }: { children: React.ReactNode }) {
   const [connection, setConnection] = useState<LocalEngineConnection | null>(null);
+  const [connectionChecked, setConnectionChecked] = useState(false);
   const [savedEndpoint, setSavedEndpoint] = useState('');
   const [hostedEndpoint, setHostedEndpoint] = useState('');
   const [desktopRuntime, setDesktopRuntime] = useState(false);
@@ -63,6 +68,12 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
 
     if (!pageCoreEndpoint && !desktop) {
       setSavedEndpoint(stored);
+      // Probe for a Core eagerly so playback starts faster and the
+      // disconnected banner reflects a real failed attempt, not a guess.
+      void discoverLocalEngine(stored)
+        .then(setConnection)
+        .catch(() => undefined)
+        .finally(() => setConnectionChecked(true));
       return;
     }
 
@@ -74,7 +85,8 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
       })
       .catch(() => {
         if (!desktop) setSavedEndpoint(stored);
-      });
+      })
+      .finally(() => setConnectionChecked(true));
   }, []);
 
   const connect = useCallback(async () => {
@@ -140,9 +152,18 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
     [connection, connect],
   );
 
+  const removeFromHistory = useCallback(
+    async (key: string) => {
+      const active = connection ?? (await connect());
+      setLibrary(await removeHistoryItem(active, key));
+    },
+    [connection, connect],
+  );
+
   const value = useMemo<CoreContextValue>(
     () => ({
       connection,
+      connectionChecked,
       endpoint: desktopRuntime ? embeddedCoreEndpoint() : hostedEndpoint || savedEndpoint,
       isHosted: hostedEndpoint !== '',
       isDesktop: desktopRuntime,
@@ -151,9 +172,11 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
       connect,
       refreshLibrary,
       updateWatchLater,
+      removeFromHistory,
     }),
     [
       connection,
+      connectionChecked,
       hostedEndpoint,
       desktopRuntime,
       savedEndpoint,
@@ -161,6 +184,7 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
       connect,
       refreshLibrary,
       updateWatchLater,
+      removeFromHistory,
     ],
   );
 

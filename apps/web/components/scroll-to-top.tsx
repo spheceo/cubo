@@ -1,15 +1,13 @@
-import { useLenis } from 'lenis/react';
-import { useEffect } from 'react';
+import { useLayoutEffect } from 'react';
 import { useLocation } from 'react-router';
 
 export function ScrollToTop() {
   const { pathname } = useLocation();
-  const lenis = useLenis();
 
-  useEffect(() => {
-    lenis?.scrollTo(0, { immediate: true, force: true });
-    window.scrollTo(0, 0);
-  }, [pathname, lenis]);
+  useLayoutEffect(() => {
+    // "instant" overrides the CSS smooth scroll so route changes never animate.
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }, [pathname]);
 
   return null;
 }

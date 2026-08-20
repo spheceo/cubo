@@ -14,6 +14,8 @@ export interface LocalEngineConnection {
   port: number | null;
   token: string;
   version: string;
+  /** True when this Core has ffmpeg and can remux MKV/incompatible-audio sources. */
+  transcode: boolean;
 }
 
 export interface AddedTorrent {
@@ -31,6 +33,7 @@ export interface PlaybackUpdate {
   subtitle: string | null;
   posterPath: string | null;
   backdropPath: string | null;
+  logoPath: string | null;
   season: number | null;
   episode: number | null;
   positionSeconds: number;
@@ -116,6 +119,7 @@ async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {
       name?: string;
       version?: string;
       sessionToken?: string;
+      transcode?: boolean;
     };
     if (health.name !== 'cubo-core' || !health.sessionToken) {
       throw new Error('Unexpected service on Cubo port');
@@ -126,6 +130,7 @@ async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {
       port: new URL(baseUrl).port ? Number(new URL(baseUrl).port) : null,
       token: health.sessionToken,
       version: health.version ?? 'unknown',
+      transcode: health.transcode === true,
     };
   } finally {
     window.clearTimeout(timeout);
@@ -153,8 +158,39 @@ export async function connectCoreEndpoint(endpoint: string): Promise<LocalEngine
   try {
     return await probeEndpoint(normalized);
   } catch {
-    throw new Error(`Could not reach Cubo Core at ${normalized}`);
+    throw new Error(explainCoreFailure(normalized));
   }
+}
+
+/** Turns the two most common "could not reach" causes into actionable
+ *  guidance: browsers silently block a secure site from calling plain-HTTP
+ *  machines, and Core itself never answers HTTPS (that's tailscale serve's
+ *  job, on the default port 443). */
+function explainCoreFailure(endpoint: string): string {
+  const url = new URL(endpoint);
+  const pageIsSecure =
+    typeof window !== 'undefined' && window.location.protocol === 'https:';
+
+  if (pageIsSecure && url.protocol === 'http:' && !isLoopbackHost(url.hostname)) {
+    return (
+      `Could not reach Cubo Core at ${endpoint}. Browsers block a secure site ` +
+      `from calling plain http:// addresses on other machines. Either open ` +
+      `${endpoint} directly in a browser tab (Core serves this app itself), or ` +
+      `give Core a secure address: run "tailscale serve --bg 8765" on the Core ` +
+      `machine, then enter its https://<machine>.<tailnet>.ts.net address here.`
+    );
+  }
+
+  if (url.protocol === 'https:' && url.port !== '' && url.port !== '443') {
+    return (
+      `Could not reach Cubo Core at ${endpoint}. Core speaks plain HTTP on ` +
+      `port ${url.port}, so an https:// address on that port never answers. ` +
+      `If you use "tailscale serve", enter the address without a port — ` +
+      `https://${url.hostname} — it forwards to Core for you.`
+    );
+  }
+
+  return `Could not reach Cubo Core at ${endpoint}`;
 }
 
 export async function discoverLocalEngine(
@@ -271,6 +307,47 @@ export function streamUrl(
   return `${engine.baseUrl}/v1/torrents/${id}/stream/${fileIndex}?token=${token}`;
 }
 
+export function hlsPlaylistUrl(
+  engine: LocalEngineConnection,
+  idOrHash: number | string,
+  fileIndex: number,
+  startSeconds = 0,
+): string {
+  const id = encodeURIComponent(String(idOrHash));
+  const token = encodeURIComponent(engine.token);
+  const start = startSeconds > 0 ? `&start=${startSeconds.toFixed(3)}` : '';
+  return `${engine.baseUrl}/v1/torrents/${id}/hls/${fileIndex}/media.m3u8?token=${token}${start}`;
+}
+
+/** Kicks off (and validates) the Core-side remux for one torrent file,
+ *  optionally starting `startSeconds` into it (seek restart). The first
+ *  playlist request blocks until ffmpeg produces playable segments, so a
+ *  success here means the returned URL is immediately watchable. */
+export async function startRemux(
+  engine: LocalEngineConnection,
+  idOrHash: number | string,
+  fileIndex: number,
+  startSeconds = 0,
+): Promise<{ url: string; durationSeconds: number | null }> {
+  const url = hlsPlaylistUrl(engine, idOrHash, fileIndex, startSeconds);
+  const response = await coreFetch(url);
+  if (!response.ok) {
+    let detail = 'This source could not be converted for the browser.';
+    try {
+      const body = (await response.json()) as { error?: unknown };
+      if (typeof body.error === 'string') detail = body.error;
+    } catch {
+      // Keep the generic message for non-JSON error bodies.
+    }
+    throw new Error(detail);
+  }
+  const duration = Number(response.headers.get('X-Cubo-Duration'));
+  return {
+    url,
+    durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
+  };
+}
+
 export function largestFileIndex(files: { length: number }[]): number {
   let largest = 0;
   for (let index = 1; index < files.length; index += 1) {
@@ -311,6 +388,19 @@ export async function setWatchLater(
     body: JSON.stringify({ item, saved }),
   });
   if (!response.ok) throw new Error(`Could not update Watch later (${response.status})`);
+  return (await response.json()) as CoreLibrarySnapshot;
+}
+
+export async function removeHistoryItem(
+  engine: LocalEngineConnection,
+  key: string,
+): Promise<CoreLibrarySnapshot> {
+  const response = await engineFetch(
+    engine,
+    `/v1/library/history/${encodeURIComponent(key)}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok) throw new Error(`Could not remove that title (${response.status})`);
   return (await response.json()) as CoreLibrarySnapshot;
 }
 

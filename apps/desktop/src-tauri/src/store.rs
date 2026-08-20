@@ -24,6 +24,8 @@ pub struct LibraryItem {
     pub subtitle: Option<String>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub logo_path: Option<String>,
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub position_seconds: f64,
@@ -81,6 +83,11 @@ pub struct CacheEntry {
     pub info_hash: String,
     pub media_key: Option<String>,
     pub title: Option<String>,
+    /// Absolute paths of the downloaded files. The torrent engine forgets its
+    /// torrents on restart, so deletion must be able to work straight against
+    /// the filesystem.
+    #[serde(default)]
+    pub files: Vec<String>,
     pub last_accessed_at: u64,
 }
 
@@ -125,6 +132,8 @@ pub struct PlaybackUpdate {
     pub subtitle: Option<String>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub logo_path: Option<String>,
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub position_seconds: f64,
@@ -188,6 +197,7 @@ impl CoreStore {
             subtitle: update.subtitle,
             poster_path: update.poster_path,
             backdrop_path: update.backdrop_path,
+            logo_path: update.logo_path,
             season: update.season,
             episode: update.episode,
             position_seconds: update.position_seconds.max(0.0),
@@ -228,6 +238,13 @@ impl CoreStore {
         Ok(data.clone())
     }
 
+    pub async fn remove_history_item(&self, key: &str) -> Result<CoreData, String> {
+        let mut data = self.data.lock().await;
+        data.history.retain(|item| item.key != key);
+        self.persist_locked(&data).await?;
+        Ok(data.clone())
+    }
+
     pub async fn update_watch_later(&self, update: WatchLaterUpdate) -> Result<CoreData, String> {
         let mut data = self.data.lock().await;
         data.watch_later.retain(|item| item.key != update.item.key);
@@ -253,6 +270,7 @@ impl CoreStore {
         info_hash: String,
         media_key: Option<String>,
         title: Option<String>,
+        files: Vec<String>,
     ) -> Result<(), String> {
         let mut data = self.data.lock().await;
         let now = now_millis();
@@ -264,6 +282,9 @@ impl CoreStore {
             entry.torrent_id = torrent_id.or(entry.torrent_id);
             entry.media_key = media_key.or_else(|| entry.media_key.clone());
             entry.title = title.or_else(|| entry.title.clone());
+            if !files.is_empty() {
+                entry.files = files;
+            }
             entry.last_accessed_at = now;
         } else {
             data.cache_entries.push(CacheEntry {
@@ -271,6 +292,7 @@ impl CoreStore {
                 info_hash,
                 media_key,
                 title,
+                files,
                 last_accessed_at: now,
             });
         }
