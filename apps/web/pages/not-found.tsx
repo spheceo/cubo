@@ -1,3 +1,4 @@
+import { CuboWordmark } from '@/components/cubo-logo';
 import { Link } from '@/components/link';
 import { useDocumentTitle } from '@/lib/use-document-title';
 
@@ -7,8 +8,8 @@ export function NotFoundPage() {
   return (
     <main className="flex min-h-dvh items-center justify-center bg-background px-6 text-white">
       <div className="max-w-sm text-center">
-        <p className="text-xl font-semibold tracking-[-0.04em]">
-          cubo<span className="text-accent">.</span>
+        <p className="text-xl font-semibold">
+          <CuboWordmark className="justify-center" />
         </p>
         <p className="mt-4 leading-relaxed text-white/60">That title could not be found.</p>
         <Link

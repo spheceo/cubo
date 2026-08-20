@@ -7,6 +7,24 @@ const DOWNLOADS = {
   windows: `${RELEASES_BASE}/cubo-windows-x64-setup.exe`,
 };
 
+const TMDB = 'https://image.tmdb.org/t/p';
+
+/** Curated stills for the marketing collage — visual only, not a catalog. */
+const STILLS = [
+  `${TMDB}/w780/rAiYTfKGqDCRIIqo664sY9XZIvQ.jpg`,
+  `${TMDB}/w780/8rpDcsf9J0n2u1Xblicyuk8hL91.jpg`,
+  `${TMDB}/w780/sAtoMqD2jvkU4yCjtzigBI2s1kZ.jpg`,
+  `${TMDB}/w780/jYEW5xZkZk2WTrdbMGAPFuBDzMw.jpg`,
+  `${TMDB}/w780/b0PlSFdDwbyK0csSAfKuCKmJEJc.jpg`,
+  `${TMDB}/w780/yFRpUmsveXQpMsEuwg0WklK89Kx.jpg`,
+  `${TMDB}/w780/fm6KqXpk3m2H4m9XcWDeVIjCqKq.jpg`,
+  `${TMDB}/w780/rLb2yfND4xOkCKsPYQYJmP8qUx.jpg`,
+  `${TMDB}/w780/dqK7dW7ghRjFTqVWK5u4UQ5XnUD.jpg`,
+  `${TMDB}/w780/2RSirqZG949GuRwN38MYCIgQj0.jpg`,
+  `${TMDB}/w780/hiKmpZVGWsRh5yshAnLFv2kh5hd.jpg`,
+  `${TMDB}/w780/xOMo8BRK7PfcJv9JCnx7s5hj0PX.jpg`,
+];
+
 type Platform = 'mac' | 'windows' | 'other';
 
 function detectPlatform(): Platform {
@@ -43,9 +61,10 @@ export function App() {
   return (
     <>
       <nav className="nav">
-        <span className="logo">
-          cubo<span className="accent">.</span>
-        </span>
+        <a href="#top" className="logo" aria-label="cubo">
+          <CuboMark />
+          cubo
+        </a>
         <div className="nav-links">
           <a href="https://github.com/spheceo/cubo" rel="noreferrer">
             GitHub
@@ -56,8 +75,15 @@ export function App() {
         </div>
       </nav>
 
-      <main>
-        <section className="hero">
+      <header className="hero" id="top">
+        <div className="still-wall" aria-hidden="true">
+          {STILLS.map((src) => (
+            <img key={src} src={src} alt="" />
+          ))}
+        </div>
+        <div className="hero-shade" />
+        <div className="hero-copy">
+          <CuboMark className="hero-mark" />
           <p className="eyebrow">Free, open source, yours</p>
           <h1>
             Your movies.
@@ -76,6 +102,16 @@ export function App() {
           <p className="version">
             {version ? `Version ${version} · ` : ''}macOS &amp; Windows · MIT licensed
           </p>
+        </div>
+      </header>
+
+      <main>
+        <section className="strip" aria-hidden="true">
+          {STILLS.slice()
+            .reverse()
+            .map((src) => (
+              <img key={`strip-${src}`} src={src} alt="" />
+            ))}
         </section>
 
         <section className="features">
@@ -142,7 +178,11 @@ export function App() {
       </main>
 
       <footer>
-        <span>&copy; {new Date().getFullYear()} Cubo</span>
+        <span className="footer-brand">
+          <CuboMark />
+          Cubo
+        </span>
+        <span>&copy; {new Date().getFullYear()}</span>
         <a href="https://github.com/spheceo/cubo/blob/main/LICENSE" rel="noreferrer">
           MIT License
         </a>
@@ -154,6 +194,16 @@ export function App() {
         </a>
       </footer>
     </>
+  );
+}
+
+function CuboMark({ className = '' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 32 32" className={`mark ${className}`.trim()} aria-hidden="true">
+      <path fill="#ffffff" d="M16 3.2 28 10.1 16 17 4 10.1 16 3.2Z" />
+      <path fill="#9a9a9a" d="M4 10.1 16 17v11.4L4 21.5V10.1Z" />
+      <path fill="#5c5c5c" d="M16 17 28 10.1v11.4L16 28.4V17Z" />
+    </svg>
   );
 }
 

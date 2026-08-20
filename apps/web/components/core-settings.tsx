@@ -125,7 +125,7 @@ export function CoreSettings({
             </div>
           ) : null}
 
-          {error ? <p role="alert" className="text-sm leading-6 text-accent">{error}</p> : null}
+          {error ? <p role="alert" className="text-sm leading-6 text-white/70">{error}</p> : null}
 
           {!currentOriginCore ? <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
             <button

@@ -41,6 +41,10 @@ export function LibraryScreen() {
     void loadCache();
   }, [loadCache]);
 
+  if (core.connection && !core.library) {
+    return <main className="min-h-dvh bg-background" aria-busy="true" />;
+  }
+
   if (!core.connection || !core.library) {
     return (
       <main className="flex min-h-dvh items-center justify-center bg-background px-6 pb-24 pt-32 text-white">

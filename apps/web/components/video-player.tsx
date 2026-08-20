@@ -27,6 +27,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from '@/components/link';
 import { isDesktopRuntime } from '@/lib/local-engine';
 import { LogoLoader } from './logo-loader';
+import { PlayerSettings } from './player-settings';
 import { formatTime } from '@/lib/format';
 
 const HIDE_DELAY_MS = 2600;
@@ -52,9 +53,8 @@ export function VideoPlayer({
   timeOffset = 0,
   title,
   subtitle,
-  logoPath,
   backHref,
-  onOpenSettings,
+  onPickSubtitle,
   subtitles,
   activeSubtitleId,
   initialTime = 0,
@@ -72,9 +72,8 @@ export function VideoPlayer({
   timeOffset?: number;
   title: string;
   subtitle: string | null;
-  logoPath: string | null;
   backHref: string;
-  onOpenSettings: () => void;
+  onPickSubtitle: (id: string | null) => void;
   subtitles: PlayerSubtitle[];
   activeSubtitleId: string | null;
   initialTime?: number;
@@ -91,6 +90,7 @@ export function VideoPlayer({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
   const scrubFrame = useRef<number | null>(null);
@@ -111,6 +111,7 @@ export function VideoPlayer({
   const [muted, setMuted] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [speedOpen, setSpeedOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
@@ -150,6 +151,7 @@ export function VideoPlayer({
 
     if (!hls) {
       video.src = src;
+      void video.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
       return () => {
         video.removeAttribute('src');
       };
@@ -172,6 +174,9 @@ export function VideoPlayer({
       instance = new Hls({ startPosition: 0 });
       instance.loadSource(src);
       instance.attachMedia(video);
+      instance.on(Hls.Events.MANIFEST_PARSED, () => {
+        void video.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
+      });
       instance.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) onErrorRef.current();
       });
@@ -192,7 +197,26 @@ export function VideoPlayer({
     }
   }, [activeSubtitleId, subtitles]);
 
-  const keepControls = speedOpen || !playing || blocked;
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!settingsRef.current?.contains(event.target as Node)) setSettingsOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        setSettingsOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', closeOnOutside);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutside);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [settingsOpen]);
+
+  const keepControls = speedOpen || settingsOpen || !playing || blocked;
 
   const revealControls = useCallback(() => {
     setControlsVisible(true);
@@ -492,7 +516,7 @@ export function VideoPlayer({
 
       {waiting && !blocked ? (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
-          <LogoLoader logoPath={logoPath} title={title} progress={null} size="sm" />
+          <LogoLoader title={title} progress={null} size="sm" />
         </div>
       ) : null}
 
@@ -654,7 +678,10 @@ export function VideoPlayer({
             <div className="relative">
               <button
                 type="button"
-                onClick={() => setSpeedOpen((open) => !open)}
+                onClick={() => {
+                  setSpeedOpen((open) => !open);
+                  setSettingsOpen(false);
+                }}
                 aria-label="Playback speed"
                 className="cursor-pointer rounded-full px-2.5 py-1.5 text-[0.75rem] font-medium tabular-nums text-white/80 transition-colors hover:bg-white/10 hover:text-white"
               >
@@ -671,7 +698,7 @@ export function VideoPlayer({
                         setSpeedOpen(false);
                       }}
                       className={`block w-full cursor-pointer px-3 py-1.5 text-left text-[0.75rem] tabular-nums transition-colors hover:bg-white/10 ${
-                        option === speed ? 'text-accent' : 'text-white/75'
+                        option === speed ? 'text-white' : 'text-white/75'
                       }`}
                     >
                       {option}×
@@ -681,9 +708,24 @@ export function VideoPlayer({
               ) : null}
             </div>
 
-            <ControlButton label="Playback settings" onClick={onOpenSettings}>
-              <IoSettingsSharp size={20} />
-            </ControlButton>
+            <div ref={settingsRef} className="relative">
+              <ControlButton
+                label="Playback settings"
+                onClick={() => {
+                  setSettingsOpen((open) => !open);
+                  setSpeedOpen(false);
+                }}
+              >
+                <IoSettingsSharp size={20} />
+              </ControlButton>
+              {settingsOpen ? (
+                <PlayerSettings
+                  subtitles={subtitles}
+                  activeSubtitleId={activeSubtitleId}
+                  onPickSubtitle={onPickSubtitle}
+                />
+              ) : null}
+            </div>
 
             {pipSupported ? (
               <ControlButton

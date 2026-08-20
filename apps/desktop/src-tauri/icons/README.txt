@@ -1,1 +1,1 @@
-Generated from app-icon-source.png with the Tauri icon pipeline.
+Generated from brand/app-icon-source.png (black field, cubo mark) with `tauri icon`.

@@ -1,11 +1,13 @@
+import { CuboWordmark } from './cubo-logo';
+
 export function CatalogError({ message }: { message: string }) {
   const missingKey = message.includes('TMDB_API_KEY');
 
   return (
     <main className="flex min-h-dvh items-center justify-center bg-background px-6 text-white">
       <div className="max-w-sm text-center">
-        <p className="text-xl font-semibold tracking-[-0.04em]">
-          cubo<span className="text-accent">.</span>
+        <p className="text-xl font-semibold">
+          <CuboWordmark className="justify-center" />
         </p>
         {missingKey ? (
           <p className="mt-4 leading-relaxed text-white/60">

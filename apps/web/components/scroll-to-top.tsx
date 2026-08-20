@@ -5,8 +5,9 @@ export function ScrollToTop() {
   const { pathname } = useLocation();
 
   useLayoutEffect(() => {
-    // "instant" overrides the CSS smooth scroll so route changes never animate.
-    window.scrollTo({ top: 0, behavior: 'instant' });
+    window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
   }, [pathname]);
 
   return null;

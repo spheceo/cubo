@@ -28,8 +28,12 @@ const AUDIO_LANGUAGE_HINTS: [string, RegExp][] = [
   ['zh', /\b(?:chi|zho|chinese|mandarin)\b/i],
   ['ar', /\b(?:ara|arabic)\b/i],
 ];
-const ORIGINAL_AUDIO_RE = /\b(?:vostfr|original[ ._-]?(?:audio|language))\b/i;
+const ORIGINAL_AUDIO_RE = /\b(?:original[ ._-]?(?:audio|language))\b/i;
 const MULTI_AUDIO_RE = /\b(?:multi|dual[ ._-]?audio|dubbed)\b/i;
+/** Releases with subtitles burned into the picture (SUBBED/PLSUBBED, HC,
+ *  KORSUB, VOSTFR, "napisy" …). No player setting can remove them, so they
+ *  rank with the dubs — last. Soft-sub markers like MULTiSUBS stay fine. */
+const HARDSUB_RE = /\b(?:hc|hard[ ._-]?subs?|\w*subbed|korsubs?|vostfr|napisy)\b/i;
 
 /** Torrentio marks stream languages with country-flag emoji — a far stronger
  *  dub signal than release-name tokens, since English-original releases
@@ -76,9 +80,11 @@ function seederBucket(seeders: number | null): number {
 }
 
 function audioLanguageRank(stream: Stream, nativeLanguage: string | null): number {
+  const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
+  // Burned-in subtitles ruin a release regardless of its audio language.
+  if (HARDSUB_RE.test(hint)) return 3;
   if (!nativeLanguage) return 1;
   const native = nativeLanguage.toLowerCase();
-  const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
   if (ORIGINAL_AUDIO_RE.test(hint)) return 0;
 
   // Flags are authoritative when present: a release flagged only with
