@@ -86,7 +86,7 @@ environment variables — the functions in `apps/web/api/` pick it up.
 
 Desktop builds bundle the UI, so the app always has its interface. The only
 configuration is the canonical deployment URL, hardcoded in two places (change
-both if the deployment ever moves from `https://cubo-nine.vercel.app`):
+both if the deployment ever moves from `https://app.cubo.spheceo.com`):
 
 - `DEPLOYED_SITE_URL` in `apps/web/lib/api.ts` — where the bundled desktop UI
   sends API requests, since its `tauri://localhost` origin has no functions.
