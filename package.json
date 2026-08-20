@@ -3,14 +3,11 @@
   "private": true,
   "packageManager": "pnpm@10.14.0",
   "scripts": {
-    "dev": "concurrently -k -n web,desktop -c blue,green \"pnpm dev:web\" \"pnpm --filter @cubo/desktop tauri dev\"",
+    "dev": "pnpm --filter @cubo/desktop dev",
     "dev:web": "pnpm --filter @cubo/web dev",
     "dev:desktop": "pnpm --filter @cubo/desktop dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck"
-  },
-  "devDependencies": {
-    "concurrently": "^9"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["esbuild"]

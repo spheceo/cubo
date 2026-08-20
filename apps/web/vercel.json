@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/api/tmdb/:path*", "destination": "/api/tmdb?path=:path*" },
+    {
+      "source": "/api/torrentio/:path*",
+      "destination": "/api/torrentio?path=:path*"
+    },
+    {
+      "source": "/api/subtitles/:path*",
+      "destination": "/api/subtitles?path=:path*"
+    },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
+  ]
+}

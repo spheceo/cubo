@@ -1,0 +1,115 @@
+@import "tailwindcss";
+@import "lenis/dist/lenis.css";
+@import "../../packages/ui/src/theme.css";
+@source "../../packages/ui/src";
+
+@layer base {
+  :root {
+    --font-inter: 'Inter Variable', ui-sans-serif, system-ui, -apple-system,
+      'Segoe UI', sans-serif;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 6rem;
+  }
+
+  body {
+    background-color: var(--color-ink);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: var(--color-accent);
+    color: #0b0b0d;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 3px;
+  }
+
+  .player-range {
+    height: 0.25rem;
+    cursor: pointer;
+    appearance: none;
+    border-radius: 999px;
+  }
+
+  .player-range::-webkit-slider-thumb {
+    width: 0.8rem;
+    height: 0.8rem;
+    appearance: none;
+    border: 0;
+    border-radius: 999px;
+    background: var(--color-accent);
+    box-shadow: 0 0 0 3px rgb(0 0 0 / 45%);
+  }
+
+  .player-range::-moz-range-thumb {
+    width: 0.8rem;
+    height: 0.8rem;
+    border: 0;
+    border-radius: 999px;
+    background: var(--color-accent);
+    box-shadow: 0 0 0 3px rgb(0 0 0 / 45%);
+  }
+
+  .player-range:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+}
+
+html[data-desktop-platform="macos"] .desktop-header-shell {
+  padding-left: max(clamp(1.25rem, 4vw, 5rem), 7rem);
+}
+
+html[data-desktop-platform="windows"] .desktop-header-shell {
+  padding-right: max(clamp(1.25rem, 4vw, 5rem), 9.25rem);
+}
+
+/* Registered so the title mark can reveal smoothly from left to right. */
+@property --logo-fill {
+  syntax: "<percentage>";
+  inherits: true;
+  initial-value: 0%;
+}
+
+.logo-fill {
+  --logo-fill: 0%;
+  transition: --logo-fill 700ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.logo-fill-loop {
+  animation: logo-fill-loop 2.5s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+}
+
+@keyframes logo-fill-loop {
+  0%,
+  8% {
+    --logo-fill: 0%;
+  }
+  78%,
+  100% {
+    --logo-fill: 100%;
+  }
+}
+
+.logo-fill-mask {
+  clip-path: inset(0 calc(100% - var(--logo-fill)) 0 0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .logo-fill {
+    transition: none;
+  }
+
+  .logo-fill-loop {
+    animation-duration: 6s;
+  }
+}

@@ -8,3 +8,4 @@ target
 .env.*.local
 *.tsbuildinfo
 .DS_Store
+.env*

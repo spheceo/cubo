@@ -1,0 +1,30 @@
+/* Shared design tokens for @cubo/ui. Imported by every app that renders these
+   components so the palette stays identical across web and desktop. */
+@theme {
+  --color-ink: #08080a;
+  --color-surface: #16161a;
+  --color-line: #ffffff14;
+  --color-line-strong: #ffffff2e;
+  --color-fg: #f5f5f3;
+  --color-muted: #a3a3ab;
+  --color-faint: #6f6f78;
+  --color-accent: #e7ff69;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', sans-serif;
+}
+
+@utility no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@utility shell {
+  margin-inline: auto;
+  max-width: none;
+  padding-inline: clamp(1.25rem, 4vw, 5rem);
+}
