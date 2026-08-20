@@ -73,6 +73,12 @@ html[data-desktop-platform="macos"] .desktop-header-shell {
   padding-left: max(2.5rem, 7rem);
 }
 
+/* The macOS traffic lights (overlay title bar) sit at the top-left of the
+   window; the player's back button must clear them. */
+html[data-desktop-platform="macos"] .desktop-back-offset {
+  transform: translateX(4.5rem);
+}
+
 html[data-desktop-platform="windows"] .desktop-header-shell {
   padding-right: max(2.5rem, 9.25rem);
 }

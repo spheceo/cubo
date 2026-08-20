@@ -1,6 +1,6 @@
 [package]
 name = "cubo"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 
 [lib]
@@ -27,3 +27,6 @@ tokio-tungstenite = "0.29"
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 urlencoding = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
