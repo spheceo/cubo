@@ -1,0 +1,14 @@
+{
+  "name": "cubo",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "dev:web": "pnpm --filter @cubo/web dev",
+    "dev:desktop": "pnpm --filter @cubo/desktop dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
