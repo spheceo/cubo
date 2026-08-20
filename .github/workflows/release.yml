@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch ffmpeg sidecar binaries
+        run: node apps/desktop/scripts/fetch-ffmpeg.mjs --target ${{ matrix.target }}
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Cubo ${{ github.ref_name }}'
+          releaseBody: 'See the assets below to download and install this version.'
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }}
+
+  # The marketing site links to fixed URLs under releases/latest/download/,
+  # so every release also carries stable-named copies of the installers.
+  aliases:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload stable-named download aliases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$REPO" --pattern '*.dmg' --pattern '*-setup.exe'
+
+          shopt -s nullglob
+          for file in *aarch64*.dmg; do cp "$file" cubo-macos-apple-silicon.dmg; done
+          for file in *x64*.dmg; do cp "$file" cubo-macos-intel.dmg; done
+          for file in *-setup.exe; do cp "$file" cubo-windows-x64-setup.exe; done
+
+          gh release upload "$TAG" --repo "$REPO" --clobber \
+            cubo-macos-apple-silicon.dmg cubo-macos-intel.dmg cubo-windows-x64-setup.exe

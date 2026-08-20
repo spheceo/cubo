@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react';
 import { Outlet, Route, Routes, useLocation } from 'react-router';
 import { ConnectionBanner } from '@/components/connection-banner';
 import { CoreProvider } from '@/components/core-provider';
+import { UpdateBanner } from '@/components/update-banner';
 import { DesktopWindowFrame } from '@/components/desktop-window-frame';
 import { ScrollToTop } from '@/components/scroll-to-top';
 import { SiteFooter } from '@/components/site-footer';
@@ -46,6 +47,7 @@ export function App() {
       <CoreProvider>
         <ScrollToTop />
         <ConnectionBanner />
+        <UpdateBanner />
         <Suspense fallback={<PageFallback />}>
           <Routes>
             <Route element={<SiteLayout />}>
