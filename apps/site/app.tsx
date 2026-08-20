@@ -124,12 +124,20 @@ export function App() {
               <span className="card-sub">64-bit installer · .exe</span>
             </a>
           </div>
-          <p className="fine-print">
-            Cubo isn&rsquo;t notarized yet: on macOS, right-click the app and choose
-            Open the first time; on Windows, choose &ldquo;More info → Run
-            anyway&rdquo; if SmartScreen appears. Updates install themselves from
-            inside the app.
-          </p>
+          <div className="fine-print">
+            <p>
+              Cubo isn&rsquo;t notarized with Apple yet, so macOS will claim the app
+              is &ldquo;damaged&rdquo; on first launch. It isn&rsquo;t — after
+              dragging cubo to Applications, run this once in Terminal, then open it
+              normally:
+            </p>
+            <code className="command">xattr -cr /Applications/cubo.app</code>
+            <p>
+              On Windows, choose &ldquo;More info → Run anyway&rdquo; if SmartScreen
+              appears. After the first launch, updates install themselves from
+              inside the app — no Terminal needed again.
+            </p>
+          </div>
         </section>
       </main>
 
