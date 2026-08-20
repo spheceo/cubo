@@ -1,3 +1,5 @@
+'use client';
+
 import { backdropUrl, type MediaSummary } from '@cubo/core';
 
 export function Hero({

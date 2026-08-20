@@ -1,3 +1,5 @@
+'use client';
+
 import { posterUrl, type MediaSummary } from '@cubo/core';
 
 export function MediaCard({

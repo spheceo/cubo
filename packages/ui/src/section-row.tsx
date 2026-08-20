@@ -1,3 +1,5 @@
+'use client';
+
 import type { MediaSummary } from '@cubo/core';
 import { MediaCard } from './media-card';
 
