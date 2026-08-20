@@ -33,7 +33,7 @@ const CORE_PORT: u16 = 8765;
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Canonical web deployment. Release builds proxy browser visitors here and
 /// trust its origin. Set to "" to disable the browser gateway entirely.
-const WEB_DEPLOYMENT_URL: &str = "https://cubo-nine.vercel.app";
+const WEB_DEPLOYMENT_URL: &str = "https://app.cubo.spheceo.com";
 // The bundled desktop webview reaches Core from tauri://localhost (macOS) or
 // http://tauri.localhost (Windows); the Vite dev server uses the loopback pair.
 const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
