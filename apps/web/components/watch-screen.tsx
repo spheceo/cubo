@@ -19,7 +19,6 @@ import { apiUrl } from '@/lib/api';
 import { queryClient, streamQueries } from '@/lib/queries';
 import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
-import { PlayerSettings } from './player-settings';
 import { VideoPlayer, type PlayerSubtitle } from './video-player';
 import {
   addMagnet,
@@ -90,8 +89,6 @@ export function WatchScreen({
 
   const [sources, setSources] = useState<Stream[]>([]);
   const [status, setStatus] = useState<Status>('loading');
-  const [statusText, setStatusText] = useState('Finding sources');
-  const [detailText, setDetailText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [needsCore, setNeedsCore] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -101,7 +98,6 @@ export function WatchScreen({
   const [videoTimeOffset, setVideoTimeOffset] = useState(0);
   const [seekConverting, setSeekConverting] = useState(false);
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [panelOpen, setPanelOpen] = useState(false);
   const [progress, setProgress] = useState(0);
   const [subtitleTracks, setSubtitleTracks] = useState<PlayerSubtitle[]>([]);
   const [activeSubtitleId, setActiveSubtitleId] = useState<string | null>(null);
@@ -130,9 +126,8 @@ export function WatchScreen({
     return () => window.clearInterval(timer);
   }, []);
 
-  function setStage(target: number, text?: string) {
+  function setStage(target: number) {
     targetRef.current = target;
-    if (text) setStatusText(text);
   }
 
   async function start(
@@ -152,9 +147,8 @@ export function WatchScreen({
     setVideoTimeOffset(0);
     setSeekConverting(false);
     remuxContext.current = null;
-    setDetailText(null);
     setProgress(0);
-    setStage(STAGE.core, 'Connecting to Cubo Core');
+    setStage(STAGE.core);
 
     let connection;
     let resume = resumeFrom ?? 0;
@@ -188,10 +182,7 @@ export function WatchScreen({
       setActiveKey(streamKey(stream));
 
       try {
-        setStage(
-          STAGE.opening,
-          index > startIndex ? `Trying source ${index + 1}` : 'Opening source',
-        );
+        setStage(STAGE.opening);
         const added = await addMagnet(connection, buildMagnet(stream), {
           mediaKey: itemKey,
           title,
@@ -212,12 +203,11 @@ export function WatchScreen({
         const id = added.id ?? added.infoHash;
         if (id === null || id === '') throw new Error('Cubo Core did not return a torrent ID');
 
-        setStage(STAGE.buffering, 'Buffering the first pieces');
+        setStage(STAGE.buffering);
         await waitUntilLive(connection, id, {
           onProgress: (stats) => {
             if (stale()) return;
             setStage(bufferingTarget(stats));
-            setDetailText(describe(stats));
           },
         });
         if (stale()) return;
@@ -232,8 +222,7 @@ export function WatchScreen({
           // Core remuxes the file into browser-friendly HLS; the call returns
           // once the first segments are playable. Resuming starts the
           // converter right at the saved position instead of from zero.
-          setStage(STAGE.buffering, 'Converting for this browser');
-          setDetailText(null);
+          setStage(STAGE.buffering);
           const remux = await startRemux(connection, id, fileIndex, resume);
           url = remux.url;
           durationHint = remux.durationSeconds;
@@ -243,7 +232,7 @@ export function WatchScreen({
           if (stale()) return;
         }
 
-        setStage(STAGE.ready, 'Ready');
+        setStage(STAGE.ready);
         setProgress(1);
         // Let the logo finish filling before the picture takes over.
         window.setTimeout(() => {
@@ -281,7 +270,7 @@ export function WatchScreen({
 
     let cancelled = false;
     setStatus('loading');
-    setStage(STAGE.sources, 'Finding sources');
+    setStage(STAGE.sources);
     setError(null);
 
     void (async () => {
@@ -428,10 +417,6 @@ export function WatchScreen({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      if (panelOpen) {
-        setPanelOpen(false);
-        return;
-      }
       if (document.fullscreenElement) return;
       void (async () => {
         // The desktop app fullscreens the native window, which the DOM
@@ -453,7 +438,7 @@ export function WatchScreen({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [panelOpen, navigate, backHref]);
+  }, [navigate, backHref]);
 
   const backdrop = backdropUrl(backdropPath, 'w780');
   const busy = status === 'loading' || status === 'starting';
@@ -469,9 +454,8 @@ export function WatchScreen({
           timeOffset={videoTimeOffset}
           title={title}
           subtitle={subtitle}
-          logoPath={logoPath}
           backHref={backHref}
-          onOpenSettings={() => setPanelOpen(true)}
+          onPickSubtitle={setActiveSubtitleId}
           subtitles={subtitleTracks}
           activeSubtitleId={activeSubtitleId}
           initialTime={videoIsHls ? 0 : resumeAt}
@@ -494,7 +478,7 @@ export function WatchScreen({
           />
           {seekConverting ? (
             <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/60">
-              <LogoLoader logoPath={logoPath} title={title} progress={null} size="sm" />
+              <LogoLoader title={title} progress={null} size="sm" />
             </div>
           ) : null}
         </div>
@@ -519,26 +503,11 @@ export function WatchScreen({
 
           <div className="relative flex w-full max-w-xl flex-col items-center text-center">
             <LogoLoader
-              logoPath={logoPath}
               title={title}
               progress={busy ? Math.min(progress, 1) : null}
             />
 
-            {busy ? (
-              <>
-                <p className="mt-9 text-white/70">
-                  {statusText}
-                  <span className="ml-0.5 inline-flex">
-                    <Dot delay="0ms" />
-                    <Dot delay="160ms" />
-                    <Dot delay="320ms" />
-                  </span>
-                </p>
-                <p className="mt-2 h-5 text-sm text-white/35">
-                  {detailText ?? (subtitle || 'Streams start once enough pieces have arrived')}
-                </p>
-              </>
-            ) : (
+            {busy ? null : (
               <>
                 <p className="mt-9 leading-7 text-white/80">{error}</p>
                 <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
@@ -573,14 +542,6 @@ export function WatchScreen({
         </div>
       )}
 
-      {panelOpen ? (
-        <PlayerSettings
-          subtitles={subtitleTracks}
-          activeSubtitleId={activeSubtitleId}
-          onPickSubtitle={setActiveSubtitleId}
-          onClose={() => setPanelOpen(false)}
-        />
-      ) : null}
     </div>
   );
 }
@@ -588,25 +549,6 @@ export function WatchScreen({
 function bufferingTarget(stats: TorrentProgress): number {
   const ratio = Math.min(1, stats.downloadedBytes / BUFFER_TARGET_BYTES);
   return STAGE.buffering + (STAGE.bufferingFull - STAGE.buffering) * ratio;
-}
-
-function describe(stats: TorrentProgress): string | null {
-  const parts = [
-    stats.speed,
-    stats.peers != null ? `${stats.peers} peer${stats.peers === 1 ? '' : 's'}` : null,
-  ].filter(Boolean);
-  return parts.length ? parts.join(' · ') : null;
-}
-
-function Dot({ delay }: { delay: string }) {
-  return (
-    <span
-      className="animate-pulse text-white/70"
-      style={{ animationDelay: delay, animationDuration: '1.2s' }}
-    >
-      .
-    </span>
-  );
 }
 
 function prepareSubtitles(tracks: SubtitleTrack[]): PlayerSubtitle[] {

@@ -211,8 +211,20 @@ export async function discoverLocalEngine(
   );
 }
 
+/** Reliable open trackers appended to every magnet. Torrentio often returns
+ *  streams with no tracker list at all, leaving resolution to DHT alone —
+ *  which fails on networks that block UDP or right after app launch before
+ *  DHT bootstraps. These make metadata resolution work everywhere. */
+const DEFAULT_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.demonii.com:1337/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://open.stealth.si:80/announce',
+];
+
 export function buildMagnet(stream: Stream): string {
-  const trackers = stream.trackers
+  const trackers = [...new Set([...stream.trackers, ...DEFAULT_TRACKERS])]
     .map((tracker) => `&tr=${encodeURIComponent(tracker)}`)
     .join('');
   return `magnet:?xt=urn:btih:${stream.infoHash}${trackers}`;
@@ -231,7 +243,25 @@ export async function addMagnet(
     headers,
     body: magnet,
   });
-  if (!response.ok) throw new Error(`Cubo core rejected the stream (${response.status})`);
+  if (!response.ok) {
+    // rqbit's error body says WHY (metadata timeout, parse failure, …) —
+    // far more useful than a bare status code.
+    let detail = '';
+    try {
+      const body = (await response.json()) as {
+        human_readable?: string;
+        error?: string;
+      };
+      detail = body.human_readable ?? body.error ?? '';
+    } catch {
+      // Non-JSON body; fall back to the status code.
+    }
+    throw new Error(
+      detail
+        ? `Cubo core rejected the stream: ${detail}`
+        : `Cubo core rejected the stream (${response.status})`,
+    );
+  }
 
   const data = (await response.json()) as {
     id?: number | null;

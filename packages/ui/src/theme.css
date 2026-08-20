@@ -13,8 +13,8 @@
   --color-fg: #ffffff;
   --color-muted: #c6c6c6;
   --color-faint: #8a8a8a;
-  --color-accent: #e50914;
-  --color-star: #dfa34b;
+  --color-accent: #ffffff;
+  --color-star: #c6c6c6;
 
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
     'Segoe UI', sans-serif;

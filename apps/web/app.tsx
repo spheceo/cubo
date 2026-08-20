@@ -9,15 +9,13 @@ import { SiteFooter } from '@/components/site-footer';
 import { SiteHeader } from '@/components/site-header';
 import { CatalogPage } from '@/pages/catalog';
 import { HomePage } from '@/pages/home';
+import { LibraryPage } from '@/pages/library';
 import { NotFoundPage } from '@/pages/not-found';
 import { SearchPage } from '@/pages/search';
 import { TitlePage } from '@/pages/title';
 
 const WatchPage = lazy(() =>
   import('@/pages/watch').then((module) => ({ default: module.WatchPage })),
-);
-const LibraryPage = lazy(() =>
-  import('@/pages/library').then((module) => ({ default: module.LibraryPage })),
 );
 const LegalPage = lazy(() =>
   import('@/pages/legal').then((module) => ({ default: module.LegalPage })),

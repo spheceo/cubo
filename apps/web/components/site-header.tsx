@@ -1,11 +1,13 @@
 import { useLocation } from 'react-router';
 import { Link } from '@/components/link';
+import { CuboWordmark } from './cubo-logo';
 import { NavSearch } from './nav-search';
 
 const LINKS = [
   { href: '/', label: 'Home' },
   { href: '/movies', label: 'Movies' },
   { href: '/tv-shows', label: 'TV Shows' },
+  { href: '/library', label: 'Library' },
 ];
 
 export function SiteHeader() {
@@ -24,9 +26,9 @@ export function SiteHeader() {
           <Link
             href="/"
             aria-label="cubo home"
-            className="shrink-0 text-xl font-semibold tracking-[-0.04em] text-fg"
+            className="shrink-0 text-xl font-semibold text-fg"
           >
-            cubo<span className="text-accent">.</span>
+            <CuboWordmark />
           </Link>
 
           {LINKS.map((link) => (
@@ -38,7 +40,7 @@ export function SiteHeader() {
                 pathname === link.href
                   ? 'cursor-default text-white'
                   : 'text-muted hover:text-white'
-              } ${link.href === '/movies' || link.href === '/tv-shows' ? 'hidden sm:block' : ''}`}
+              } ${link.href === '/movies' || link.href === '/tv-shows' || link.href === '/library' ? 'hidden sm:block' : ''}`}
             >
               {link.label}
             </Link>
