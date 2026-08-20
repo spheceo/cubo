@@ -40,6 +40,8 @@ export interface Episode {
 
 export interface MediaDetails extends MediaSummary {
   imdbId: string | null;
+  /** ISO 639-1 language of the title's original audio. */
+  originalLanguage: string | null;
   tagline: string;
   /** Transparent title treatment (logo) from TMDB, when one exists. */
   logoPath: string | null;
@@ -78,6 +80,7 @@ export interface LibraryItem {
   subtitle: string | null;
   posterPath: string | null;
   backdropPath: string | null;
+  logoPath: string | null;
   season: number | null;
   episode: number | null;
   positionSeconds: number;
@@ -119,6 +122,8 @@ export interface CacheEntry {
   infoHash: string;
   mediaKey: string | null;
   title: string | null;
+  /** Absolute paths of the downloaded files on the Core machine. */
+  files: string[];
   lastAccessedAt: number;
 }
 
@@ -174,6 +179,7 @@ export type TmdbListItemRaw = {
 
 export type TmdbDetailsRaw = TmdbListItemRaw & {
   imdb_id?: string | null;
+  original_language?: string | null;
   external_ids?: { imdb_id?: string | null };
   tagline?: string | null;
   genres?: { name: string }[];
@@ -269,6 +275,7 @@ export function normalizeDetails(item: TmdbDetailsRaw, mediaType: MediaType): Me
   return {
     ...normalizeSummary(item, mediaType),
     imdbId: item.external_ids?.imdb_id ?? item.imdb_id ?? null,
+    originalLanguage: item.original_language ?? null,
     tagline: item.tagline ?? '',
     logoPath: pickLogo(item.images?.logos ?? []),
     genres: (item.genres ?? []).map((genre) => genre.name),

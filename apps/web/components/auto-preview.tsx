@@ -1,9 +1,9 @@
 import { type MediaDetails } from '@cubo/core';
 import { useGSAP } from '@gsap/react';
-import { SpeakerHigh, SpeakerSlash } from '@phosphor-icons/react';
+import { IoVolumeHigh, IoVolumeMute } from 'react-icons/io5';
 import { gsap } from 'gsap';
 import { useEffect, useRef, useState } from 'react';
-import { catalog } from '@/lib/api';
+import { queryClient, streamQueries } from '@/lib/queries';
 import {
   addMagnet,
   buildMagnet,
@@ -12,27 +12,52 @@ import {
   waitUntilLive,
 } from '@/lib/local-engine';
 import { isBrowserPlayableFilename } from '@/lib/media-compatibility';
-import { rankStreams } from '@/lib/stream-select';
+import { rankPreviewStreams } from '@/lib/stream-select';
 import { useCore } from './core-provider';
 
-const PREVIEW_SECONDS = 60;
+const PREVIEW_SECONDS = 30;
+const PREPARE_DELAY_MS = 100;
+
+function randomPreviewEpisode(item: MediaDetails): { season: number; episode: number } | null {
+  const eligibleSeasons = item.seasons.filter((season) => season.episodeCount > 1);
+  if (eligibleSeasons.length === 0) return null;
+
+  const season = eligibleSeasons[Math.floor(Math.random() * eligibleSeasons.length)];
+  const firstHalfEnd = Math.min(
+    season.episodeCount - 1,
+    Math.max(1, Math.ceil(season.episodeCount / 2)),
+  );
+
+  return {
+    season: season.seasonNumber,
+    episode: 1 + Math.floor(Math.random() * firstHalfEnd),
+  };
+}
 
 export function AutoPreview({
   item,
   videoClassName = 'absolute inset-0 -z-20 h-full w-full object-cover',
   controlClassName = 'absolute bottom-8 right-5 z-20 sm:bottom-10 sm:right-8',
+  onActiveChange,
 }: {
   item: MediaDetails;
   videoClassName?: string;
   controlClassName?: string;
+  /** Fires when the preview takes over the artwork, and again when it ends. */
+  onActiveChange?: (active: boolean) => void;
 }) {
   const { connect } = useCore();
   const videoRef = useRef<HTMLVideoElement>(null);
   const startedRef = useRef(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewActive, setPreviewActive] = useState(false);
+  const activeChangeRef = useRef(onActiveChange);
+  activeChangeRef.current = onActiveChange;
   const [muted, setMuted] = useState(true);
-  const firstSeason = item.mediaType === 'tv' ? (item.seasons[0]?.seasonNumber ?? 1) : undefined;
+
+  useEffect(() => {
+    activeChangeRef.current?.(previewActive);
+  }, [previewActive]);
 
   useEffect(() => {
     setPreviewUrl(null);
@@ -45,18 +70,25 @@ export function AutoPreview({
 
     async function preparePreview() {
       try {
+        const target = item.mediaType === 'tv' ? randomPreviewEpisode(item) : null;
+        if (item.mediaType === 'tv' && !target) return;
+
         const connection = await connect();
-        const streams = await catalog.streams.get(
-          item.mediaType,
-          item.imdbId as string,
-          firstSeason,
-          firstSeason == null ? undefined : 1,
+        const streams = await queryClient.fetchQuery(
+          streamQueries.streams(
+            item.mediaType,
+            item.imdbId as string,
+            target?.season,
+            target?.episode,
+          ),
         );
-        const source = rankStreams(streams)[0];
+        const source = rankPreviewStreams(streams, item.originalLanguage)[0];
         if (!source || cancelled) return;
 
         const added = await addMagnet(connection, buildMagnet(source), {
-          mediaKey: `${item.mediaType}:${item.id}`,
+          mediaKey: `${item.mediaType}:${item.id}${
+            target ? `:${target.season}:${target.episode}` : ''
+          }`,
           title: item.title,
         });
         if (cancelled) return;
@@ -74,13 +106,13 @@ export function AutoPreview({
       }
     }
 
-    const idle = window.setTimeout(() => void preparePreview(), 900);
+    const idle = window.setTimeout(() => void preparePreview(), PREPARE_DELAY_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(idle);
       videoRef.current?.pause();
     };
-  }, [connect, firstSeason, item.id, item.imdbId, item.mediaType, item.title]);
+  }, [connect, item]);
 
   useGSAP(
     () => {
@@ -95,9 +127,15 @@ export function AutoPreview({
           duration: 2.2,
           ease: 'power2.inOut',
           delay: PREVIEW_SECONDS,
+          onStart: () => {
+            // Ride the audio down with the picture instead of a hard cut.
+            gsap.killTweensOf(video, 'volume');
+            gsap.to(video, { volume: 0, duration: 2.2, ease: 'power2.inOut' });
+          },
           onComplete: () => {
             video.pause();
             video.muted = true;
+            video.volume = 1;
             setMuted(true);
             setPreviewActive(false);
           },
@@ -107,7 +145,17 @@ export function AutoPreview({
     { dependencies: [previewActive], revertOnUpdate: true },
   );
 
+  /** Previews are ambience — never show embedded subtitle/caption tracks. */
+  function disableTextTracks() {
+    const video = videoRef.current;
+    if (!video) return;
+    for (let index = 0; index < video.textTracks.length; index += 1) {
+      video.textTracks[index].mode = 'disabled';
+    }
+  }
+
   function positionPreview() {
+    disableTextTracks();
     const video = videoRef.current;
     if (!video || startedRef.current || !Number.isFinite(video.duration) || video.duration <= 0) return;
 
@@ -124,6 +172,7 @@ export function AutoPreview({
     const video = videoRef.current;
     if (!video || startedRef.current) return;
     startedRef.current = true;
+    disableTextTracks();
     video.muted = true;
     void video
       .play()
@@ -137,7 +186,23 @@ export function AutoPreview({
     const video = videoRef.current;
     if (!video) return;
     const nextMuted = !video.muted;
-    video.muted = nextMuted;
+    gsap.killTweensOf(video, 'volume');
+    if (nextMuted) {
+      // Ease the sound away before actually muting so there is no hard cut.
+      gsap.to(video, {
+        volume: 0,
+        duration: 0.45,
+        ease: 'power2.out',
+        onComplete: () => {
+          video.muted = true;
+          video.volume = 1;
+        },
+      });
+    } else {
+      video.volume = 0;
+      video.muted = false;
+      gsap.to(video, { volume: 1, duration: 0.9, ease: 'power2.out' });
+    }
     setMuted(nextMuted);
   }
 
@@ -165,9 +230,9 @@ export function AutoPreview({
             onClick={toggleAudio}
             aria-label={muted ? `Play ${item.title} preview audio` : `Mute ${item.title} preview`}
             aria-pressed={!muted}
-            className="inline-flex size-11 cursor-pointer items-center justify-center rounded-full border border-white/20 bg-black/48 text-white shadow-lg backdrop-blur-xl transition duration-300 hover:scale-105 hover:border-white/35 hover:bg-black/68"
+            className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-[#1f1f1f] text-white shadow-[0_8px_24px_rgba(0,0,0,0.35)] transition-colors hover:bg-control-hover"
           >
-            {muted ? <SpeakerSlash className="size-[1.1rem]" /> : <SpeakerHigh className="size-[1.1rem]" />}
+            {muted ? <IoVolumeMute size={23} /> : <IoVolumeHigh size={23} />}
           </button>
         </div>
       ) : null}

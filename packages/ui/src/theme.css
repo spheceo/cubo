@@ -1,17 +1,24 @@
 /* Shared design tokens for @cubo/ui. Imported by every app that renders these
    components so the palette stays identical across web and desktop. */
 @theme {
-  --color-ink: #08080a;
-  --color-surface: #16161a;
-  --color-line: #ffffff14;
-  --color-line-strong: #ffffff2e;
-  --color-fg: #f5f5f3;
-  --color-muted: #a3a3ab;
-  --color-faint: #6f6f78;
-  --color-accent: #e7ff69;
+  --color-background: #141414;
+  --color-ink: #141414;
+  --color-elevated: #1d1d1d;
+  --color-panel: #181818;
+  --color-surface: #232323;
+  --color-control: #2c2c2c;
+  --color-control-hover: #3a3a3a;
+  --color-line: #ffffff1f;
+  --color-line-strong: #ffffff33;
+  --color-fg: #ffffff;
+  --color-muted: #c6c6c6;
+  --color-faint: #8a8a8a;
+  --color-accent: #e50914;
+  --color-star: #dfa34b;
 
-  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
     'Segoe UI', sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
 }
 
 @utility no-scrollbar {
@@ -19,12 +26,32 @@
   scrollbar-width: none;
 
   &::-webkit-scrollbar {
+    width: 0;
+    height: 0;
     display: none;
+    background: transparent;
   }
 }
 
+/* Kino's page gutter: a flat 40px rail rather than a centred column. */
 @utility shell {
-  margin-inline: auto;
-  max-width: none;
-  padding-inline: clamp(1.25rem, 4vw, 5rem);
+  padding-inline: 1.5rem;
+
+  @media (width >= 40rem) {
+    padding-inline: 2.5rem;
+  }
+}
+
+@utility bg-blur {
+  backdrop-filter: blur(4px);
+}
+
+@utility bg-blur-dark {
+  backdrop-filter: blur(10px);
+  background-color: #25252570;
+}
+
+@utility bg-blur-light {
+  backdrop-filter: blur(10px);
+  background-color: #ffffff9f;
 }

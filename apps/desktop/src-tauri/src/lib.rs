@@ -1,5 +1,6 @@
 mod engine;
 mod store;
+mod transcode;
 
 use tauri::Manager;
 

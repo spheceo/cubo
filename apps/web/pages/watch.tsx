@@ -1,8 +1,8 @@
-import type { MediaDetails, MediaType } from '@cubo/core';
-import { useEffect, useState } from 'react';
+import type { MediaType } from '@cubo/core';
+import { useQuery } from '@tanstack/react-query';
 import { useParams, useSearchParams } from 'react-router';
 import { WatchScreen } from '@/components/watch-screen';
-import { catalog } from '@/lib/api';
+import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { NotFoundPage } from './not-found';
 
@@ -17,79 +17,52 @@ export function WatchPage() {
   const id = Number(params.id);
   const valid = mediaType !== null && Number.isFinite(id);
 
-  const [details, setDetails] = useState<MediaDetails | null>(null);
-  const [subtitle, setSubtitle] = useState<string | null>(null);
-  const [missing, setMissing] = useState(false);
+  const details = useQuery({
+    ...tmdbQueries.details(mediaType ?? 'movie', id),
+    enabled: valid,
+  });
 
   const resolvedSeason =
     mediaType === 'tv'
-      ? Number(searchParams.get('season')) || details?.seasons[0]?.seasonNumber || 1
+      ? Number(searchParams.get('season')) || details.data?.seasons[0]?.seasonNumber || 1
       : undefined;
-  const resolvedEpisode = mediaType === 'tv' ? Number(searchParams.get('episode')) || 1 : undefined;
+  const resolvedEpisode =
+    mediaType === 'tv' ? Number(searchParams.get('episode')) || 1 : undefined;
 
-  useDocumentTitle(details ? `Watch ${details.title}` : 'Watch');
+  const season = useQuery({
+    ...tmdbQueries.season(id, resolvedSeason ?? 1),
+    enabled: valid && mediaType === 'tv' && details.data != null,
+  });
 
-  useEffect(() => {
-    if (!valid || !mediaType) {
-      setMissing(true);
-      return;
-    }
-    let cancelled = false;
-    setDetails(null);
-    setMissing(false);
-    catalog.tmdb
-      .details(mediaType, id)
-      .then((found) => {
-        if (!cancelled) setDetails(found);
-      })
-      .catch(() => {
-        if (!cancelled) setMissing(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mediaType, id, valid]);
+  useDocumentTitle(details.data ? `Watch ${details.data.title}` : 'Watch');
 
-  useEffect(() => {
-    if (mediaType !== 'tv' || !details || resolvedSeason == null || resolvedEpisode == null) {
-      setSubtitle(null);
-      return;
-    }
-    let cancelled = false;
-    catalog.tmdb
-      .season(id, resolvedSeason)
-      .then((episodes) => {
-        if (cancelled) return;
-        const current = episodes.find((entry) => entry.episodeNumber === resolvedEpisode);
-        setSubtitle(
-          `S${resolvedSeason} E${resolvedEpisode}${current?.name ? ` · ${current.name}` : ''}`,
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setSubtitle(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mediaType, id, details, resolvedSeason, resolvedEpisode]);
-
-  if (missing) return <NotFoundPage />;
-  if (!details || !mediaType) {
+  if (!valid || details.error) return <NotFoundPage />;
+  if (!details.data || !mediaType) {
     return <div className="fixed inset-0 bg-black" aria-label="Loading player" />;
   }
+
+  const currentEpisode =
+    mediaType === 'tv'
+      ? season.data?.find((entry) => entry.episodeNumber === resolvedEpisode)
+      : undefined;
+  const subtitle =
+    mediaType === 'tv' && resolvedSeason != null && resolvedEpisode != null
+      ? `S${resolvedSeason} E${resolvedEpisode}${currentEpisode?.name ? ` · ${currentEpisode.name}` : ''}`
+      : null;
 
   return (
     <WatchScreen
       key={`${mediaType}:${id}:${resolvedSeason ?? '-'}`}
       mediaType={mediaType}
       mediaId={id}
-      imdbId={details.imdbId}
-      title={details.title}
+      imdbId={details.data.imdbId}
+      title={details.data.title}
       subtitle={subtitle}
       backHref={`/${mediaType}/${id}`}
-      backdropPath={details.backdropPath}
-      posterPath={details.posterPath}
-      logoPath={details.logoPath}
+      backdropPath={details.data.backdropPath}
+      posterPath={details.data.posterPath}
+      logoPath={details.data.logoPath}
+      originalLanguage={details.data.originalLanguage}
       season={resolvedSeason}
       episode={resolvedEpisode}
     />

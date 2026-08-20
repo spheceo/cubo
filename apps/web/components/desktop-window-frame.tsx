@@ -1,4 +1,4 @@
-import { Minus, Square, X } from '@phosphor-icons/react';
+import { IoClose, IoRemove, IoSquareOutline } from 'react-icons/io5';
 import { useEffect, useState } from 'react';
 import { isDesktopRuntime } from '@/lib/local-engine';
 
@@ -43,7 +43,7 @@ export function DesktopWindowFrame() {
           aria-label="Minimize window"
           className="inline-flex w-11 cursor-default items-center justify-center transition hover:bg-white/12 hover:text-white"
         >
-          <Minus className="size-3.5" />
+          <IoRemove size={16} />
         </button>
         <button
           type="button"
@@ -51,7 +51,7 @@ export function DesktopWindowFrame() {
           aria-label="Maximize window"
           className="inline-flex w-11 cursor-default items-center justify-center transition hover:bg-white/12 hover:text-white"
         >
-          <Square className="size-3" />
+          <IoSquareOutline size={13} />
         </button>
         <button
           type="button"
@@ -59,7 +59,7 @@ export function DesktopWindowFrame() {
           aria-label="Close window"
           className="inline-flex w-11 cursor-default items-center justify-center transition hover:bg-[#c42b1c] hover:text-white"
         >
-          <X className="size-3.5" />
+          <IoClose size={16} />
         </button>
       </div>
     </div>

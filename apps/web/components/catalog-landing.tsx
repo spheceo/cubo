@@ -1,25 +1,30 @@
-import type { MediaDetails, MediaSummary } from '@cubo/core';
+import type { MediaDetails, MediaSummary, MediaType } from '@cubo/core';
+import { ContinueWatching } from './continue-watching';
 import { FeaturedHero } from './featured-hero';
 import { MediaRow } from './media-row';
 import { MotionReveal } from './motion-reveal';
 
 export function CatalogLanding({
+  mediaType,
   featured,
   sections,
 }: {
+  mediaType: MediaType;
   featured: MediaDetails | null;
   sections: { title: string; items: MediaSummary[] }[];
 }) {
   return (
-    <main>
+    <div className="min-h-dvh bg-background text-white">
       {featured ? <FeaturedHero item={featured} /> : null}
-      <div className="shell space-y-14 pb-28 pt-12 sm:space-y-20 sm:pt-16">
+
+      <div className="relative space-y-10 px-6 sm:px-10">
+        <ContinueWatching mediaType={mediaType} className="pt-2" />
         {sections.map((section) => (
           <MotionReveal key={section.title}>
             <MediaRow title={section.title} items={section.items} />
           </MotionReveal>
         ))}
       </div>
-    </main>
+    </div>
   );
 }

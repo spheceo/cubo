@@ -28,6 +28,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
 use crate::store::{CoreStore, PlaybackUpdate, WatchLaterUpdate};
+use crate::transcode::TranscodeManager;
 
 const CORE_PORT: u16 = 8765;
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
@@ -58,11 +59,20 @@ struct BridgeState {
     web_origin: Option<Arc<str>>,
     download_dir: Arc<PathBuf>,
     store: CoreStore,
+    transcode: Arc<TranscodeManager>,
 }
 
 #[derive(Deserialize)]
 struct StreamQuery {
     token: String,
+}
+
+#[derive(Deserialize)]
+struct HlsQuery {
+    token: String,
+    /// Seconds into the source the remux should begin at. Seeking into an
+    /// unconverted region restarts ffmpeg here instead of waiting for it.
+    start: Option<f64>,
 }
 
 static ENGINE: OnceCell<Engine> = OnceCell::const_new();
@@ -109,6 +119,10 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 .iter()
                 .filter_map(|listener| listener.local_addr().ok())
                 .collect::<Vec<_>>();
+            let transcode_dir = download_dir
+                .parent()
+                .unwrap_or(download_dir.as_path())
+                .join("transcode");
             let state = BridgeState {
                 rqbit_port,
                 token: Uuid::new_v4().simple().to_string().into(),
@@ -116,6 +130,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 web_origin: resolve_web_origin()?,
                 download_dir: Arc::new(download_dir),
                 store,
+                transcode: Arc::new(TranscodeManager::new(transcode_dir)),
             };
             let router = bridge_router(state.clone());
 
@@ -252,16 +267,27 @@ fn bridge_router(state: BridgeState) -> Router {
             HeaderName::from_static("x-cubo-media-key"),
             HeaderName::from_static("x-cubo-title"),
         ])
-        .expose_headers([ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE]);
+        .expose_headers([
+            ACCEPT_RANGES,
+            CONTENT_LENGTH,
+            CONTENT_RANGE,
+            CONTENT_TYPE,
+            HeaderName::from_static("x-cubo-duration"),
+        ]);
 
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/torrents", post(add_torrent))
         .route("/v1/torrents/{id}/stats", get(torrent_stats))
         .route("/v1/torrents/{id}/stream/{file_index}", get(stream_torrent))
+        .route("/v1/torrents/{id}/hls/{file_index}/{file}", get(hls_file))
         .route("/v1/library", get(library_snapshot))
         .route("/v1/library/progress", post(record_playback))
         .route("/v1/library/watch-later", post(update_watch_later))
+        .route(
+            "/v1/library/history/{key}",
+            axum::routing::delete(remove_history_item),
+        )
         .route("/v1/cache", get(cache_status).delete(clear_cache))
         .route("/v1/cache/settings", put(update_cache_settings))
         .route("/v1/cache/{id}", axum::routing::delete(delete_cache_item))
@@ -326,6 +352,7 @@ async fn health(State(state): State<BridgeState>) -> impl IntoResponse {
         "engineVersion": librqbit::version(),
         "sessionToken": state.token,
         "webUrl": state.web_origin,
+        "transcode": state.transcode.available(),
     }))
 }
 
@@ -382,6 +409,20 @@ async fn update_watch_later(
     }
 }
 
+async fn remove_history_item(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    match state.store.remove_history_item(&key).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
 async fn update_cache_settings(
     State(state): State<BridgeState>,
     headers: HeaderMap,
@@ -429,39 +470,124 @@ async fn delete_cache_item(
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
-    let response = state
-        .client
-        .post(format!(
-            "http://127.0.0.1:{}/torrents/{}/delete",
-            state.rqbit_port,
-            urlencoding::encode(&id)
-        ))
-        .send()
-        .await;
 
-    match response {
-        Ok(response) if response.status().is_success() => {
-            if let Err(error) = state.store.remove_cache_entry(&id).await {
-                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(response) => bridge_error(response.status(), "Could not remove cached video".into()),
-        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    // rqbit forgets its torrents when the app restarts, so it deleting the
+    // torrent is the happy path, not the source of truth. "Unknown torrent"
+    // is fine — the recorded file paths get removed from disk either way.
+    if let Err(error) = rqbit_delete(&state, &id).await {
+        return bridge_error(StatusCode::BAD_GATEWAY, error);
     }
+
+    let snapshot = state.store.snapshot().await;
+    let entry_files = snapshot
+        .cache_entries
+        .iter()
+        .find(|entry| {
+            entry.info_hash == id
+                || entry.torrent_id.map(|value| value.to_string()).as_deref() == Some(id.as_str())
+        })
+        .map(|entry| entry.files.clone())
+        .unwrap_or_default();
+    remove_entry_files(&state.download_dir, &entry_files).await;
+
+    if let Err(error) = state.store.remove_cache_entry(&id).await {
+        return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn clear_cache(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
-    match delete_all_torrents(&state).await {
-        Ok(()) => match state.store.clear_cache_entries().await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
-        },
-        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error),
+    if let Err(error) = delete_all_torrents(&state).await {
+        return bridge_error(StatusCode::BAD_GATEWAY, error);
     }
+    if let Err(error) = state.store.clear_cache_entries().await {
+        return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    // The download directory belongs exclusively to this cache; wiping the
+    // leftovers reclaims files rqbit no longer knows about (older sessions).
+    let download_dir = state.download_dir.clone();
+    let wiped = tokio::task::spawn_blocking(move || wipe_dir_contents(&download_dir))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+    match wiped {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+/// Asks rqbit to delete a torrent and its files. Returns Ok whether it
+/// deleted or simply didn't know the torrent (post-restart orphans).
+async fn rqbit_delete(state: &BridgeState, id: &str) -> Result<(), String> {
+    let response = state
+        .client
+        .post(format!(
+            "http://127.0.0.1:{}/torrents/{}/delete",
+            state.rqbit_port,
+            urlencoding::encode(id)
+        ))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!(
+            "rqbit could not delete torrent {id} ({})",
+            response.status()
+        ))
+    }
+}
+
+/// Removes an entry's recorded files from disk and prunes the empty folders
+/// they leave behind. Paths outside the download directory are refused.
+async fn remove_entry_files(download_dir: &std::path::Path, files: &[String]) {
+    let download_dir = download_dir.to_path_buf();
+    let files = files.to_vec();
+    let _ = tokio::task::spawn_blocking(move || {
+        for file in &files {
+            let path = std::path::Path::new(file);
+            if !path.starts_with(&download_dir) {
+                continue;
+            }
+            let _ = std::fs::remove_file(path);
+            let mut parent = path.parent();
+            while let Some(dir) = parent {
+                if dir == download_dir.as_path() {
+                    break;
+                }
+                // remove_dir only succeeds on empty directories, so this
+                // stops naturally at folders that still hold other files.
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                parent = dir.parent();
+            }
+        }
+    })
+    .await;
+}
+
+fn wipe_dir_contents(dir: &std::path::Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|error| error.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            return Err(format!("could not remove {}: {error}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 async fn cache_maintenance_loop(state: BridgeState) {
@@ -487,23 +613,53 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
             .torrent_id
             .map(|value| value.to_string())
             .unwrap_or_else(|| entry.info_hash.clone());
-        let response = state
-            .client
-            .post(format!(
-                "http://127.0.0.1:{}/torrents/{}/delete",
-                state.rqbit_port,
-                urlencoding::encode(&id)
-            ))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if response.status().is_success() {
+        // Delete through rqbit when it still knows the torrent, and always
+        // remove the recorded files — after a restart only the files exist.
+        if rqbit_delete(state, &id).await.is_ok() {
+            remove_entry_files(&state.download_dir, &entry.files).await;
             state.store.remove_cache_entry(&id).await?;
         }
         used_bytes = cache_size(state.download_dir.clone()).await?;
         if used_bytes <= snapshot.cache.max_bytes {
-            break;
+            return Ok(());
         }
+    }
+
+    // Still over the limit: whatever remains is untracked (downloaded before
+    // file paths were recorded). Reclaim the oldest items, sparing anything
+    // touched in the last 10 minutes — that could be an active stream.
+    let download_dir = state.download_dir.clone();
+    let max_bytes = snapshot.cache.max_bytes;
+    tokio::task::spawn_blocking(move || reclaim_untracked(&download_dir, max_bytes))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String> {
+    const ACTIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+    let mut items: Vec<(std::path::PathBuf, std::time::SystemTime)> = std::fs::read_dir(dir)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .filter_map(|entry| {
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((entry.path(), modified))
+        })
+        .collect();
+    items.sort_by_key(|(_, modified)| *modified);
+
+    for (path, modified) in items {
+        if directory_size(dir).map_err(|error| error.to_string())? <= max_bytes {
+            return Ok(());
+        }
+        if modified.elapsed().unwrap_or_default() < ACTIVE_GRACE {
+            continue;
+        }
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
     }
     Ok(())
 }
@@ -519,23 +675,15 @@ async fn delete_all_torrents(state: &BridgeState) -> Result<(), String> {
         .json::<TorrentListResponse>()
         .await
         .map_err(|error| error.to_string())?;
+    // Best effort per torrent: one stuck torrent must not block clearing the
+    // rest (the directory wipe afterwards reclaims its files regardless).
     for torrent in list.torrents {
         let id = torrent
             .id
             .map(|value| value.to_string())
             .unwrap_or(torrent.info_hash);
-        let response = state
-            .client
-            .post(format!(
-                "http://127.0.0.1:{}/torrents/{}/delete",
-                state.rqbit_port,
-                urlencoding::encode(&id)
-            ))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("rqbit could not delete torrent {id}"));
+        if let Err(error) = rqbit_delete(state, &id).await {
+            eprintln!("Cubo cache clear: {error}");
         }
     }
     Ok(())
@@ -770,12 +918,86 @@ async fn add_torrent(
                     .unwrap_or_default()
                     .to_owned();
                 if !info_hash.is_empty() {
+                    // Record absolute file paths so cache deletion keeps
+                    // working after restarts, when rqbit no longer knows the
+                    // torrent but the files are still on disk.
+                    let output_folder = parsed
+                        .as_ref()
+                        .and_then(|value| {
+                            value
+                                .get("output_folder")
+                                .or_else(|| value.pointer("/details/output_folder"))
+                        })
+                        .and_then(serde_json::Value::as_str);
+                    let files = match output_folder {
+                        Some(folder) => parsed
+                            .as_ref()
+                            .and_then(|value| value.pointer("/details/files"))
+                            .and_then(serde_json::Value::as_array)
+                            .map(|files| {
+                                files
+                                    .iter()
+                                    .filter_map(|file| {
+                                        file.get("name").and_then(serde_json::Value::as_str)
+                                    })
+                                    .map(|name| {
+                                        std::path::Path::new(folder)
+                                            .join(name)
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
                     if let Err(error) = state
                         .store
-                        .touch_cache(torrent_id, info_hash, media_key, title)
+                        .touch_cache(torrent_id, info_hash.clone(), media_key, title, files)
                         .await
                     {
                         eprintln!("Could not update Cubo cache index: {error}");
+                    }
+                }
+
+                // MKV files can only play through the remux pipeline, which
+                // needs an ffprobe first. Warm it now, in parallel with the
+                // torrent buffering, so the playlist request doesn't pay for
+                // it serially. (Direct-play MP4s never need a probe.)
+                if !info_hash.is_empty() {
+                    let torrent_key = torrent_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| info_hash.clone());
+                    let largest_mkv = parsed
+                        .as_ref()
+                        .and_then(|value| value.pointer("/details/files"))
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|files| {
+                            files
+                                .iter()
+                                .enumerate()
+                                .max_by_key(|(_, file)| {
+                                    file.get("length").and_then(serde_json::Value::as_u64)
+                                })
+                                .filter(|(_, file)| {
+                                    file.get("name")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|name| {
+                                            name.to_ascii_lowercase().ends_with(".mkv")
+                                        })
+                                })
+                                .map(|(index, _)| index)
+                        });
+                    if let Some(file_index) = largest_mkv {
+                        let key = format!("{torrent_key}:{file_index}");
+                        let input_url = format!(
+                            "http://127.0.0.1:{}/torrents/{torrent_key}/stream/{file_index}",
+                            state.rqbit_port
+                        );
+                        let transcode = state.transcode.clone();
+                        tauri::async_runtime::spawn(async move {
+                            transcode.prewarm(key, input_url).await;
+                        });
                     }
                 }
             }
@@ -837,6 +1059,154 @@ async fn stream_torrent(
         Ok(response) => proxy_response(response),
         Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
     }
+}
+
+/// Serves the remux pipeline for one torrent file. `media.m3u8` starts (or
+/// reuses) the ffmpeg job and returns the playlist with the session token
+/// appended to every segment URI; any other name serves a segment from disk.
+async fn hls_file(
+    State(state): State<BridgeState>,
+    Path((id, file_index, file)): Path<(String, usize, String)>,
+    Query(query): Query<HlsQuery>,
+) -> Response {
+    if query.token != state.token.as_ref() {
+        return unauthorized();
+    }
+    if !state.transcode.available() {
+        return bridge_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "ffmpeg is not available on this Core".into(),
+        );
+    }
+    let key = format!("{id}:{file_index}");
+    let start = query.start.unwrap_or(0.0).max(0.0);
+
+    if file == "media.m3u8" {
+        // hls.js polls this URL every few seconds while the playlist grows.
+        // A running job's playlist is served straight from disk — probing the
+        // source again here blocked every poll behind a fresh ffprobe.
+        if !state.transcode.job_usable(&key, start).await {
+            let input_url = format!(
+                "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
+                state.rqbit_port
+            );
+            // Seek restarts and prewarmed torrents reuse a cached probe; only
+            // a cold file pays for ffprobe here, and the result is remembered.
+            let probe = match state.transcode.cached_probe(&key).await {
+                Some(probe) => probe,
+                None => match state.transcode.probe(&input_url).await {
+                    Ok(probe) => {
+                        state.transcode.remember_probe(&key, probe.clone()).await;
+                        probe
+                    }
+                    Err(error) => return bridge_error(StatusCode::BAD_GATEWAY, error),
+                },
+            };
+            if !probe.video_copyable() {
+                return bridge_error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    format!(
+                        "video codec {} cannot be converted quickly",
+                        probe.video_codec.as_deref().unwrap_or("unknown")
+                    ),
+                );
+            }
+            if let Err(error) = state
+                .transcode
+                .ensure_job(&key, &input_url, &probe, start)
+                .await
+            {
+                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+            }
+        }
+
+        let Some(job_dir) = state.transcode.job_dir(&key).await else {
+            return bridge_error(StatusCode::NOT_FOUND, "no conversion is running".into());
+        };
+        if let Err(error) = state.transcode.wait_for_playlist(&job_dir).await {
+            return bridge_error(StatusCode::GATEWAY_TIMEOUT, error);
+        }
+        let duration = state.transcode.job_duration(&key).await;
+        let nonce = state.transcode.job_nonce(&key).await.unwrap_or_default();
+
+        return match tokio::fs::read_to_string(job_dir.join("media.m3u8")).await {
+            Ok(content) => {
+                let mut response = (
+                    [
+                        (CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                        (HeaderName::from_static("cache-control"), "no-store"),
+                    ],
+                    rewrite_playlist(&content, &state.token, &nonce),
+                )
+                    .into_response();
+                if let Some(duration) = duration {
+                    if let Ok(value) = HeaderValue::from_str(&duration.to_string()) {
+                        response
+                            .headers_mut()
+                            .insert(HeaderName::from_static("x-cubo-duration"), value);
+                    }
+                }
+                response
+            }
+            Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+    }
+
+    // Segment names come from ffmpeg; refuse anything that could escape the
+    // job directory.
+    if file.contains('/') || file.contains('\\') || file.contains("..") {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid segment name".into());
+    }
+    let Some(job_dir) = state.transcode.job_dir(&key).await else {
+        return bridge_error(StatusCode::NOT_FOUND, "no conversion is running".into());
+    };
+    match tokio::fs::read(job_dir.join(&file)).await {
+        Ok(bytes) => {
+            let content_type = if file.ends_with(".mp4") {
+                "video/mp4"
+            } else if file.ends_with(".m4s") {
+                "video/iso.segment"
+            } else {
+                "application/octet-stream"
+            };
+            // Seek restarts reuse segment names in a fresh job; a cached
+            // response from the previous offset would splice wrong video in.
+            (
+                [
+                    (CONTENT_TYPE, content_type),
+                    (HeaderName::from_static("cache-control"), "no-store"),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => bridge_error(StatusCode::NOT_FOUND, "segment not found".into()),
+    }
+}
+
+/// HLS players fetch segment URIs verbatim, so the session token rides along
+/// as a query parameter on every entry — plus the job nonce, which makes each
+/// conversion's segment URLs unique. Seek restarts reuse segment names for
+/// different content, and a cached response from a previous job would splice
+/// mismatched audio/video into playback.
+fn rewrite_playlist(content: &str, token: &str, nonce: &str) -> String {
+    let params = format!("token={token}&v={nonce}");
+    content
+        .lines()
+        .map(|line| {
+            if line.starts_with("#EXT-X-MAP") {
+                line.replace(
+                    "URI=\"init.mp4\"",
+                    &format!("URI=\"init.mp4?{params}\""),
+                )
+            } else if !line.starts_with('#') && !line.trim().is_empty() {
+                format!("{line}?{params}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_authorized(state: &BridgeState, headers: &HeaderMap) -> bool {
@@ -945,6 +1315,7 @@ mod tests {
         let store = CoreStore::load(test_dir.join("state.json"))
             .await
             .expect("load test store");
+        let transcode_dir = test_dir.join("transcode");
         let state = BridgeState {
             rqbit_port: 1,
             token: "test-session-token".into(),
@@ -952,6 +1323,7 @@ mod tests {
             web_origin: Some(format!("http://127.0.0.1:{web_port}").into()),
             download_dir: Arc::new(test_dir),
             store,
+            transcode: Arc::new(TranscodeManager::new(transcode_dir)),
         };
         tauri::async_runtime::spawn(async move {
             axum::serve(bridge_listener, bridge_router(state))

@@ -1,14 +1,10 @@
-import type { MediaDetails, MediaSummary, MediaType } from '@cubo/core';
-import { useEffect, useState } from 'react';
+import type { MediaType } from '@cubo/core';
+import { useQuery } from '@tanstack/react-query';
 import { CatalogError } from '@/components/catalog-error';
 import { CatalogLanding } from '@/components/catalog-landing';
-import { catalog } from '@/lib/api';
+import { HeroSkeleton, MediaRowsSkeleton } from '@/components/page-skeletons';
+import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
-
-interface CatalogData {
-  featured: MediaDetails | null;
-  sections: { title: string; items: MediaSummary[] }[];
-}
 
 const COPY: Record<
   MediaType,
@@ -16,79 +12,65 @@ const COPY: Record<
 > = {
   movie: {
     title: 'Movies',
-    sections: ['Trending movies', 'Now playing', 'Popular movies', 'Top rated movies'],
+    sections: ['Trending', 'Now Playing', 'Popular Movies', 'Top Rated'],
   },
   tv: {
     title: 'TV Shows',
-    sections: ['Trending TV shows', 'On the air', 'Popular TV shows', 'Top rated TV shows'],
+    sections: ['Trending', 'On The Air', 'Popular TV Shows', 'Top Rated TV'],
   },
 };
 
 export function CatalogPage({ mediaType }: { mediaType: MediaType }) {
   const copy = COPY[mediaType];
   useDocumentTitle(copy.title);
-  const [data, setData] = useState<CatalogData | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    setData(null);
-    setError(null);
-    (async () => {
-      try {
-        const [trending, current, popular, topRated] = await Promise.all([
-          catalog.tmdb.trending(mediaType),
-          catalog.tmdb.collection(mediaType, 'current'),
-          catalog.tmdb.collection(mediaType, 'popular'),
-          catalog.tmdb.collection(mediaType, 'top_rated'),
-        ]);
-        const featured = trending[0] ? await catalog.tmdb.details(mediaType, trending[0].id) : null;
-        if (cancelled) return;
-        const [trendingTitle, currentTitle, popularTitle, topRatedTitle] = copy.sections;
-        setData({
-          featured,
-          sections: [
-            { title: trendingTitle, items: trending },
-            { title: currentTitle, items: current },
-            { title: popularTitle, items: popular },
-            { title: topRatedTitle, items: topRated },
-          ],
-        });
-      } catch (reason) {
-        if (!cancelled) {
-          setError(reason instanceof Error ? reason.message : 'Could not load the catalogue.');
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [mediaType, copy]);
+  const trending = useQuery(tmdbQueries.trending(mediaType));
+  const current = useQuery(tmdbQueries.collection(mediaType, 'current'));
+  const popular = useQuery(tmdbQueries.collection(mediaType, 'popular'));
+  const topRated = useQuery(tmdbQueries.collection(mediaType, 'top_rated'));
+  const featuredId = trending.data?.[0]?.id;
+  const featured = useQuery({
+    ...tmdbQueries.details(mediaType, featuredId ?? 0),
+    enabled: featuredId != null,
+  });
 
-  if (error) return <CatalogError message={error} />;
-  if (!data) return <CatalogSkeleton />;
-  return <CatalogLanding featured={data.featured} sections={data.sections} />;
+  const error = trending.error ?? current.error ?? popular.error ?? topRated.error;
+  if (error) {
+    return (
+      <CatalogError
+        message={error instanceof Error ? error.message : 'Could not load the catalogue.'}
+      />
+    );
+  }
+
+  const loading =
+    !trending.data ||
+    !current.data ||
+    !popular.data ||
+    !topRated.data ||
+    (featuredId != null && featured.isLoading);
+  if (loading) return <CatalogSkeleton />;
+
+  const [trendingTitle, currentTitle, popularTitle, topRatedTitle] = copy.sections;
+  return (
+    <CatalogLanding
+      mediaType={mediaType}
+      featured={featured.data ?? null}
+      sections={[
+        { title: trendingTitle, items: trending.data },
+        { title: currentTitle, items: current.data },
+        { title: popularTitle, items: popular.data },
+        { title: topRatedTitle, items: topRated.data },
+      ]}
+    />
+  );
 }
 
 function CatalogSkeleton() {
   return (
-    <div className="animate-pulse">
-      <div className="min-h-[32rem] bg-surface sm:min-h-[38rem] lg:min-h-[min(84vh,44rem)]" />
-      <div className="shell space-y-14 pb-24 pt-14 sm:space-y-20 sm:pt-16">
-        {[0, 1, 2, 3].map((row) => (
-          <div key={row}>
-            <div className="mb-5 h-4 w-40 rounded bg-surface" />
-            <div className="flex gap-3 sm:gap-4">
-              {Array.from({ length: 8 }, (_, i) => (
-                <div
-                  key={i}
-                  className="aspect-[2/3] w-[8.5rem] shrink-0 rounded-xl bg-surface sm:w-[10.5rem]"
-                />
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
+    <div className="min-h-dvh bg-background text-white">
+      <HeroSkeleton />
+      <MediaRowsSkeleton rows={4} />
     </div>
   );
 }

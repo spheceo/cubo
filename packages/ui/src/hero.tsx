@@ -1,4 +1,6 @@
 import { backdropUrl, type MediaSummary } from '@cubo/core';
+import { IoMdInformationCircleOutline } from 'react-icons/io';
+import { IoPlay } from 'react-icons/io5';
 import type { LinkComponent } from './link';
 
 export function Hero({
@@ -12,59 +14,52 @@ export function Hero({
   watchHref: string;
   linkComponent?: LinkComponent;
 }) {
-  const src = backdropUrl(item.backdropPath, 'w1280');
+  const src = backdropUrl(item.backdropPath, 'original');
   const year = item.releaseDate.slice(0, 4);
   const kind = item.mediaType === 'tv' ? 'Series' : 'Film';
 
   return (
-    <section className="relative isolate flex min-h-[32rem] items-end overflow-hidden sm:min-h-[38rem] lg:min-h-[min(84vh,44rem)]">
-      {src ? (
-        <img
-          src={src}
-          alt=""
-          fetchPriority="high"
-          className="absolute inset-0 -z-10 h-full w-full object-cover object-center"
-        />
-      ) : (
-        <div className="absolute inset-0 -z-10 bg-surface" />
-      )}
-      <div className="absolute inset-0 -z-10 bg-linear-to-t from-ink via-ink/70 to-ink/10" />
-      <div className="absolute inset-0 -z-10 bg-linear-to-r from-ink/85 via-ink/25 to-transparent" />
+    <div className="relative h-[82dvh] overflow-hidden">
+      <div className="relative h-full w-full overflow-hidden">
+        {src ? (
+          <img src={src} alt="" fetchPriority="high" className="absolute inset-0 h-full w-full object-cover" />
+        ) : (
+          <div className="absolute inset-0 bg-surface" />
+        )}
 
-      <div className="shell w-full pb-14 pt-32 sm:pb-20 sm:pt-40">
-        <p className="flex items-center gap-2.5 text-[0.7rem] font-medium tracking-[0.08em] text-muted uppercase">
-          <span className="size-1 rounded-full bg-accent" />
-          Featured {kind.toLowerCase()}
-        </p>
-        <h1 className="mt-4 max-w-3xl text-balance text-4xl font-semibold leading-[1.02] tracking-[-0.035em] text-fg sm:text-6xl lg:text-7xl">
-          {item.title}
-        </h1>
-        <div className="mt-5 flex items-center gap-2.5 text-[0.8rem] tabular-nums text-muted">
-          <span>{year}</span>
-          <span className="text-line-strong">·</span>
-          <span>{kind}</span>
+        <div className="relative z-10 flex h-full w-full flex-col justify-end px-10 pb-6 pt-10">
+          <div className="w-[600px] max-w-full space-y-5">
+            <h1 className="text-6xl font-bold sm:text-8xl">{item.title}</h1>
+            <div className="flex items-center gap-2 text-xl font-semibold">
+              <h2>{kind}</h2>
+              {year ? (
+                <>
+                  <p>•</p>
+                  <p>{year}</p>
+                </>
+              ) : null}
+            </div>
+            <p className="line-clamp-3">{item.overview}</p>
+            <div className="flex items-center gap-4">
+              <Link href={watchHref}>
+                <span className="flex h-12 w-48 cursor-pointer items-center justify-center gap-2 rounded-full bg-white font-semibold text-black">
+                  <IoPlay size={20} />
+                  Watch Now
+                </span>
+              </Link>
+              <Link
+                href={href}
+                aria-label={`More information about ${item.title}`}
+                className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control"
+              >
+                <IoMdInformationCircleOutline size={25} />
+              </Link>
+            </div>
+          </div>
         </div>
-        <p className="mt-5 line-clamp-3 max-w-lg text-sm leading-relaxed text-muted sm:text-[0.95rem]">
-          {item.overview}
-        </p>
-        <div className="mt-8 flex flex-wrap items-center gap-3">
-          <Link
-            href={watchHref}
-            className="inline-flex items-center gap-2 rounded-full bg-fg px-5 py-2.5 text-sm font-medium text-ink transition hover:bg-accent"
-          >
-            <svg viewBox="0 0 12 12" fill="currentColor" className="size-3">
-              <path d="M2.5 1.3 10 6 2.5 10.7Z" />
-            </svg>
-            Watch now
-          </Link>
-          <Link
-            href={href}
-            className="rounded-full border border-line-strong px-5 py-2.5 text-sm font-medium text-fg/90 backdrop-blur-sm transition hover:border-fg/60 hover:bg-white/5"
-          >
-            More info
-          </Link>
-        </div>
+
+        <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-[#14141499] to-[#14141433]" />
       </div>
-    </section>
+    </div>
   );
 }

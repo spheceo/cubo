@@ -61,7 +61,25 @@ export default defineConfig({
   resolve: {
     alias: [{ find: /^@\//, replacement: `${root}/` }],
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Long-lived vendor chunks so app-code changes don't invalidate the
+        // framework bytes in visitors' caches. hls.js splits automatically
+        // via its dynamic import.
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return undefined;
+          if (/[\\/](react|react-dom|react-router|scheduler)[\\/]/.test(id)) return 'react';
+          if (/[\\/](gsap|@gsap)[\\/]/.test(id)) return 'motion';
+          if (id.includes('@tanstack')) return 'query';
+          return undefined;
+        },
+      },
+    },
+  },
   server: {
+    host: '0.0.0.0',
+    allowedHosts: ['kenobi'],
     port: 3000,
     strictPort: true,
   },
