@@ -25,6 +25,7 @@ import {
 import { IoIosArrowBack } from 'react-icons/io';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from '@/components/link';
+import { isDesktopRuntime } from '@/lib/local-engine';
 import { LogoLoader } from './logo-loader';
 import { formatTime } from '@/lib/format';
 
@@ -291,6 +292,22 @@ export function VideoPlayer({
   }, [resolveDuration, revealControls, seekToAbsolute]);
 
   const toggleFullscreen = useCallback(() => {
+    // WKWebView in the desktop shell doesn't implement element fullscreen —
+    // toggle the native window instead (also feels more at home on desktop).
+    if (isDesktopRuntime()) {
+      void (async () => {
+        try {
+          const { getCurrentWindow } = await import('@tauri-apps/api/window');
+          const appWindow = getCurrentWindow();
+          const next = !(await appWindow.isFullscreen());
+          await appWindow.setFullscreen(next);
+          setFullscreen(next);
+        } catch {
+          // Missing permission or non-Tauri context; nothing to do.
+        }
+      })();
+      return;
+    }
     if (document.fullscreenElement) void document.exitFullscreen();
     else void containerRef.current?.requestFullscreen().catch(() => undefined);
   }, []);
@@ -500,7 +517,7 @@ export function VideoPlayer({
       >
         <Link
           href={backHref}
-          className="pointer-events-auto flex min-w-0 items-center gap-4 text-white transition-colors hover:text-white/80"
+          className="desktop-back-offset pointer-events-auto flex min-w-0 items-center gap-4 text-white transition-colors hover:text-white/80"
         >
           <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-black/55 backdrop-blur-md">
             <IoIosArrowBack size={22} />

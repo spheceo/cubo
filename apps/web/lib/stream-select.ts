@@ -31,6 +31,38 @@ const AUDIO_LANGUAGE_HINTS: [string, RegExp][] = [
 const ORIGINAL_AUDIO_RE = /\b(?:vostfr|original[ ._-]?(?:audio|language))\b/i;
 const MULTI_AUDIO_RE = /\b(?:multi|dual[ ._-]?audio|dubbed)\b/i;
 
+/** Torrentio marks stream languages with country-flag emoji — a far stronger
+ *  dub signal than release-name tokens, since English-original releases
+ *  almost never say "English" while dubs often carry only a flag. */
+const FLAG_LANGUAGES: Record<string, string> = {
+  '🇬🇧': 'en',
+  '🇺🇸': 'en',
+  '🇫🇷': 'fr',
+  '🇪🇸': 'es',
+  '🇲🇽': 'es',
+  '🇩🇪': 'de',
+  '🇮🇹': 'it',
+  '🇵🇹': 'pt',
+  '🇧🇷': 'pt',
+  '🇷🇺': 'ru',
+  '🇯🇵': 'ja',
+  '🇰🇷': 'ko',
+  '🇮🇳': 'hi',
+  '🇨🇳': 'zh',
+  '🇸🇦': 'ar',
+  '🇳🇱': 'nl',
+  '🇵🇱': 'pl',
+  '🇹🇷': 'tr',
+};
+
+function flaggedLanguages(hint: string): Set<string> {
+  const found = new Set<string>();
+  for (const [flag, code] of Object.entries(FLAG_LANGUAGES)) {
+    if (hint.includes(flag)) found.add(code);
+  }
+  return found;
+}
+
 function rank(stream: Stream): number {
   return QUALITY_RANK[stream.quality?.toLowerCase() ?? ''] ?? 4;
 }
@@ -48,6 +80,14 @@ function audioLanguageRank(stream: Stream, nativeLanguage: string | null): numbe
   const native = nativeLanguage.toLowerCase();
   const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
   if (ORIGINAL_AUDIO_RE.test(hint)) return 0;
+
+  // Flags are authoritative when present: a release flagged only with
+  // foreign languages is a dub even if its name carries no language tokens.
+  const flags = flaggedLanguages(hint);
+  if (flags.size > 0) {
+    if (flags.has(native)) return 0;
+    return 3;
+  }
 
   const nativeHint = AUDIO_LANGUAGE_HINTS.find(([code]) => code === native);
   if (nativeHint?.[1].test(hint)) return 0;
