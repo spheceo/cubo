@@ -80,7 +80,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     allowedHosts: ['kenobi'],
-    port: 3000,
+    port: 4200,
     strictPort: true,
   },
 });

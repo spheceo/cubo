@@ -1,0 +1,22 @@
+[package]
+name = "cubo-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cubo-cli"
+path = "src/main.rs"
+
+[dependencies]
+cubo-engine = { path = "../cubo-engine" }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }

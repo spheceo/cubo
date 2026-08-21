@@ -48,8 +48,8 @@ export function LegalPage() {
   const doc = useLegalDoc();
 
   return (
-    <main className="min-h-dvh bg-background px-6 pt-28 pb-8 text-fg sm:px-10">
-      <div className="max-w-3xl">
+    <main className="min-h-dvh bg-background px-6 pt-28 pb-8 text-fg">
+      <div className="mx-auto w-full max-w-[1080px]">
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-faint">Legal</p>
         <h1 className="mt-3 text-[clamp(2.4rem,5.5vw,3.6rem)] font-bold leading-[1.03] tracking-[-0.035em]">
           {doc.title}

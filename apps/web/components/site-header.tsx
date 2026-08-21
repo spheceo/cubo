@@ -7,7 +7,6 @@ const LINKS = [
   { href: '/', label: 'Home' },
   { href: '/movies', label: 'Movies' },
   { href: '/tv-shows', label: 'TV Shows' },
-  { href: '/library', label: 'Library' },
 ];
 
 export function SiteHeader() {
@@ -15,7 +14,7 @@ export function SiteHeader() {
 
   return (
     <div className="absolute top-0 z-50 w-full">
-      <div className="pointer-events-none fixed inset-x-0 top-0 z-0 h-24 bg-linear-to-b from-[#141414e6] via-[#14141499] to-transparent [mask-image:linear-gradient(to_bottom,black_0%,black_70%,transparent_100%)]" />
+      <div className="pointer-events-none fixed inset-x-0 top-0 z-0 h-24 bg-linear-to-b from-[#0a0a0ae6] via-[#0a0a0a99] to-transparent [mask-image:linear-gradient(to_bottom,black_0%,black_70%,transparent_100%)]" />
 
       <header className="relative z-10">
         <nav
@@ -40,7 +39,7 @@ export function SiteHeader() {
                 pathname === link.href
                   ? 'cursor-default text-white'
                   : 'text-muted hover:text-white'
-              } ${link.href === '/movies' || link.href === '/tv-shows' || link.href === '/library' ? 'hidden sm:block' : ''}`}
+              } ${link.href === '/movies' || link.href === '/tv-shows' ? 'hidden sm:block' : ''}`}
             >
               {link.label}
             </Link>

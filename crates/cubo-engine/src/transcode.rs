@@ -118,6 +118,11 @@ struct ActiveJob {
     dir: PathBuf,
     /// Seconds into the source this job's ffmpeg was started at (`-ss`).
     start_seconds: f64,
+    /// Where ffmpeg ACTUALLY landed: the keyframe at/before `start_seconds`.
+    /// Input seeks are keyframe-aligned, so this can be a few seconds earlier
+    /// than the requested start — playlist time zero is THIS value, and the
+    /// client must use it (not the request) as its absolute-time offset.
+    actual_start_seconds: f64,
     /// Unique per job. Appended to segment URLs so a browser can never splice
     /// cached segments from a previous job (same names, different offset)
     /// into this one — that mismatch played audio from one scene over video
@@ -201,16 +206,25 @@ impl TranscodeManager {
             .find(|stream| stream.codec_type.as_deref() == Some("video"))
             .and_then(|stream| stream.codec_name.clone());
         let audio = pick_audio_stream(&parsed.streams);
+        let duration_seconds = parsed
+            .format
+            .duration
+            .as_deref()
+            .and_then(|duration| duration.parse::<f64>().ok())
+            .filter(|duration| duration.is_finite() && *duration > 0.0);
+        tracing::info!(
+            target: "probe",
+            video_codec = video_codec.as_deref().unwrap_or("-"),
+            audio_codec = audio.and_then(|stream| stream.codec_name.clone()).as_deref().unwrap_or("-"),
+            audio_stream_index = audio.and_then(|stream| stream.index).unwrap_or(u32::MAX),
+            duration_seconds = duration_seconds.unwrap_or(0.0),
+            "source probe complete"
+        );
         Ok(MediaProbe {
             video_codec,
             audio_codec: audio.and_then(|stream| stream.codec_name.clone()),
             audio_stream_index: audio.and_then(|stream| stream.index),
-            duration_seconds: parsed
-                .format
-                .duration
-                .as_deref()
-                .and_then(|duration| duration.parse::<f64>().ok())
-                .filter(|duration| duration.is_finite() && *duration > 0.0),
+            duration_seconds,
         })
     }
 
@@ -227,6 +241,22 @@ impl TranscodeManager {
     ) -> Result<PathBuf, String> {
         let ffmpeg = self.ffmpeg.as_ref().ok_or("ffmpeg is not available")?;
         let mut active = self.active.lock().await;
+
+        // An input seek lands on the keyframe AT/BEFORE the target; measure
+        // that spot so the client can map playlist time to absolute movie
+        // time truthfully (subtitle alignment + reported positions).
+        let actual_start = if start_seconds > 0.1 {
+            match self.ffprobe.as_ref() {
+                Some(ffprobe) => {
+                    find_keyframe_before(ffprobe, input_url, start_seconds)
+                        .await
+                        .unwrap_or(start_seconds)
+                }
+                None => start_seconds,
+            }
+        } else {
+            start_seconds
+        };
 
         if let Some(job) = active.as_mut() {
             if job.key == key && same_start(job.start_seconds, start_seconds) {
@@ -308,15 +338,33 @@ impl TranscodeManager {
         let child = command
             .spawn()
             .map_err(|error| format!("could not start ffmpeg: {error}"))?;
+        tracing::info!(
+            target: "remux",
+            key = %key,
+            requested_start_seconds = start_seconds,
+            actual_start_seconds = actual_start,
+            "remux job started"
+        );
         *active = Some(ActiveJob {
             key: key.to_owned(),
             dir: job_dir.clone(),
             start_seconds,
+            actual_start_seconds: actual_start,
             nonce: uuid::Uuid::new_v4().simple().to_string(),
             probe: probe.clone(),
             child,
         });
         Ok(job_dir)
+    }
+
+    /// Where the current job for `key` actually begins in the source (the
+    /// seek keyframe), which can differ from the requested `-ss` target.
+    pub async fn job_actual_start(&self, key: &str) -> Option<f64> {
+        let active = self.active.lock().await;
+        active
+            .as_ref()
+            .filter(|job| job.key == key)
+            .map(|job| job.actual_start_seconds)
     }
 
     /// Cache-busting id of the current job for `key`.
@@ -437,6 +485,59 @@ impl TranscodeManager {
 
 fn same_start(a: f64, b: f64) -> bool {
     (a - b).abs() < 0.25
+}
+
+/// Finds the timestamp of the last video keyframe at/before `target` — the
+/// spot an input seek (`-ss`) with `-noaccurate_seek` actually lands on.
+/// Packet-level scan of a narrow read interval, so this is fast (no decoding).
+/// Returns None when ffprobe fails or finds nothing; callers fall back to the
+/// requested target (the pre-measurement behaviour).
+async fn find_keyframe_before(
+    ffprobe: &Path,
+    input_url: &str,
+    target: f64,
+) -> Option<f64> {
+    let from = (target - 20.0).max(0.0);
+    let to = target + 0.25;
+    let output = Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-read_intervals", &format!("{from:.3}%{to:.3}")])
+        .args(["-show_packets", "-show_entries", "packet=pts_time,flags"])
+        .args(["-of", "csv=p=0"])
+        .arg(input_url)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut best: Option<f64> = None;
+    for line in text.lines() {
+        let mut fields = line.split(',');
+        let pts = fields.next()?.trim().parse::<f64>().ok();
+        let flags = fields.next().unwrap_or("");
+        if let Some(pts) = pts {
+            if flags.contains('K') && pts <= target + 0.001 && best.is_none_or(|b| pts > b) {
+                best = Some(pts);
+            }
+        }
+    }
+    if let Some(found) = best {
+        tracing::debug!(
+            target: "probe",
+            requested_start_seconds = target,
+            actual_start_seconds = found,
+            "keyframe before seek target located"
+        );
+    } else {
+        tracing::debug!(
+            target: "probe",
+            requested_start_seconds = target,
+            "keyframe scan found nothing; falling back to requested start"
+        );
+    }
+    best
 }
 
 fn sanitize_key(key: &str) -> String {

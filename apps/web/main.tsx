@@ -1,5 +1,4 @@
 import '@fontsource-variable/geist';
-import '@fontsource-variable/geist-mono';
 import './globals.css';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { StrictMode } from 'react';

@@ -1,19 +1,14 @@
 import { backdropUrl, titleHref, watchHref, type MediaDetails } from '@cubo/core';
+import { formatNextEpisodeLabel } from '@/lib/air-date';
 import gsap from 'gsap';
 import { useEffect, useRef, useState } from 'react';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
 import { IoPlay } from 'react-icons/io5';
 import { Link } from '@/components/link';
+import { formatRuntime } from '@/lib/format';
 import { watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
 import { WatchLaterButton } from './watch-later-button';
-
-function formatRuntime(minutes: number | null): string | null {
-  if (!minutes) return null;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return `${hours > 0 ? `${hours}h ` : ''}${rest > 0 ? `${rest}m` : ''}`.trim();
-}
 
 /** Kino splits titles on a colon so the subtitle carries the display weight. */
 function HeroTitle({ title }: { title: string }) {
@@ -33,13 +28,18 @@ function HeroTitle({ title }: { title: string }) {
 
 export function FeaturedHero({ item }: { item: MediaDetails }) {
   const artworkRef = useRef<HTMLImageElement>(null);
+  const titleRef = useRef<HTMLDivElement>(null);
   const detailsRef = useRef<HTMLDivElement>(null);
   const descriptionRef = useRef<HTMLDivElement>(null);
   const [previewing, setPreviewing] = useState(false);
   const hasPreviewed = useRef(false);
   const image = backdropUrl(item.backdropPath, 'w1280');
   const year = item.releaseDate.slice(0, 4);
-  const kind = item.mediaType === 'tv' ? 'Featured Show' : 'Featured Movie';
+  const nextAirs = item.nextEpisode ? formatNextEpisodeLabel(item.nextEpisode) : null;
+  const kind =
+    item.mediaType === 'tv'
+      ? (nextAirs ?? 'Featured Show')
+      : 'Featured Movie';
   const firstSeason = item.mediaType === 'tv' ? (item.seasons[0]?.seasonNumber ?? 1) : undefined;
   const playHref =
     item.mediaType === 'tv' ? watchHref(item, firstSeason ?? 1, 1) : watchHref(item);
@@ -74,6 +74,13 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
       delay,
       ease: previewing ? 'power3.inOut' : 'power2.out',
     });
+    // The title settles slightly lower over the playing clip, then returns.
+    const titleTween = gsap.to(titleRef.current, {
+      y: previewing ? 36 : 0,
+      duration: previewing ? 1 : 0.9,
+      delay,
+      ease: previewing ? 'power3.inOut' : 'power2.out',
+    });
     const artwork = gsap.to(artworkRef.current, {
       opacity: previewing ? 0 : 1,
       duration: 1.2,
@@ -82,6 +89,7 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
 
     return () => {
       tween.kill();
+      titleTween.kill();
       artwork.kill();
     };
   }, [previewing]);
@@ -109,7 +117,9 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
 
         <div className="relative z-10 flex h-full w-full flex-col justify-end px-6 pb-6 pt-10 sm:px-10">
           <div className="w-[600px] max-w-full space-y-5">
+            <div ref={titleRef} className="will-change-transform">
             <HeroTitle title={item.title} />
+          </div>
 
             <div ref={detailsRef} className="overflow-hidden">
               <div className="flex items-center gap-2">
@@ -146,7 +156,7 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
           </div>
         </div>
 
-        <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-[#14141499] to-[#14141433]" />
+        <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-[#0a0a0a99] to-[#0a0a0a33]" />
       </div>
     </div>
   );

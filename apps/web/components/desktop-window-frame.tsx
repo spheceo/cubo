@@ -1,4 +1,4 @@
-import { IoClose, IoRemove, IoSquareOutline } from 'react-icons/io5';
+import { IoClose, IoCloudDownloadOutline, IoRemove, IoSquareOutline } from 'react-icons/io5';
 import { useEffect, useState } from 'react';
 import { isDesktopRuntime } from '@/lib/local-engine';
 
@@ -32,11 +32,26 @@ export function DesktopWindowFrame() {
     if (action === 'close') await window.close();
   }
 
+  // Same funnel as the macOS menu item: UpdateBanner listens for this event.
+  async function checkForUpdates() {
+    const { emit } = await import('@tauri-apps/api/event');
+    await emit('cubo://check-updates');
+  }
+
   if (platform !== 'windows') return null;
 
   return (
     <div className="pointer-events-none fixed inset-x-0 top-0 z-[100] h-8 select-none">
       <div className="pointer-events-auto absolute right-0 top-0 flex h-8 items-stretch text-white/72">
+        <button
+          type="button"
+          onClick={() => void checkForUpdates()}
+          aria-label="Check for updates"
+          title="Check for updates"
+          className="inline-flex w-11 cursor-default items-center justify-center transition hover:bg-white/12 hover:text-white"
+        >
+          <IoCloudDownloadOutline size={15} />
+        </button>
         <button
           type="button"
           onClick={() => void withWindow('minimize')}

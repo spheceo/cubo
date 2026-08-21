@@ -1,4 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import {
+  FALLBACK_LEGAL,
+  fetchPublishedLegal,
+  legalDocFrom,
+  splitInlineMarkdown,
+  type LegalDoc,
+} from '../../legal';
 
 const RELEASES_BASE = 'https://github.com/spheceo/cubo/releases/latest/download';
 const DOWNLOADS = {
@@ -9,23 +16,37 @@ const DOWNLOADS = {
 
 const TMDB = 'https://image.tmdb.org/t/p';
 
-/** Curated stills for the marketing collage — visual only, not a catalog. */
+/** Curated stills for the marketing collage — visual only, not a catalog.
+ *  Every path is curl-verified against image.tmdb.org (dead TMDB paths 404
+ *  silently and leave holes in the collage). */
 const STILLS = [
   `${TMDB}/w780/rAiYTfKGqDCRIIqo664sY9XZIvQ.jpg`,
-  `${TMDB}/w780/8rpDcsf9J0n2u1Xblicyuk8hL91.jpg`,
-  `${TMDB}/w780/sAtoMqD2jvkU4yCjtzigBI2s1kZ.jpg`,
-  `${TMDB}/w780/jYEW5xZkZk2WTrdbMGAPFuBDzMw.jpg`,
-  `${TMDB}/w780/b0PlSFdDwbyK0csSAfKuCKmJEJc.jpg`,
-  `${TMDB}/w780/yFRpUmsveXQpMsEuwg0WklK89Kx.jpg`,
-  `${TMDB}/w780/fm6KqXpk3m2H4m9XcWDeVIjCqKq.jpg`,
-  `${TMDB}/w780/rLb2yfND4xOkCKsPYQYJmP8qUx.jpg`,
-  `${TMDB}/w780/dqK7dW7ghRjFTqVWK5u4UQ5XnUD.jpg`,
-  `${TMDB}/w780/2RSirqZG949GuRwN38MYCIgQj0.jpg`,
-  `${TMDB}/w780/hiKmpZVGWsRh5yshAnLFv2kh5hd.jpg`,
-  `${TMDB}/w780/xOMo8BRK7PfcJv9JCnx7s5hj0PX.jpg`,
+  `${TMDB}/w780/8sSKdEmlmqF4kJUd28SqthXC4yZ.jpg`,
+  `${TMDB}/w780/7iwUUcKURMT7aKfCwMy6YnGtchD.jpg`,
+  `${TMDB}/w780/jUdV706J4d3nUEbfimqVnGZqTbW.jpg`,
+  `${TMDB}/w780/r57L2UBLPKcHdZQYg8tagv9XqK2.jpg`,
+  `${TMDB}/w780/kkcwhgSFd81QDlXo8ytrpHPQjhy.jpg`,
+  `${TMDB}/w780/rZfmzpixLKLR3Hg2u0WgC7XLFl8.jpg`,
+  `${TMDB}/w780/b9q9VmbXDvJmTziRqkwdEmFdwhr.jpg`,
+  `${TMDB}/w780/flxau5Iu7bChQHsESqvGZ3FQRaI.jpg`,
+  `${TMDB}/w780/s4v0UX1anfXm0UvloLsTTJ4v222.jpg`,
+  `${TMDB}/w780/vJb3fniB8E0JnSMr1tDyIsb6gPi.jpg`,
+  `${TMDB}/w780/hD8y787ciNWQ2bn396YrSsOIzdN.jpg`,
 ];
 
 type Platform = 'mac' | 'windows' | 'other';
+
+const PLATFORM_LABEL: Record<Platform, string> = {
+  mac: 'macOS',
+  windows: 'Windows',
+  other: 'Linux',
+};
+
+const INSTALL_COMMANDS = {
+  mac: 'curl -fsSL https://cubo.spheceo.com/install.sh | sh',
+  other: 'curl -fsSL https://cubo.spheceo.com/install.sh | sh',
+  windows: 'irm https://cubo.spheceo.com/install.ps1 | iex',
+} as const;
 
 function detectPlatform(): Platform {
   const agent = navigator.userAgent;
@@ -34,7 +55,7 @@ function detectPlatform(): Platform {
   return 'other';
 }
 
-/** Purely cosmetic: shows the current version next to the download buttons. */
+/** Purely cosmetic: shows the current version next to calls to action. */
 function useLatestVersion(): string | null {
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
@@ -54,14 +75,53 @@ function useLatestVersion(): string | null {
   return version;
 }
 
+/** Path-based router: '/', '/downloads', '/legal'. */
+function useRoute(): string {
+  const [path, setPath] = useState(() => window.location.pathname);
+  useEffect(() => {
+    const onChange = () => {
+      setPath(window.location.pathname);
+      window.scrollTo(0, 0);
+    };
+    window.addEventListener('popstate', onChange);
+    return () => window.removeEventListener('popstate', onChange);
+  }, []);
+  return path.replace(/\/+$/, '') || '/';
+}
+
+/** Client-side navigation that keeps the URL bar honest. */
+function navigate(to: string): void {
+  if (window.location.pathname === to) return;
+  window.history.pushState({}, '', to);
+  window.dispatchEvent(new PopStateEvent('popstate'));
+}
+
 export function App() {
   const [platform] = useState<Platform>(detectPlatform);
   const version = useLatestVersion();
+  const route = useRoute();
+
+  const page =
+    route === '/downloads' ? (
+      <DownloadPage version={version} platform={platform} />
+    ) : route === '/legal' ? (
+      <LegalPage />
+    ) : (
+      <HomePage platform={platform} version={version} />
+    );
 
   return (
     <>
       <nav className="nav">
-        <a href="#top" className="logo" aria-label="cubo">
+        <a
+          href="/"
+          className="logo"
+          aria-label="cubo"
+          onClick={(event) => {
+            event.preventDefault();
+            navigate('/');
+          }}
+        >
           <CuboMark />
           cubo
         </a>
@@ -69,12 +129,35 @@ export function App() {
           <a href="https://github.com/spheceo/cubo" rel="noreferrer">
             GitHub
           </a>
+          <a
+            href="/downloads"
+            onClick={(event) => {
+              event.preventDefault();
+              navigate('/downloads');
+            }}
+          >
+            Download
+          </a>
           <a className="nav-cta" href="https://app.cubo.spheceo.com" rel="noreferrer">
             Open web app
           </a>
         </div>
       </nav>
 
+      {page}
+    </>
+  );
+}
+
+function HomePage({
+  platform,
+  version,
+}: {
+  platform: Platform;
+  version: string | null;
+}) {
+  return (
+    <>
       <header className="hero" id="top">
         <div className="still-wall" aria-hidden="true">
           {STILLS.map((src) => (
@@ -83,151 +166,584 @@ export function App() {
         </div>
         <div className="hero-shade" />
         <div className="hero-copy">
-          <CuboMark className="hero-mark" />
-          <p className="eyebrow">Free, open source, yours</p>
+          <p className="eyebrow">Free · Open source · Self-hosted</p>
           <h1>
-            Your movies.
+            One command.
             <br />
-            One click away.
+            Your media server.
           </h1>
           <p className="lede">
-            Cubo finds trending films and series and streams them instantly through
-            your own hardware. No accounts, no subscriptions — your library and
-            viewing history never leave machines you control.
+            Cubo Core turns a machine you already own into a private streaming
+            server. Install it, open any device, press play — no accounts, no
+            subscriptions, nothing leaves your hardware.
           </p>
 
-          <div className="download-row">
-            <DownloadButtons platform={platform} />
-          </div>
+          <InstallCore platform={platform} />
+
           <p className="version">
-            {version ? `Version ${version} · ` : ''}macOS &amp; Windows · MIT licensed
+            {version ? `Version ${version} · ` : ''}macOS, Linux &amp; Windows · MIT licensed
           </p>
         </div>
       </header>
 
       <main>
         <section className="strip" aria-hidden="true">
-          {STILLS.slice()
-            .reverse()
-            .map((src) => (
-              <img key={`strip-${src}`} src={src} alt="" />
+          <div className="strip-track">
+            {[...STILLS, ...STILLS].map((src, index) => (
+              <img key={`strip-${index}`} src={src} alt="" />
             ))}
-        </section>
-
-        <section className="features">
-          <article>
-            <h2>Streams in seconds</h2>
-            <p>
-              Sources are ranked by quality and health, playback starts as the first
-              pieces arrive, and if a source fails mid-play Cubo quietly moves to the
-              next one from the same position.
-            </p>
-          </article>
-          <article>
-            <h2>Plays everything</h2>
-            <p>
-              A built-in converter (bundled ffmpeg) unlocks high-quality releases the
-              browser alone can&rsquo;t play — full seeking included, with automatic
-              audio conversion.
-            </p>
-          </article>
-          <article>
-            <h2>Your library stays yours</h2>
-            <p>
-              Progress, watch-later and history live in Cubo Core on your machine.
-              Reach it from any device — pair it with Tailscale and your whole
-              library follows you.
-            </p>
-          </article>
-        </section>
-
-        <section className="downloads" id="download">
-          <h2>Download Cubo</h2>
-          <p className="downloads-note">
-            Runs on macOS 12+ (Apple Silicon and Intel) and Windows 10+.
-          </p>
-          <div className="download-grid">
-            <a className="card" href={DOWNLOADS.macArm}>
-              <span className="card-title">macOS</span>
-              <span className="card-sub">Apple Silicon · .dmg</span>
-            </a>
-            <a className="card" href={DOWNLOADS.macIntel}>
-              <span className="card-title">macOS</span>
-              <span className="card-sub">Intel · .dmg</span>
-            </a>
-            <a className="card" href={DOWNLOADS.windows}>
-              <span className="card-title">Windows</span>
-              <span className="card-sub">64-bit installer · .exe</span>
-            </a>
           </div>
-          <div className="fine-print">
+        </section>
+
+        <section className="steps">
+          <Step
+            num="01"
+            title="Install Core"
+            body="One command puts the engine on your machine — bundled ffmpeg and auto-updates included."
+          />
+          <Step
+            num="02"
+            title="Open any device"
+            body="The web app finds Core automatically — phone, tablet, laptop, anything with a browser."
+          />
+          <Step
+            num="03"
+            title="Press play"
+            body="Media from the sources you connect starts streaming from your hardware in seconds. That's the whole ritual."
+          />
+        </section>
+
+        <section className="showcase">
+          <div className="showcase-copy">
+            <p className="eyebrow">Cubo Core</p>
+            <h2>
+              Your hardware.
+              <br />
+              Your rules.
+            </h2>
+            <p className="showcase-lede">
+              A quiet background process on a machine you already own &mdash;
+              then it stays out of the way.
+            </p>
+          </div>
+
+          <ul className="spec-list">
+            <SpecRow
+              icon={<BoltIcon />}
+              title="Direct-play first"
+              body="MP4 and WebM stream untouched. ffmpeg only steps in for the titles nothing can play natively."
+            />
+            <SpecRow
+              icon={<ShuffleIcon />}
+              title="Seeks across sources"
+              body="A source that dies mid-play hands off to the next one and resumes at the same second."
+            />
+            <SpecRow
+              icon={<LockIcon />}
+              title="Nothing leaves the box"
+              body="No accounts and no telemetry. Watch history and cache never go anywhere but your disk."
+            />
+          </ul>
+        </section>
+
+        <section className="cta-banner">
+          <h2>Ready in one command.</h2>
+          <InstallCore platform={platform} />
+          <a
+            className="cta-link"
+            href="/downloads"
+            onClick={(event) => {
+              event.preventDefault();
+              navigate('/downloads');
+            }}
+          >
+            or browse all downloads →
+          </a>
+        </section>
+      </main>
+
+      <Footer />
+    </>
+  );
+}
+
+function DownloadPage({
+  version,
+  platform,
+}: {
+  version: string | null;
+  platform: Platform;
+}) {
+  const leadCmd = INSTALL_COMMANDS[platform === 'windows' ? 'windows' : 'mac'];
+  const leadShell = platform === 'windows' ? 'PowerShell' : 'Terminal';
+
+  return (
+    <main className="page">
+      <header className="dl-head">
+        <p className="eyebrow">Download</p>
+        <h1>One command and you&rsquo;re running.</h1>
+        <ul className="trait-row">
+          <li>
+            <BoxIcon />
+            ffmpeg bundled
+          </li>
+          <li>
+            <GlobeIcon />
+            Serves the web app
+          </li>
+          <li>
+            <RefreshIcon />
+            Updates itself
+          </li>
+        </ul>
+      </header>
+
+      {/* Lead with the one answer for the visitor's own machine; everything
+          else drops to the table below rather than competing up here. */}
+      <section className="dl-lead">
+        <p className="dl-detected">
+          {platform === 'windows' ? <WindowsIcon /> : <AppleIcon />}
+          Looks like <strong>{PLATFORM_LABEL[platform]}</strong> &mdash; paste
+          this into {leadShell}
+        </p>
+        <BigCommand cmd={leadCmd} />
+        <p className="dl-lead-note">
+          Not your machine? <a href="#every">Every option is below.</a>
+        </p>
+      </section>
+
+      <section className="dl-all" id="every">
+        <h2>Every option</h2>
+        <ul className="dl-rows">
+          <CommandOption
+            icon={<TerminalIcon />}
+            os="macOS & Linux"
+            kind="Terminal"
+            cmd={INSTALL_COMMANDS.mac}
+          />
+          <CommandOption
+            icon={<TerminalIcon />}
+            os="Windows"
+            kind="PowerShell"
+            cmd={INSTALL_COMMANDS.windows}
+          />
+          <FileOption
+            icon={<AppleIcon />}
+            os="macOS"
+            kind="Apple Silicon"
+            file="cubo-macos-apple-silicon.dmg"
+            href={DOWNLOADS.macArm}
+          />
+          <FileOption
+            icon={<AppleIcon />}
+            os="macOS"
+            kind="Intel"
+            file="cubo-macos-intel.dmg"
+            href={DOWNLOADS.macIntel}
+          />
+          <FileOption
+            icon={<WindowsIcon />}
+            os="Windows"
+            kind="64-bit"
+            file="cubo-windows-x64-setup.exe"
+            href={DOWNLOADS.windows}
+          />
+        </ul>
+
+        <details className="fine-print">
+          <summary>First-launch notes (unsigned-app quirks)</summary>
+          <div>
             <p>
-              Cubo isn&rsquo;t notarized with Apple yet, so macOS will claim the app
-              is &ldquo;damaged&rdquo; on first launch. It isn&rsquo;t — after
-              dragging cubo to Applications, run this once in Terminal, then open it
+              Cubo isn&rsquo;t notarized yet, so macOS calls the app
+              &ldquo;damaged&rdquo; on first launch. Run this once, then open it
               normally:
             </p>
             <code className="command">xattr -cr /Applications/cubo.app</code>
             <p>
-              On Windows, choose &ldquo;More info → Run anyway&rdquo; if SmartScreen
-              appears. After the first launch, updates install themselves from
-              inside the app — no Terminal needed again.
+              On Windows, choose &ldquo;More info &rarr; Run anyway&rdquo; if
+              SmartScreen appears. Updates install themselves after that.
             </p>
           </div>
+        </details>
+      </section>
+
+      {version ? (
+        <p className="version page-version">Latest release: v{version}</p>
+      ) : null}
+    </main>
+  );
+}
+
+/** The page's centerpiece: one oversized, copyable command. */
+function BigCommand({ cmd }: { cmd: string }) {
+  const [copied, copy] = useCopy();
+  return (
+    <div className="big-cmd">
+      <code>{cmd}</code>
+      <button type="button" className="big-cmd-btn" onClick={() => copy(cmd)}>
+        {copied ? <CheckIcon /> : <CopyIcon />}
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+    </div>
+  );
+}
+
+/** One row of the "every option" table, ending in a copy button. */
+function CommandOption({
+  icon,
+  os,
+  kind,
+  cmd,
+}: {
+  icon: ReactNode;
+  os: string;
+  kind: string;
+  cmd: string;
+}) {
+  const [copied, copy] = useCopy();
+  return (
+    <li className="dl-row">
+      <RowName icon={icon} os={os} kind={kind} />
+      <code className="dl-row-cmd">{cmd}</code>
+      <button type="button" className="row-btn" onClick={() => copy(cmd)}>
+        {copied ? <CheckIcon /> : <CopyIcon />}
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+    </li>
+  );
+}
+
+/** One row of the "every option" table, ending in a download link. */
+function FileOption({
+  icon,
+  os,
+  kind,
+  file,
+  href,
+}: {
+  icon: ReactNode;
+  os: string;
+  kind: string;
+  file: string;
+  href: string;
+}) {
+  return (
+    <li className="dl-row">
+      <RowName icon={icon} os={os} kind={kind} />
+      <code className="dl-row-cmd dl-row-file">{file}</code>
+      <a className="row-btn" href={href}>
+        <DownloadIcon />
+        Download
+      </a>
+    </li>
+  );
+}
+
+function RowName({ icon, os, kind }: { icon: ReactNode; os: string; kind: string }) {
+  return (
+    <span className="dl-row-name">
+      <span className="dl-row-icon" aria-hidden="true">
+        {icon}
+      </span>
+      <span>
+        <span className="dl-row-os">{os}</span>
+        <span className="dl-row-kind">{kind}</span>
+      </span>
+    </span>
+  );
+}
+
+function Footer() {
+  const follow = (to: string) => (event: React.MouseEvent) => {
+    event.preventDefault();
+    navigate(to);
+  };
+  return (
+    <footer>
+      <span className="footer-brand">
+        <CuboMark />
+        Cubo
+      </span>
+      <span>&copy; {new Date().getFullYear()}</span>
+      <a href="/downloads" onClick={follow('/downloads')}>
+        Download
+      </a>
+      <a href="/legal" onClick={follow('/legal')}>
+        Legal
+      </a>
+      <a href="https://github.com/spheceo/cubo/blob/main/LICENSE" rel="noreferrer">
+        MIT License
+      </a>
+      <a href="https://github.com/spheceo/cubo" rel="noreferrer">
+        Source
+      </a>
+    </footer>
+  );
+}
+
+function useLegalDoc(): LegalDoc {
+  const [doc, setDoc] = useState(() => legalDocFrom(FALLBACK_LEGAL));
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPublishedLegal().then((live) => {
+      if (!cancelled && live) setDoc(live);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return doc;
+}
+
+function LegalInlineText({ text }: { text: string }) {
+  return (
+    <>
+      {splitInlineMarkdown(text).map((part, index) =>
+        part.type === 'link' ? (
+          <a key={index} href={part.href} rel="noreferrer">
+            {part.label}
+          </a>
+        ) : (
+          <span key={index}>{part.value}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+/** Plain-language legal summary. Sourced from LEGAL.md on main. */
+function LegalPage() {
+  const doc = useLegalDoc();
+  return (
+    <>
+      <main className="page">
+        <header className="legal-head">
+          <p className="eyebrow">Legal</p>
+          <h1>{doc.title}</h1>
+          <p className="legal-lede">
+            <LegalInlineText text={doc.lede} />
+          </p>
+        </header>
+
+        <section className="legal-body">
+          {doc.sections.map((section) => (
+            <article key={section.title} className="legal-block">
+              <h2>{section.title}</h2>
+              {section.paragraphs.map((paragraph) => (
+                <p key={paragraph}>
+                  <LegalInlineText text={paragraph} />
+                </p>
+              ))}
+            </article>
+          ))}
         </section>
       </main>
-
-      <footer>
-        <span className="footer-brand">
-          <CuboMark />
-          Cubo
-        </span>
-        <span>&copy; {new Date().getFullYear()}</span>
-        <a href="https://github.com/spheceo/cubo/blob/main/LICENSE" rel="noreferrer">
-          MIT License
-        </a>
-        <a href="https://github.com/spheceo/cubo" rel="noreferrer">
-          Source
-        </a>
-        <a href="https://app.cubo.spheceo.com/legal" rel="noreferrer">
-          Legal
-        </a>
-      </footer>
+      <Footer />
     </>
+  );
+}
+
+function Step({ num, title, body }: { num: string; title: string; body: string }) {
+  return (
+    <article className="step">
+      <span className="step-num" aria-hidden="true">
+        {num}
+      </span>
+      <h3>{title}</h3>
+      <p>{body}</p>
+    </article>
+  );
+}
+
+function useCopy(): [boolean, (text: string) => void] {
+  const [copied, setCopied] = useState(false);
+  const copy = (text: string) => {
+    const done = () => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(done);
+    } else {
+      // Clipboard API needs a secure context; fall back silently.
+      done();
+    }
+  };
+  return [copied, copy];
+}
+
+/** Hero / CTA call-to-action: the one-liner for this platform, with a copy
+ *  button. The downloads page has its own, larger treatment. */
+function InstallCore({ platform }: { platform: Platform }) {
+  const cmd = INSTALL_COMMANDS[platform === 'windows' ? 'windows' : platform];
+  const [copied, copy] = useCopy();
+  return (
+    <div className="install">
+      <div className="install-box">
+        <code className="install-cmd">{cmd}</code>
+        <button type="button" className="copy-btn" onClick={() => copy(cmd)}>
+          {copied ? 'Copied ✓' : 'Copy'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SpecRow({
+  icon,
+  title,
+  body,
+}: {
+  icon: ReactNode;
+  title: string;
+  body: string;
+}) {
+  return (
+    <li className="spec-row">
+      <span className="spec-icon" aria-hidden="true">
+        {icon}
+      </span>
+      <h3>{title}</h3>
+      <p>{body}</p>
+    </li>
+  );
+}
+
+/* Inline SVG throughout: apps/site deliberately carries no dependencies, so
+   there is no icon package to pull from. All inherit currentColor. */
+
+function Glyph({ children, stroke = true }: { children: ReactNode; stroke?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="icon"
+      aria-hidden="true"
+      fill={stroke ? 'none' : 'currentColor'}
+      stroke={stroke ? 'currentColor' : 'none'}
+      strokeWidth={stroke ? 1.7 : undefined}
+      strokeLinecap={stroke ? 'round' : undefined}
+      strokeLinejoin={stroke ? 'round' : undefined}
+    >
+      {children}
+    </svg>
+  );
+}
+
+function AppleIcon() {
+  return (
+    <Glyph stroke={false}>
+      <path d="M17 12.8c0-2.5 2-3.7 2.1-3.8-1.1-1.7-2.9-1.9-3.6-1.9-1.5-.2-3 .9-3.7.9s-2-.9-3.3-.9c-1.7 0-3.3 1-4.1 2.5-1.8 3.1-.5 7.6 1.3 10.1.9 1.2 1.9 2.6 3.2 2.6 1.2 0 1.7-.8 3.2-.8s1.9.8 3.2.8 2.2-1.2 3-2.5c.9-1.4 1.3-2.8 1.3-2.9 0-.1-2.6-1-2.6-3.9z" />
+      <path d="M14.7 5.3c.7-.8 1.1-2 1-3.2-1 0-2.2.7-2.9 1.5-.6.8-1.2 2-1 3.1 1.1.1 2.2-.6 2.9-1.4z" />
+    </Glyph>
+  );
+}
+
+function WindowsIcon() {
+  return (
+    <Glyph stroke={false}>
+      <path d="M3 5.6l7.5-1v7.1H3V5.6zM11.7 4.4L21 3v8.7h-9.3V4.4zM3 12.9h7.5V20L3 19V12.9zM11.7 12.9H21V21l-9.3-1.3v-6.8z" />
+    </Glyph>
+  );
+}
+
+function TerminalIcon() {
+  return (
+    <Glyph>
+      <rect x="2.6" y="4.6" width="18.8" height="14.8" rx="2.6" />
+      <path d="M7 9.8l2.8 2.4L7 14.6M12.8 15.1h4.4" />
+    </Glyph>
+  );
+}
+
+function BoxIcon() {
+  return (
+    <Glyph>
+      <path d="M12 2.9l8.4 4.7v8.8L12 21.1l-8.4-4.7V7.6z" />
+      <path d="M3.6 7.6l8.4 4.7 8.4-4.7M12 12.3v8.8" />
+    </Glyph>
+  );
+}
+
+function GlobeIcon() {
+  return (
+    <Glyph>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3c2.3 2.5 3.5 5.6 3.5 9s-1.2 6.5-3.5 9c-2.3-2.5-3.5-5.6-3.5-9S9.7 5.5 12 3z" />
+    </Glyph>
+  );
+}
+
+function RefreshIcon() {
+  return (
+    <Glyph>
+      <path d="M20.4 12a8.4 8.4 0 1 1-2.5-6" />
+      <path d="M20.6 3.4v5.2h-5.2" />
+    </Glyph>
+  );
+}
+
+function BoltIcon() {
+  return (
+    <Glyph>
+      <path d="M13.2 2.8L4.4 13.6h6.3l-.9 7.6 8.8-10.8h-6.3z" />
+    </Glyph>
+  );
+}
+
+function ShuffleIcon() {
+  return (
+    <Glyph>
+      <path d="M3.2 6.6h3.4c1.5 0 2.9.8 3.7 2.1l2.9 4.6c.8 1.3 2.2 2.1 3.7 2.1h3M3.2 17.4h3.4c1.5 0 2.9-.8 3.7-2.1M16.9 4.2l3 2.4-3 2.4M16.9 12.9l3 2.4-3 2.4" />
+    </Glyph>
+  );
+}
+
+function LockIcon() {
+  return (
+    <Glyph>
+      <rect x="4.2" y="10.2" width="15.6" height="10.6" rx="2.4" />
+      <path d="M8 10.2V7.4a4 4 0 0 1 8 0v2.8" />
+    </Glyph>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <Glyph>
+      <rect x="9" y="9" width="11.4" height="11.4" rx="2.2" />
+      <path d="M15 5.7a2.2 2.2 0 0 0-2.2-2.2H5.8a2.3 2.3 0 0 0-2.3 2.3v7a2.2 2.2 0 0 0 2.2 2.2" />
+    </Glyph>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <Glyph>
+      <path d="M4.8 12.6l4.8 4.8L19.4 7.2" />
+    </Glyph>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <Glyph>
+      <path d="M12 3.6v11.2M7.4 10.4l4.6 4.6 4.6-4.6M4.2 19.4h15.6" />
+    </Glyph>
   );
 }
 
 function CuboMark({ className = '' }: { className?: string }) {
   return (
     <svg viewBox="0 0 32 32" className={`mark ${className}`.trim()} aria-hidden="true">
-      <path fill="#ffffff" d="M16 3.2 28 10.1 16 17 4 10.1 16 3.2Z" />
-      <path fill="#9a9a9a" d="M4 10.1 16 17v11.4L4 21.5V10.1Z" />
-      <path fill="#5c5c5c" d="M16 17 28 10.1v11.4L16 28.4V17Z" />
+      <g
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinejoin="round"
+      >
+        <path d="M16 3.8 27 10v12L16 28.2 5 22V10Z" />
+        <path d="M5 10l11 6.3L27 10M16 16.3v11.9" />
+      </g>
     </svg>
-  );
-}
-
-function DownloadButtons({ platform }: { platform: Platform }) {
-  if (platform === 'windows') {
-    return (
-      <>
-        <a className="button primary" href={DOWNLOADS.windows}>
-          Download for Windows
-        </a>
-        <a className="button ghost" href="#download">
-          Other platforms
-        </a>
-      </>
-    );
-  }
-  return (
-    <>
-      <a className="button primary" href={DOWNLOADS.macArm}>
-        Download for Mac
-      </a>
-      <a className="button ghost" href="#download">
-        {platform === 'mac' ? 'Intel Mac or Windows?' : 'All downloads'}
-      </a>
-    </>
   );
 }

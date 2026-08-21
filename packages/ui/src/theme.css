@@ -1,24 +1,24 @@
 /* Shared design tokens for @cubo/ui. Imported by every app that renders these
    components so the palette stays identical across web and desktop. */
 @theme {
-  --color-background: #141414;
-  --color-ink: #141414;
-  --color-elevated: #1d1d1d;
-  --color-panel: #181818;
-  --color-surface: #232323;
-  --color-control: #2c2c2c;
-  --color-control-hover: #3a3a3a;
-  --color-line: #ffffff1f;
-  --color-line-strong: #ffffff33;
+  --color-background: #0a0a0a;
+  --color-ink: #0a0a0a;
+  --color-elevated: #161616;
+  --color-panel: #101010;
+  --color-surface: #1b1b1b;
+  --color-control: #242424;
+  --color-control-hover: #303030;
+  --color-line: #ffffff14;
+  --color-line-strong: #ffffff2b;
   --color-fg: #ffffff;
-  --color-muted: #c6c6c6;
-  --color-faint: #8a8a8a;
+  --color-muted: #c0c0c0;
+  --color-faint: #7d7d7d;
   --color-accent: #ffffff;
-  --color-star: #c6c6c6;
+  --color-star: #f5a623;
 
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
     'Segoe UI', sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-mono: ui-monospace, SFMono-Regular, monospace;
 }
 
 @utility no-scrollbar {

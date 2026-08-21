@@ -24,12 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,7 +41,7 @@ jobs:
           workspaces: apps/desktop/src-tauri
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Fetch ffmpeg sidecar binaries
         run: node apps/desktop/scripts/fetch-ffmpeg.mjs --target ${{ matrix.target }}
@@ -59,6 +60,91 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
+
+  # Headless CLI (`cubo serve`). Ships as a plain tarball with the ffmpeg
+  # sidecars bundled next to the binary — curl-installed files never carry a
+  # browser quarantine marker, so unsigned distribution just works.
+  cli:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # GitHub's free arm64 runner for public repos — native build, no
+          # cross toolchain needed.
+          - platform: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            apps/desktop/src-tauri
+            crates
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Fetch ffmpeg sidecar binaries
+        run: node apps/desktop/scripts/fetch-ffmpeg.mjs --target ${{ matrix.target }}
+
+      - name: Build CLI
+        run: cargo build --release -p cubo-cli --target ${{ matrix.target }}
+
+      - name: Package CLI (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="staging"
+          mkdir "$stage"
+          cp "target/${TARGET}/release/cubo-cli" "$stage/cubo"
+          cp "apps/desktop/src-tauri/binaries/ffmpeg-${TARGET}" "$stage/ffmpeg"
+          cp "apps/desktop/src-tauri/binaries/ffprobe-${TARGET}" "$stage/ffprobe"
+          tar czf "cubo-cli-${TARGET}.tar.gz" -C "$stage" .
+          sha256sum "cubo-cli-${TARGET}.tar.gz" > "cubo-cli-${TARGET}.tar.gz.sha256"
+          gh release upload "$TAG" --repo "$REPO" --clobber \
+            "cubo-cli-${TARGET}.tar.gz" "cubo-cli-${TARGET}.tar.gz.sha256"
+
+      - name: Package CLI (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item "target/${env:TARGET}/release/cubo-cli.exe" staging/cubo.exe
+          Copy-Item "apps/desktop/src-tauri/binaries/ffmpeg-${env:TARGET}.exe" staging/ffmpeg.exe
+          Copy-Item "apps/desktop/src-tauri/binaries/ffprobe-${env:TARGET}.exe" staging/ffprobe.exe
+          tar czf "cubo-cli-${env:TARGET}.tar.gz" -C staging .
+          $hash = (Get-FileHash "cubo-cli-${env:TARGET}.tar.gz" -Algorithm SHA256).Hash.ToLower()
+          "$hash  cubo-cli-${env:TARGET}.tar.gz" | Out-File -Encoding ascii "cubo-cli-${env:TARGET}.tar.gz.sha256"
+          gh release upload "$env:TAG" --repo "$env:REPO" --clobber `
+            "cubo-cli-${env:TARGET}.tar.gz" "cubo-cli-${env:TARGET}.tar.gz.sha256"
 
   # The marketing site links to fixed URLs under releases/latest/download/,
   # so every release also carries stable-named copies of the installers.

@@ -17,6 +17,7 @@ import {
   embeddedCoreEndpoint,
   getLibrary,
   isDesktopRuntime,
+  PairingRequiredError,
   removeHistoryItem,
   setWatchLater,
   type LocalEngineConnection,
@@ -59,6 +60,8 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
   const [desktopRuntime, setDesktopRuntime] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [library, setLibrary] = useState<CoreLibrarySnapshot | null>(null);
+  /** A reachable Core that wants a pairing code before it will talk to us. */
+  const [pairingEndpoint, setPairingEndpoint] = useState('');
 
   useEffect(() => {
     const stored = window.localStorage.getItem(STORAGE_KEY) ?? '';
@@ -66,13 +69,20 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
     const desktop = isDesktopRuntime();
     setDesktopRuntime(desktop);
 
+    const surfacePairing = (reason: unknown) => {
+      if (reason instanceof PairingRequiredError) {
+        setPairingEndpoint(reason.endpoint);
+        setSettingsOpen(true);
+      }
+    };
+
     if (!pageCoreEndpoint && !desktop) {
       setSavedEndpoint(stored);
       // Probe for a Core eagerly so playback starts faster and the
       // disconnected banner reflects a real failed attempt, not a guess.
       void discoverLocalEngine(stored)
         .then(setConnection)
-        .catch(() => undefined)
+        .catch(surfacePairing)
         .finally(() => setConnectionChecked(true));
       return;
     }
@@ -83,8 +93,9 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
         if (!desktop) setHostedEndpoint(hosted.baseUrl);
         setConnection(hosted);
       })
-      .catch(() => {
+      .catch((reason: unknown) => {
         if (!desktop) setSavedEndpoint(stored);
+        surfacePairing(reason);
       })
       .finally(() => setConnectionChecked(true));
   }, []);
@@ -197,6 +208,7 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
           connection={connection}
           currentOriginCore={value.isHosted || value.isDesktop}
           embeddedCore={value.isDesktop}
+          initialPairingEndpoint={pairingEndpoint}
           onSave={saveCore}
           onClose={() => setSettingsOpen(false)}
         />

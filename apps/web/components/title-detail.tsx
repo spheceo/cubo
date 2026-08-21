@@ -9,17 +9,12 @@ import { useEffect, useRef, useState } from 'react';
 import { FaStar } from 'react-icons/fa';
 import { IoPlay } from 'react-icons/io5';
 import { Link } from '@/components/link';
+import { formatNextEpisodeLabel } from '@/lib/air-date';
+import { formatRuntime } from '@/lib/format';
 import { watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
 import { EpisodeList } from './episode-list';
 import { WatchLaterButton } from './watch-later-button';
-
-function formatRuntime(minutes: number | null): string | null {
-  if (!minutes) return null;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return `${hours > 0 ? `${hours}h ` : ''}${rest > 0 ? `${rest}m` : ''}`.trim();
-}
 
 /** Kino's small-caps section label, reused for every block below the fold. */
 export function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -38,6 +33,7 @@ export function TitleDetail({
   const rating = details.voteAverage ? details.voteAverage.toFixed(1) : '';
   const runtime = formatRuntime(details.runtime);
   const firstSeason = details.seasons[0]?.seasonNumber ?? 1;
+  const nextAirs = details.nextEpisode ? formatNextEpisodeLabel(details.nextEpisode) : null;
   const playHref =
     details.mediaType === 'tv'
       ? watchHref(details, firstSeason, episodes[0]?.episodeNumber ?? 1)
@@ -75,6 +71,12 @@ export function TitleDetail({
               <>
                 <span>•</span>
                 <span>{runtime}</span>
+              </>
+            ) : null}
+            {nextAirs ? (
+              <>
+                <span>•</span>
+                <span>{nextAirs}</span>
               </>
             ) : null}
           </div>

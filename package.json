@@ -1,15 +1,17 @@
 {
   "name": "cubo",
   "private": true,
-  "packageManager": "pnpm@10.14.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "dev": "pnpm --filter @cubo/desktop dev",
-    "dev:web": "pnpm --filter @cubo/web dev",
-    "dev:desktop": "pnpm --filter @cubo/desktop dev",
-    "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "dev": "bun --filter '@cubo/web' --filter '@cubo/site' --filter '@cubo/desktop' dev",
+    "dev:web": "bun --filter '@cubo/web' dev",
+    "dev:site": "bun --filter '@cubo/site' dev",
+    "dev:core": "cargo run -p cubo-cli -- serve --no-open",
+    "dev:desktop": "bun --filter '@cubo/web' --filter '@cubo/desktop' dev",
+    "build": "bun run --recursive build",
+    "typecheck": "bun run --recursive typecheck"
   }
 }

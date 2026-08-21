@@ -2,9 +2,10 @@ import { stillUrl, type Episode, type SeasonSummary } from '@cubo/core';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import gsap from 'gsap';
 import { useRef, useState } from 'react';
-import { IoClose, IoList } from 'react-icons/io5';
+import { IoCalendarOutline, IoClose, IoList } from 'react-icons/io5';
 import { Dropdown } from '@/components/dropdown';
 import { Link } from '@/components/link';
+import { formatNextEpisodeLabel } from '@/lib/air-date';
 import { tmdbQueries } from '@/lib/queries';
 
 export function EpisodeList({
@@ -139,13 +140,14 @@ export function EpisodeList({
             <ul className={`m-0 list-none space-y-2 p-0 ${loading ? 'opacity-40' : ''}`}>
               {episodes.map((episode) => {
                 const still = stillUrl(episode.stillPath, 'w300');
+                const airs = formatNextEpisodeLabel(episode);
                 return (
                   <li key={episode.id}>
                     <Link
                       href={`/watch/tv/${showId}?season=${episode.seasonNumber}&episode=${episode.episodeNumber}`}
                       className="group flex gap-4 rounded-xl p-3 transition-colors hover:bg-control"
                     >
-                      <div className="relative aspect-video w-32 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-background sm:w-44">
+                      <div className="relative aspect-video w-32 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-surface sm:w-44">
                         {still ? (
                           <img
                             src={still}
@@ -153,13 +155,24 @@ export function EpisodeList({
                             loading="lazy"
                             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
                           />
-                        ) : null}
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center">
+                            <IoCalendarOutline
+                              size={28}
+                              className="text-white/20"
+                              aria-hidden
+                            />
+                          </div>
+                        )}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
                           <span className="text-sm text-faint">E{episode.episodeNumber}</span>
                           <p className="truncate font-semibold">{episode.name}</p>
                         </div>
+                        {airs ? (
+                          <p className="mt-1 text-sm text-white/70">{airs}</p>
+                        ) : null}
                         <p className="mt-2 line-clamp-2 text-sm leading-6 text-white/60">
                           {episode.overview || 'No description available.'}
                         </p>

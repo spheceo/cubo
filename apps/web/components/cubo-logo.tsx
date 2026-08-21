@@ -1,9 +1,13 @@
 const MARK = (
-  <>
-    <path fill="currentColor" d="M16 3.2 28 10.1 16 17 4 10.1 16 3.2Z" />
-    <path fill="currentColor" fillOpacity="0.55" d="M4 10.1 16 17v11.4L4 21.5V10.1Z" />
-    <path fill="currentColor" fillOpacity="0.32" d="M16 17 28 10.1v11.4L16 28.4V17Z" />
-  </>
+  <g
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2.5"
+    strokeLinejoin="round"
+  >
+    <path d="M16 3.8 27 10v12L16 28.2 5 22V10Z" />
+    <path d="M5 10l11 6.3L27 10M16 16.3v11.9" />
+  </g>
 );
 
 export function CuboMark({
