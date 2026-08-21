@@ -16,14 +16,18 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { Link } from '@/components/link';
 import { apiUrl } from '@/lib/api';
-import { queryClient, streamQueries } from '@/lib/queries';
+import { isUpcomingAirDate } from '@/lib/air-date';
+import { queryClient, streamQueries, tmdbQueries } from '@/lib/queries';
 import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
+import { resetWindowScroll } from './scroll-to-top';
 import { VideoPlayer, type PlayerSubtitle } from './video-player';
 import {
   addMagnet,
   buildMagnet,
   getLibrary,
+  getSubtitleMatch,
+  shipClientLog,
   isDesktopRuntime,
   largestFileIndex,
   recordPlayback,
@@ -37,8 +41,17 @@ import {
   isRemuxableFilename,
   supportsHevcRemux,
 } from '@/lib/media-compatibility';
+import {
+  loadCaptionPrefs,
+  preferredSubtitleId,
+  saveCaptionPrefs,
+  type CaptionColor,
+  type CaptionPrefs,
+  type CaptionSize,
+} from '@/lib/caption-prefs';
 import { playbackKey } from '@/lib/library';
 import { rankStreams, streamKey } from '@/lib/stream-select';
+import type { SubtitleReleaseHint } from '@cubo/core';
 
 const AUTO_ATTEMPTS = 3;
 /** Bytes that make the buffering stage feel "full" — playback usually starts well before this. */
@@ -96,14 +109,71 @@ export function WatchScreen({
   const [videoDurationHint, setVideoDurationHint] = useState<number | null>(null);
   /** Where the current remux playlist begins within the source (seek restart). */
   const [videoTimeOffset, setVideoTimeOffset] = useState(0);
+  /** Playlist-local jump that makes up the gap between the keyframe ffmpeg
+   *  landed on and the exact position the viewer requested. */
+  const [videoStartLocal, setVideoStartLocal] = useState<number | null>(null);
   const [seekConverting, setSeekConverting] = useState(false);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [subtitleTracks, setSubtitleTracks] = useState<PlayerSubtitle[]>([]);
   const [activeSubtitleId, setActiveSubtitleId] = useState<string | null>(null);
+  /** Release hint (OpenSubtitles hash etc.) for the source actually playing.
+   *  Null until Core computes it; subtitle lookup upgrades itself when it
+   *  lands, replacing title-ID-matched tracks with release-exact ones. */
+  const [subtitleMatch, setSubtitleMatch] = useState<SubtitleReleaseHint | null>(null);
   const [resumeAt, setResumeAt] = useState(0);
 
+  // Caption preferences outlive any single title: the viewer's on/off choice,
+  // language, and text size follow them to the next movie or episode.
+  const [captionPrefs, setCaptionPrefs] = useState<CaptionPrefs>(() => loadCaptionPrefs());
+  const updateCaptionPrefs = useCallback((patch: Partial<CaptionPrefs>) => {
+    setCaptionPrefs((current) => {
+      const next = { ...current, ...patch };
+      saveCaptionPrefs(next);
+      return next;
+    });
+  }, []);
+
+  const pickSubtitle = useCallback(
+    (id: string | null) => {
+      setActiveSubtitleId(id);
+      if (id === null) {
+        updateCaptionPrefs({ enabled: false });
+        return;
+      }
+      const track = subtitleTracks.find((entry) => entry.id === id);
+      updateCaptionPrefs({ enabled: true, language: track?.language ?? captionPrefs.language });
+    },
+    [subtitleTracks, captionPrefs.language, updateCaptionPrefs],
+  );
+
+  const enableCaptions = useCallback(() => {
+    // Pick purely by saved language — prefs.enabled is false right now
+    // (that's why the viewer is toggling ON), so it must not gate the choice.
+    const language = captionPrefs.language?.toLowerCase();
+    const match = language
+      ? subtitleTracks.find((track) => track.language.toLowerCase() === language)
+      : undefined;
+    setActiveSubtitleId(match?.id ?? subtitleTracks[0]?.id ?? null);
+    updateCaptionPrefs({ enabled: true });
+  }, [subtitleTracks, captionPrefs.language, updateCaptionPrefs]);
+
+  // When a title's tracks arrive, apply whatever the viewer left behind:
+  // captions on means this title opens with captions too, same language.
+  useEffect(() => {
+    if (subtitleTracks.length === 0) return;
+    setActiveSubtitleId((current) => {
+      if (current != null && subtitleTracks.some((track) => track.id === current)) return current;
+      return preferredSubtitleId(subtitleTracks, captionPrefs);
+    });
+    // Only re-apply when a new title's track list lands.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- captionPrefs intentionally read once per list
+  }, [subtitleTracks]);
+
   const attemptRef = useRef(0);
+  /** Cancels the in-flight start sequence (buffer polling included) the
+   *  moment a newer attempt begins or the screen unmounts. */
+  const startAbortRef = useRef<AbortController | null>(null);
   const targetRef = useRef(STAGE.sources);
   const playbackConnection = useRef<Awaited<ReturnType<typeof core.connect>> | null>(null);
   /** Last position the player reported — lets a source fallback resume in place. */
@@ -118,13 +188,16 @@ export function WatchScreen({
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
 
   // The fill eases toward whatever ceiling the current stage set, so it keeps
-  // creeping while a stage takes its time and never jumps backwards.
+  // creeping while a stage takes its time and never jumps backwards. The timer
+  // stops once playback (or an error) ends the loading sequence — it must not
+  // wake the main thread for the whole duration of the movie.
   useEffect(() => {
+    if (status === 'ready' || status === 'error') return;
     const timer = window.setInterval(() => {
       setProgress((current) => current + (targetRef.current - current) * 0.14);
     }, 220);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [status]);
 
   function setStage(target: number) {
     targetRef.current = target;
@@ -138,6 +211,9 @@ export function WatchScreen({
   ) {
     const attempt = (attemptRef.current += 1);
     const stale = () => attemptRef.current !== attempt;
+    startAbortRef.current?.abort();
+    const abort = new AbortController();
+    startAbortRef.current = abort;
 
     setStatus('starting');
     setError(null);
@@ -145,6 +221,7 @@ export function WatchScreen({
     setVideoUrl(null);
     setVideoDurationHint(null);
     setVideoTimeOffset(0);
+    setVideoStartLocal(null);
     setSeekConverting(false);
     remuxContext.current = null;
     setProgress(0);
@@ -180,6 +257,7 @@ export function WatchScreen({
     for (let index = startIndex; index < limit; index += 1) {
       const stream = list[index];
       setActiveKey(streamKey(stream));
+      setSubtitleMatch(null);
 
       try {
         setStage(STAGE.opening);
@@ -203,8 +281,36 @@ export function WatchScreen({
         const id = added.id ?? added.infoHash;
         if (id === null || id === '') throw new Error('Cubo Core did not return a torrent ID');
 
+        // Compute the release hash in the background — it may pull the file's
+        // tail from peers and take a while. When it lands, the subtitle
+        // effect refetches with an exact-release match.
+        void getSubtitleMatch(connection, id, fileIndex).then((match) => {
+          if (!stale()) setSubtitleMatch(match);
+        });
+
+        shipClientLog(
+          connection,
+          'info',
+          'stream_selected',
+          {
+            index,
+            total: list.length,
+            auto,
+            resume: resume || undefined,
+            direct_play: direct,
+            name: stream.name,
+            source_title: stream.title,
+            quality: stream.quality,
+            size_bytes: stream.sizeBytes,
+            seeders: stream.seeders,
+            filename: filename || undefined,
+            info_hash: stream.infoHash,
+          },
+        );
+
         setStage(STAGE.buffering);
         await waitUntilLive(connection, id, {
+          signal: abort.signal,
           onProgress: (stats) => {
             if (stale()) return;
             setStage(bufferingTarget(stats));
@@ -216,18 +322,23 @@ export function WatchScreen({
         let usesHls = false;
         let durationHint: number | null = null;
         let timeOffset = 0;
+        let localJump: number | null = null;
         if (direct) {
           url = streamUrl(connection, id, fileIndex);
         } else {
           // Core remuxes the file into browser-friendly HLS; the call returns
-          // once the first segments are playable. Resuming starts the
-          // converter right at the saved position instead of from zero.
+          // once the first segments are playable. The playlist actually
+          // begins where ffmpeg's input seek landed (the keyframe at/before
+          // `resume`) — that measured offset is what keeps absolute times
+          // truthful; the local jump closes any gap up to the exact spot.
           setStage(STAGE.buffering);
           const remux = await startRemux(connection, id, fileIndex, resume);
           url = remux.url;
           durationHint = remux.durationSeconds;
           usesHls = true;
-          timeOffset = resume;
+          timeOffset = remux.startSeconds;
+          localJump = resume - timeOffset;
+          if (localJump < 0.25) localJump = null;
           remuxContext.current = { connection, id, fileIndex };
           if (stale()) return;
         }
@@ -241,11 +352,12 @@ export function WatchScreen({
           setVideoIsHls(usesHls);
           setVideoDurationHint(durationHint);
           setVideoTimeOffset(timeOffset);
+          setVideoStartLocal(localJump);
           setStatus('ready');
         }, 480);
         return;
       } catch (reason) {
-        if (stale()) return;
+        if (stale() || abort.signal.aborted) return;
         lastError = reason instanceof Error ? reason.message : lastError;
       }
     }
@@ -279,9 +391,14 @@ export function WatchScreen({
       // ranks (direct-play only) and surfaces the Core error via start().
       const connection = await core.connect().catch(() => null);
       try {
-        const found = await queryClient.fetchQuery(
-          streamQueries.streams(mediaType, imdbId, season, episode),
-        );
+        const [found, seasonEpisodes] = await Promise.all([
+          queryClient.fetchQuery(
+            streamQueries.streams(mediaType, imdbId, season, episode),
+          ),
+          mediaType === 'tv' && season != null
+            ? queryClient.fetchQuery(tmdbQueries.season(mediaId, season))
+            : Promise.resolve(undefined),
+        ]);
         if (cancelled) return;
         const ranked = rankStreams(
           found,
@@ -289,9 +406,36 @@ export function WatchScreen({
           originalLanguage,
         );
         setSources(ranked);
+        if (connection) {
+          shipClientLog(
+            connection,
+            'info',
+            'sources_ranked',
+            {
+              media_type: mediaType,
+              season: season ?? undefined,
+              episode: episode ?? undefined,
+              found: found.length,
+              kept: ranked.length,
+              top: ranked.slice(0, 5).map((stream) => ({
+                name: stream.name,
+                title: stream.title,
+                quality: stream.quality,
+                size_bytes: stream.sizeBytes,
+                seeders: stream.seeders,
+              })),
+            },
+          );
+        }
         if (ranked.length === 0) {
+          const airDate = seasonEpisodes?.find((entry) => entry.episodeNumber === episode)
+            ?.airDate;
           setStatus('error');
-          setError('No browser-compatible sources were found for this title.');
+          setError(
+            airDate && isUpcomingAirDate(airDate)
+              ? "This episode hasn't come out yet."
+              : 'No browser-compatible sources were found for this title.',
+          );
           return;
         }
         void startRef.current(ranked, 0, true);
@@ -306,23 +450,31 @@ export function WatchScreen({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- core.connect is stable for a given endpoint
-  }, [mediaType, imdbId, season, episode]);
+  }, [mediaType, mediaId, imdbId, season, episode]);
 
   useEffect(() => {
     if (!imdbId) return;
     let cancelled = false;
     void queryClient
-      .fetchQuery(streamQueries.subtitles(mediaType, imdbId, season, episode))
+      .fetchQuery(streamQueries.subtitles(mediaType, imdbId, season, episode, subtitleMatch))
       .then((tracks) => {
-        if (!cancelled) setSubtitleTracks(prepareSubtitles(tracks));
+        if (cancelled) return;
+        const prepared = prepareSubtitles(tracks);
+        // Upgrade passes must never leave the viewer worse off: a release
+        // match that comes up empty (provider doesn't know this hash) keeps
+        // the title-ID tracks already on screen.
+        if (subtitleMatch != null && prepared.length === 0) return;
+        setSubtitleTracks(prepared);
       })
       .catch(() => {
-        if (!cancelled) setSubtitleTracks([]);
+        // A failed upgrade likewise keeps working tracks; only a failed
+        // first lookup means the title genuinely has none.
+        if (!cancelled && subtitleMatch == null) setSubtitleTracks([]);
       });
     return () => {
       cancelled = true;
     };
-  }, [mediaType, imdbId, season, episode]);
+  }, [mediaType, imdbId, season, episode, subtitleMatch]);
 
   const savePlaybackProgress = useCallback(
     (
@@ -394,8 +546,22 @@ export function WatchScreen({
       );
       if (seekAttemptRef.current !== attempt) return;
       lastPositionRef.current = targetSeconds;
-      setVideoTimeOffset(targetSeconds);
+      // The restarted converter begins at its own landing keyframe — adopt
+      // it as the new absolute origin, then close the gap locally.
+      setVideoTimeOffset(remux.startSeconds);
+      const gap = targetSeconds - remux.startSeconds;
+      setVideoStartLocal(gap >= 0.25 ? gap : null);
       setVideoUrl(remux.url);
+      shipClientLog(
+        context.connection,
+        'info',
+        'remux_seek',
+        {
+          requested: targetSeconds,
+          landed_at: remux.startSeconds,
+          local_jump: gap >= 0.25 ? gap : 0,
+        },
+      );
     } catch {
       // The converter could not restart there; playback continues in place.
     } finally {
@@ -404,15 +570,28 @@ export function WatchScreen({
   }, []);
 
   // Refresh Continue Watching once the viewer leaves the player. The small
-  // delay lets the player's final progress flush land first.
+  // delay lets the player's final progress flush land first. Leaving also
+  // cancels any start sequence still buffering — it would otherwise keep
+  // polling Core long after the viewer has moved on.
   const refreshLibraryRef = useRef(refreshLibrary);
   refreshLibraryRef.current = refreshLibrary;
   useEffect(
     () => () => {
+      startAbortRef.current?.abort();
       window.setTimeout(() => void refreshLibraryRef.current(), 400);
     },
     [],
   );
+
+  // Back means BACK — the page the viewer came from, not always the info
+  // page (e.g. Home → Watch should land on Home). Falls back to `backHref`.
+  const goBack = useCallback(() => {
+    if (window.history.length > 1) navigate(-1);
+    else navigate(backHref);
+    // History POP otherwise restores the catalog/title scroll we left from.
+    resetWindowScroll();
+    requestAnimationFrame(resetWindowScroll);
+  }, [navigate, backHref]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -433,12 +612,12 @@ export function WatchScreen({
             // Fall through to navigation.
           }
         }
-        navigate(backHref);
+        goBack();
       })();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [navigate, backHref]);
+  }, [goBack]);
 
   const backdrop = backdropUrl(backdropPath, 'w780');
   const busy = status === 'loading' || status === 'starting';
@@ -454,11 +633,19 @@ export function WatchScreen({
           timeOffset={videoTimeOffset}
           title={title}
           subtitle={subtitle}
+          logoPath={logoPath}
           backHref={backHref}
-          onPickSubtitle={setActiveSubtitleId}
+          onBack={goBack}
+          onPickSubtitle={pickSubtitle}
+          onEnableCaptions={enableCaptions}
+          captionSize={captionPrefs.size}
+          onPickCaptionSize={(size: CaptionSize) => updateCaptionPrefs({ size })}
+          captionColor={captionPrefs.color}
+          onPickCaptionColor={(color: CaptionColor) => updateCaptionPrefs({ color })}
           subtitles={subtitleTracks}
           activeSubtitleId={activeSubtitleId}
           initialTime={videoIsHls ? 0 : resumeAt}
+          startTimeLocal={videoIsHls ? videoStartLocal : null}
           onPlaybackProgress={savePlaybackProgress}
           onSeekOutside={(target) => void requestRemuxSeek(target)}
           onError={() => {
@@ -467,6 +654,21 @@ export function WatchScreen({
             const failedIndex = sources.findIndex(
               (stream) => streamKey(stream) === activeKey,
             );
+            const failed = failedIndex >= 0 ? sources[failedIndex] : null;
+            if (playbackConnection.current) {
+              shipClientLog(
+                playbackConnection.current,
+                'warn',
+                'source_failed',
+                {
+                  failed_name: failed?.name,
+                  failed_title: failed?.title,
+                  next_index: failedIndex + 1,
+                  total: sources.length,
+                  resume_at: lastPositionRef.current || undefined,
+                },
+              );
+            }
             const nextIndex = failedIndex >= 0 ? failedIndex + 1 : 0;
             if (nextIndex < sources.length) {
               void start(sources, nextIndex, true, lastPositionRef.current);
@@ -478,7 +680,7 @@ export function WatchScreen({
           />
           {seekConverting ? (
             <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/60">
-              <LogoLoader title={title} progress={null} size="sm" />
+              <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
             </div>
           ) : null}
         </div>
@@ -493,18 +695,20 @@ export function WatchScreen({
           ) : null}
           <div className="absolute inset-0 bg-linear-to-t from-black via-black/60 to-black/80" />
 
-          <Link
-            href={backHref}
+          <button
+            type="button"
+            onClick={goBack}
             aria-label="Go back"
-            className="desktop-back-offset absolute left-6 top-6 z-50 flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-md transition-colors hover:bg-black/75 sm:left-10 sm:top-10"
+            className="desktop-back-offset absolute left-6 top-6 z-50 flex cursor-pointer items-center text-white transition-colors hover:text-white/80 sm:left-10 sm:top-10"
           >
-            <IoIosArrowBack size={22} />
-          </Link>
+            <IoIosArrowBack size={26} className="drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]" />
+          </button>
 
           <div className="relative flex w-full max-w-xl flex-col items-center text-center">
             <LogoLoader
               title={title}
               progress={busy ? Math.min(progress, 1) : null}
+              logoPath={logoPath}
             />
 
             {busy ? null : (

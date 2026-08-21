@@ -1,28 +1,22 @@
 import type { MediaSummary, WatchLaterItem } from '@cubo/core';
 import { MediaCard } from '@cubo/ui';
 import { useCallback, useEffect, useState } from 'react';
-import { IoRefresh, IoServer, IoTrash } from 'react-icons/io5';
-import { ConfirmDialog } from '@/components/confirm-dialog';
 import { ContinueWatching } from '@/components/continue-watching';
-import { Dropdown } from '@/components/dropdown';
 import { Link } from '@/components/link';
-import {
-  clearCache,
-  deleteCacheItem,
-  getCacheStatus,
-  updateCacheLimit,
-  type CacheStatus,
-} from '@/lib/local-engine';
+import { asMediaSummary } from '@/lib/format';
+import { getCacheStatus, type CacheStatus } from '@/lib/local-engine';
 import { useCore } from './core-provider';
 
 const GIGABYTE = 1024 ** 3;
-const CACHE_OPTIONS = [10, 25, 50, 100, 250];
 
+/**
+ * The viewer-facing side of the library: resume, saved and history. Machine
+ * administration (cache budget/folder, system stats) lives in the Core
+ * dialog — this page only whispers a usage summary with a link to it.
+ */
 export function LibraryScreen() {
   const core = useCore();
   const [cache, setCache] = useState<CacheStatus | null>(null);
-  const [cacheBusy, setCacheBusy] = useState(false);
-  const [confirmingClear, setConfirmingClear] = useState(false);
 
   const loadCache = useCallback(async () => {
     if (!core.connection) return;
@@ -52,7 +46,7 @@ export function LibraryScreen() {
           <p className="text-xl font-semibold text-white/50">LOCAL LIBRARY</p>
           <h1 className="mt-4 text-4xl font-bold">Your viewing stays with you.</h1>
           <p className="mt-4 leading-7 text-white/60">
-            Connect to Cubo Core to see viewing progress, saved titles and local cache usage.
+            Connect to Cubo Core to see viewing progress, saved titles and your watch history.
           </p>
           <button
             type="button"
@@ -68,193 +62,37 @@ export function LibraryScreen() {
 
   const { history, watchLater, analytics } = core.library;
 
-  async function changeLimit(gigabytes: number) {
-    if (!core.connection) return;
-    setCacheBusy(true);
-    try {
-      await updateCacheLimit(core.connection, gigabytes * GIGABYTE);
-      await loadCache();
-    } finally {
-      setCacheBusy(false);
-    }
-  }
-
-  async function removeCache(id: string | number) {
-    if (!core.connection) return;
-    setCacheBusy(true);
-    try {
-      await deleteCacheItem(core.connection, id);
-      await loadCache();
-    } finally {
-      setCacheBusy(false);
-    }
-  }
-
-  async function removeAllCache() {
-    if (!core.connection) return;
-    setCacheBusy(true);
-    try {
-      await clearCache(core.connection);
-      await loadCache();
-    } finally {
-      setCacheBusy(false);
-    }
-  }
-
   return (
     <main className="min-h-dvh space-y-16 bg-background px-6 pb-24 pt-28 text-white sm:px-10">
       <header>
         <p className="text-xl font-semibold text-white/50">LOCAL TO CUBO CORE</p>
         <h1 className="mt-3 text-5xl font-bold sm:text-6xl">Library</h1>
-        <p className="mt-4 max-w-xl leading-7 text-white/60">
-          Progress, history and saved titles live on the machine running Cubo Core.
+        <p className="mt-4 text-sm text-faint">
+          {formatWatchTime(analytics.totalWatchSeconds)} watched ·{' '}
+          {analytics.titlesStarted} titles started · {analytics.titlesCompleted} finished
         </p>
       </header>
-
-      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Metric label="Time watched" value={formatWatchTime(analytics.totalWatchSeconds)} />
-        <Metric label="Play sessions" value={String(analytics.playSessions)} />
-        <Metric label="Titles started" value={String(analytics.titlesStarted)} />
-        <Metric label="Completed" value={String(analytics.titlesCompleted)} />
-      </section>
 
       <ContinueWatching className="" />
       <SavedGrid title="Watch Later" items={watchLater} />
       <HistoryGrid items={history.slice(0, 16)} />
 
-      <section className="space-y-5 border-t border-line pt-12">
-        <div className="flex items-center gap-3">
-          <IoServer size={22} />
-          <h2 className="text-2xl font-semibold">Content cache</h2>
-        </div>
-        <p className="max-w-xl leading-7 text-white/60">
-          Cubo keeps recently streamed pieces locally. When the limit is reached, the oldest cached
-          title is removed first.
+      <section className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-8">
+        <p className="text-sm text-faint">
+          {cache
+            ? `Content cache · ${formatBytes(cache.usedBytes)} of ${Math.round(cache.maxBytes / GIGABYTE)} GB used`
+            : 'Content cache'}
         </p>
-
-        <div className="max-w-xl rounded-2xl bg-panel p-6">
-          <div className="flex items-end justify-between gap-4">
-            <div>
-              <p className="text-sm text-faint">Used</p>
-              <p className="mt-1 text-3xl font-semibold">
-                {cache ? formatBytes(cache.usedBytes) : '—'}
-              </p>
-            </div>
-            <div className="text-right text-sm text-faint">
-              Maximum
-              <Dropdown
-                value={cache ? Math.round(cache.maxBytes / GIGABYTE) : 50}
-                options={CACHE_OPTIONS.map((option) => ({
-                  value: option,
-                  label: `${option} GB`,
-                }))}
-                disabled={cacheBusy || !cache}
-                onChange={(gigabytes) => void changeLimit(gigabytes)}
-                ariaLabel="Maximum cache size"
-                className="mt-2"
-              />
-            </div>
-          </div>
-
-          <div className="mt-5 h-1.5 overflow-hidden rounded-full bg-[#4f4f4f]">
-            <div
-              className="h-full rounded-full bg-accent transition-[width] duration-500"
-              style={{
-                width: `${cache ? Math.min(100, (cache.usedBytes / cache.maxBytes) * 100) : 0}%`,
-              }}
-            />
-          </div>
-
-          <div className="mt-5 flex items-center justify-between border-t border-line pt-5">
-            <p className="text-sm text-faint">{cache?.itemCount ?? 0} cached titles</p>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void loadCache()}
-                disabled={cacheBusy}
-                aria-label="Refresh cache usage"
-                className="flex h-10 w-10 cursor-pointer items-center justify-center rounded-full text-muted transition-colors hover:bg-control hover:text-white"
-              >
-                <IoRefresh size={18} />
-              </button>
-              <button
-                type="button"
-                onClick={() => setConfirmingClear(true)}
-                disabled={cacheBusy || !cache?.itemCount}
-                className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-control px-4 py-2 text-sm text-white transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-35"
-              >
-                <IoTrash size={15} />
-                Clear cache
-              </button>
-            </div>
-          </div>
-
-          {cache?.entries.length ? (
-            <ul
-              className="m-0 mt-4 max-h-52 list-none divide-y divide-line overflow-y-auto p-0"
-            >
-              {cache.entries.map((entry) => (
-                <li key={entry.infoHash} className="flex items-center justify-between gap-4 py-3">
-                  <p className="min-w-0 truncate text-sm text-white/60">
-                    {entry.title || 'Cached video'}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => void removeCache(entry.torrentId ?? entry.infoHash)}
-                    disabled={cacheBusy}
-                    className="shrink-0 cursor-pointer text-sm text-faint transition-colors hover:text-white"
-                  >
-                    Remove
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
+        <button
+          type="button"
+          onClick={core.openSettings}
+          className="cursor-pointer border-0 bg-transparent p-0 text-sm font-semibold text-muted transition-colors hover:text-white"
+        >
+          Manage in Core
+        </button>
       </section>
-
-      {confirmingClear ? (
-        <ConfirmDialog
-          title="Clear the content cache?"
-          description="All locally cached video will be removed. Titles will need to buffer again the next time you watch them."
-          confirmLabel="Clear cache"
-          onCancel={() => setConfirmingClear(false)}
-          onConfirm={() => {
-            setConfirmingClear(false);
-            void removeAllCache();
-          }}
-        />
-      ) : null}
     </main>
   );
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl bg-panel p-6">
-      <p className="text-sm text-faint">{label}</p>
-      <p className="mt-2 text-3xl font-semibold">{value}</p>
-    </div>
-  );
-}
-
-function toSummary(item: {
-  mediaId: number;
-  mediaType: MediaSummary['mediaType'];
-  title: string;
-  posterPath: string | null;
-  backdropPath: string | null;
-}): MediaSummary {
-  return {
-    id: item.mediaId,
-    mediaType: item.mediaType,
-    title: item.title,
-    overview: '',
-    posterPath: item.posterPath,
-    backdropPath: item.backdropPath,
-    releaseDate: '',
-    voteAverage: 0,
-  };
 }
 
 function SavedGrid({ title, items }: { title: string; items: WatchLaterItem[] }) {
@@ -267,7 +105,7 @@ function SavedGrid({ title, items }: { title: string; items: WatchLaterItem[] })
         {items.map((item) => (
           <MediaCard
             key={item.key}
-            item={toSummary(item)}
+            item={asMediaSummary(item)}
             href={item.detailHref}
             linkComponent={Link}
             className="w-full"
@@ -301,7 +139,7 @@ function HistoryGrid({
         {items.map((item) => (
           <div key={item.key}>
             <MediaCard
-              item={toSummary(item)}
+              item={asMediaSummary(item)}
               href={item.detailHref}
               linkComponent={Link}
               className="w-full"

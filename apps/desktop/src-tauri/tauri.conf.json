@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "cubo",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "identifier": "com.cubo.app",
   "build": {
-    "beforeDevCommand": "pnpm --filter @cubo/web dev",
-    "beforeBuildCommand": "pnpm --filter @cubo/web build",
-    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "bun --filter @cubo/web build",
+    "devUrl": "http://localhost:4200",
     "frontendDist": "../../web/dist"
   },
   "app": {
@@ -21,7 +21,7 @@
         "hiddenTitle": true,
         "trafficLightPosition": {
           "x": 18,
-          "y": 26
+          "y": 38
         }
       }
     ],

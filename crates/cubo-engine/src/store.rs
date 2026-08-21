@@ -1,16 +1,26 @@
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-const DEFAULT_CACHE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+const DEFAULT_CACHE_BYTES: u64 = 25 * 1024 * 1024 * 1024;
 const MAX_HISTORY_ITEMS: usize = 500;
+/// Playback progress ticks arrive every few seconds; the state file is
+/// rewritten at most this often, with a trailing flush for the final tick.
+const PERSIST_MIN_INTERVAL_MS: u64 = 3_000;
 
 #[derive(Clone)]
 pub struct CoreStore {
     path: PathBuf,
     data: std::sync::Arc<Mutex<CoreData>>,
+    /// Set when in-memory changes have not reached disk yet.
+    dirty: std::sync::Arc<AtomicBool>,
+    last_persist_ms: std::sync::Arc<AtomicU64>,
+    flush_scheduled: std::sync::Arc<AtomicBool>,
+    /// Serializes state-file writes so concurrent flushes cannot interleave.
+    persist_lock: std::sync::Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,12 +76,17 @@ pub struct WatchAnalytics {
 #[serde(rename_all = "camelCase")]
 pub struct CachePreferences {
     pub max_bytes: u64,
+    /// Absolute path of the torrent download folder. `None` means the
+    /// process default (next to this state file, `downloads/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
 }
 
 impl Default for CachePreferences {
     fn default() -> Self {
         Self {
             max_bytes: DEFAULT_CACHE_BYTES,
+            directory: None,
         }
     }
 }
@@ -165,28 +180,32 @@ impl CoreStore {
         Ok(Self {
             path,
             data: std::sync::Arc::new(Mutex::new(data)),
+            dirty: std::sync::Arc::new(AtomicBool::new(false)),
+            last_persist_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            flush_scheduled: std::sync::Arc::new(AtomicBool::new(false)),
+            persist_lock: std::sync::Arc::new(Mutex::new(())),
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub async fn snapshot(&self) -> CoreData {
         self.data.lock().await.clone()
     }
 
-    pub async fn record_playback(&self, update: PlaybackUpdate) -> Result<CoreData, String> {
+    /// Progress ticks arrive every ~10 s during playback, so this stays
+    /// lean: one pass over history and no snapshot in the response.
+    pub async fn record_playback(&self, update: PlaybackUpdate) -> Result<(), String> {
         let mut data = self.data.lock().await;
         let now = now_millis();
-        let new_title = !data.history.iter().any(|item| item.key == update.key);
         let progress = if update.duration_seconds > 0.0 {
             (update.position_seconds / update.duration_seconds).clamp(0.0, 1.0)
         } else {
             0.0
         };
         let completed = progress >= 0.9;
-        let was_completed = data
-            .history
-            .iter()
-            .find(|item| item.key == update.key)
-            .is_some_and(|item| item.completed);
 
         let item = LibraryItem {
             key: update.key.clone(),
@@ -209,14 +228,15 @@ impl CoreStore {
             detail_href: update.detail_href,
         };
 
-        if let Some(existing) = data
+        let existing = data
             .history
             .iter_mut()
-            .find(|entry| entry.key == update.key)
-        {
-            *existing = item;
-        } else {
-            data.history.push(item);
+            .find(|entry| entry.key == update.key);
+        let new_title = existing.is_none();
+        let was_completed = existing.as_ref().is_some_and(|entry| entry.completed);
+        match existing {
+            Some(entry) => *entry = item,
+            None => data.history.push(item),
         }
         data.history
             .sort_by_key(|entry| std::cmp::Reverse(entry.last_watched_at));
@@ -234,8 +254,8 @@ impl CoreStore {
         }
         data.analytics.last_watched_at = Some(now);
 
-        self.persist_locked(&data).await?;
-        Ok(data.clone())
+        drop(data);
+        self.persist_throttled().await
     }
 
     pub async fn remove_history_item(&self, key: &str) -> Result<CoreData, String> {
@@ -260,6 +280,13 @@ impl CoreStore {
     pub async fn update_cache_limit(&self, max_bytes: u64) -> Result<CoreData, String> {
         let mut data = self.data.lock().await;
         data.cache.max_bytes = max_bytes.clamp(1024 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
+        self.persist_locked(&data).await?;
+        Ok(data.clone())
+    }
+
+    pub async fn update_cache_directory(&self, directory: PathBuf) -> Result<CoreData, String> {
+        let mut data = self.data.lock().await;
+        data.cache.directory = Some(directory.to_string_lossy().into_owned());
         self.persist_locked(&data).await?;
         Ok(data.clone())
     }
@@ -314,8 +341,48 @@ impl CoreStore {
         self.persist_locked(&data).await
     }
 
+    /// Persists at most once per [`PERSIST_MIN_INTERVAL_MS`]; ticks in between
+    /// only mark the state dirty and schedule one trailing flush, so a burst
+    /// of progress updates costs a single write.
+    async fn persist_throttled(&self) -> Result<(), String> {
+        let now = now_millis();
+        let last = self.last_persist_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= PERSIST_MIN_INTERVAL_MS
+            && self
+                .last_persist_ms
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            return self.persist_now().await;
+        }
+
+        self.dirty.store(true, Ordering::Release);
+        if self.flush_scheduled.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let store = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(PERSIST_MIN_INTERVAL_MS)).await;
+            store.flush_scheduled.store(false, Ordering::Release);
+            if !store.dirty.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            store.last_persist_ms.store(now_millis(), Ordering::Release);
+            if let Err(error) = store.persist_now().await {
+                eprintln!("Cubo could not save state: {error}");
+            }
+        });
+        Ok(())
+    }
+
+    async fn persist_now(&self) -> Result<(), String> {
+        let _guard = self.persist_lock.lock().await;
+        let data = self.data.lock().await.clone();
+        self.persist_locked(&data).await
+    }
+
     async fn persist_locked(&self, data: &CoreData) -> Result<(), String> {
-        let bytes = serde_json::to_vec_pretty(data)
+        let bytes = serde_json::to_vec(data)
             .map_err(|error| format!("could not encode Cubo state: {error}"))?;
         let temporary = self.path.with_extension("json.tmp");
         tokio::fs::write(&temporary, bytes)
@@ -331,7 +398,7 @@ fn state_version() -> u32 {
     1
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

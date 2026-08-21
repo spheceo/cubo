@@ -1,4 +1,4 @@
-import type { MediaType } from '@cubo/core';
+import type { MediaType, SubtitleReleaseHint } from '@cubo/core';
 import { QueryClient, queryOptions } from '@tanstack/react-query';
 import { catalog } from './api';
 
@@ -50,10 +50,26 @@ export const streamQueries = {
       queryFn: () => catalog.streams.get(mediaType, imdbId, season, episode),
       staleTime: 2 * 60 * 1000,
     }),
-  subtitles: (mediaType: MediaType, imdbId: string, season?: number, episode?: number) =>
+  subtitles: (
+    mediaType: MediaType,
+    imdbId: string,
+    season?: number,
+    episode?: number,
+    release?: SubtitleReleaseHint | null,
+  ) =>
     queryOptions({
-      queryKey: ['subtitles', mediaType, imdbId, season ?? null, episode ?? null],
-      queryFn: () => catalog.subtitles.get(mediaType, imdbId, season, episode),
+      queryKey: [
+        'subtitles',
+        mediaType,
+        imdbId,
+        season ?? null,
+        episode ?? null,
+        release ?? null,
+      ],
+      // The first fetch (no hint) matches by title ID alone; once Core has
+      // computed the OpenSubtitles hash of the playing file, the refetch
+      // machine-matches the exact release and replaces badly-synced tracks.
+      queryFn: () => catalog.subtitles.get(mediaType, imdbId, season, episode, release),
       staleTime: 30 * 60 * 1000,
     }),
 };

@@ -1,12 +1,14 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::header::{
     ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
 };
@@ -22,12 +24,16 @@ use librqbit_dualstack_sockets::TcpListener as RqbitListener;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::store::{CoreStore, PlaybackUpdate, WatchLaterUpdate};
+use crate::pairing::{PairAttempt, PairingManager};
+use crate::paths::home_dir;
+use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
+use crate::system;
 use crate::transcode::TranscodeManager;
 
 const CORE_PORT: u16 = 8765;
@@ -38,15 +44,20 @@ const WEB_DEPLOYMENT_URL: &str = "https://app.cubo.spheceo.com";
 // The bundled desktop webview reaches Core from tauri://localhost (macOS) or
 // http://tauri.localhost (Windows); the Vite dev server uses the loopback pair.
 const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
+    "http://localhost:4200",
+    "http://127.0.0.1:4200",
     "tauri://localhost",
     "http://tauri.localhost",
 ];
+/// Ports a loopback or own-hostname origin may use: Core itself (pages it
+/// proxies), the web dev server, and the Tauri dev server. Any other local
+/// port is some unrelated app and gets no CORS access.
+const ALLOWED_ORIGIN_PORTS: [u16; 3] = [CORE_PORT, 4200, 1420];
 
 pub struct Engine {
     bridge_port: u16,
     bridge_addresses: Vec<SocketAddr>,
+    download_dir: Arc<RwLock<PathBuf>>,
     // Held for the app's lifetime so the session and its DHT tasks stay alive.
     _session: Arc<Session>,
 }
@@ -57,16 +68,47 @@ struct BridgeState {
     token: Arc<str>,
     client: reqwest::Client,
     web_origin: Option<Arc<str>>,
-    download_dir: Arc<PathBuf>,
+    /// Hostnames/IPs this machine answers to (hostname, Tailscale IP). Pages
+    /// served from e.g. http://kenobi:4200 on another tailnet device carry
+    /// that origin, so the CORS layer accepts host matches — but only on
+    /// Cubo's own ports (see ALLOWED_ORIGIN_PORTS).
+    allowed_hosts: Arc<Vec<String>>,
+    download_dir: Arc<RwLock<PathBuf>>,
+    /// Last time a viewer was clearly pulling video (progress, buffer poll,
+    /// remux segment). Playlist polls do not count — those continue while paused.
+    playback_last_ms: Arc<AtomicU64>,
+    cache_swap: Arc<Mutex<()>>,
     store: CoreStore,
     transcode: Arc<TranscodeManager>,
+    /// Computed OpenSubtitles release matches, keyed by `{torrent}:{file}`.
+    /// Each one costs two ranged reads through rqbit (the tail can pull
+    /// pieces from peers), so results are remembered for the session.
+    subtitle_matches: Arc<Mutex<HashMap<String, SubtitleMatchInfo>>>,
+    /// Authenticator-style pairing: verifies offline codes and remembers
+    /// device tokens issued to remote (non-loopback) clients.
+    pairing: Arc<PairingManager>,
+}
+
+impl BridgeState {
+    async fn current_download_dir(&self) -> PathBuf {
+        self.download_dir.read().await.clone()
+    }
+
+    fn mark_playback(&self) {
+        self.playback_last_ms
+            .store(store::now_millis(), Ordering::Release);
+    }
+
+    fn is_playback_active(&self) -> bool {
+        let last = self.playback_last_ms.load(Ordering::Acquire);
+        last != 0 && store::now_millis().saturating_sub(last) < PLAYBACK_GUARD_MS
+    }
 }
 
 #[derive(Deserialize)]
 struct StreamQuery {
     token: String,
 }
-
 #[derive(Deserialize)]
 struct HlsQuery {
     token: String,
@@ -74,6 +116,10 @@ struct HlsQuery {
     /// unconverted region restarts ffmpeg here instead of waiting for it.
     start: Option<f64>,
 }
+
+/// Progress ticks every 10s while playing; this window covers a missed tick
+/// plus the pause report so a swap is refused until the viewer actually stops.
+const PLAYBACK_GUARD_MS: u64 = 20_000;
 
 static ENGINE: OnceCell<Engine> = OnceCell::const_new();
 
@@ -86,7 +132,14 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 .parent()
                 .unwrap_or(download_dir.as_path())
                 .join("cubo-state.json");
-            let store = CoreStore::load(state_path).await?;
+            let store = CoreStore::load(state_path.clone()).await?;
+            // Pairing state lives in the SHARED Cubo data dir, not next to
+            // this embedder's store: the desktop app passes its Tauri
+            // app-data folder here, while `cubo pair` (a separate process)
+            // reads paths::data_dir() — both must see one secret, or codes
+            // printed in the terminal would never match a desktop Core.
+            let pairing = Arc::new(PairingManager::load(&crate::paths::data_dir())?);
+            let download_dir = resolve_startup_download_dir(&store, download_dir).await;
             let session = Session::new(download_dir.clone())
                 .await
                 .map_err(|e| format!("rqbit session init failed: {e:#}"))?;
@@ -108,42 +161,64 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             .map_err(|e| format!("failed to bind rqbit server: {e:#}"))?;
             let rqbit_port = rqbit_listener.bind_addr().port();
 
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(error) = http_api.make_http_api_and_run(rqbit_listener, None).await {
-                    eprintln!("rqbit HTTP API exited: {error:#}");
+                    tracing::error!(target: "engine", error = %error, "rqbit HTTP API exited");
                 }
             });
 
-            let bridge_listeners = bind_bridges().await?;
+            // Probed once here; binding and the CORS host allowlist both use it.
+            let tailscale_address = detect_tailscale_ipv4();
+            let bridge_listeners = bind_bridges(tailscale_address).await?;
             let bridge_addresses = bridge_listeners
                 .iter()
                 .filter_map(|listener| listener.local_addr().ok())
                 .collect::<Vec<_>>();
-            let transcode_dir = download_dir
+            // Remux output stays next to Cubo state, not inside the (movable)
+            // torrent cache. A directory swap must not relocate ffmpeg jobs.
+            let transcode_dir = state_path
                 .parent()
                 .unwrap_or(download_dir.as_path())
                 .join("transcode");
+            let download_dir = Arc::new(RwLock::new(download_dir));
             let state = BridgeState {
                 rqbit_port,
                 token: Uuid::new_v4().simple().to_string().into(),
                 client: reqwest::Client::new(),
                 web_origin: resolve_web_origin()?,
-                download_dir: Arc::new(download_dir),
+                allowed_hosts: Arc::new(local_machine_hosts(tailscale_address)),
+                download_dir: download_dir.clone(),
+                playback_last_ms: Arc::new(AtomicU64::new(0)),
+                cache_swap: Arc::new(Mutex::new(())),
                 store,
                 transcode: Arc::new(TranscodeManager::new(transcode_dir)),
+                subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
+                pairing,
             };
             let router = bridge_router(state.clone());
 
             let maintenance_state = state.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 cache_maintenance_loop(maintenance_state).await;
             });
 
+            tracing::info!(
+                target: "engine",
+                bridge_port = CORE_PORT,
+                rqbit_port,
+                addresses = ?bridge_addresses,
+                "Cubo engine started"
+            );
+
             for listener in bridge_listeners {
                 let listener_router = router.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = axum::serve(listener, listener_router).await {
-                        eprintln!("Cubo bridge exited: {error:#}");
+                tokio::spawn(async move {
+                    // Connect info lets /v1/health tell loopback callers
+                    // (handed the session token) from remote ones (must pair).
+                    let service = listener_router
+                        .into_make_service_with_connect_info::<SocketAddr>();
+                    if let Err(error) = axum::serve(listener, service).await {
+                        tracing::error!(target: "engine", error = %error, "Cubo bridge exited");
                     }
                 });
             }
@@ -151,12 +226,44 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             Ok::<Engine, String>(Engine {
                 bridge_port: CORE_PORT,
                 bridge_addresses,
+                download_dir,
                 _session: session,
             })
         })
         .await?;
 
     Ok(engine.bridge_port)
+}
+
+pub async fn cache_directory() -> Option<PathBuf> {
+    match ENGINE.get() {
+        Some(engine) => Some(engine.download_dir.read().await.clone()),
+        None => None,
+    }
+}
+
+async fn resolve_startup_download_dir(store: &CoreStore, default_dir: PathBuf) -> PathBuf {
+    let configured = store
+        .snapshot()
+        .await
+        .cache
+        .directory
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let candidate = configured.unwrap_or(default_dir.clone());
+    match tokio::fs::create_dir_all(&candidate).await {
+        Ok(()) => candidate,
+        Err(error) => {
+            tracing::warn!(
+                target: "engine",
+                path = %candidate.display(),
+                error = %error,
+                "configured cache directory is not usable; falling back to default"
+            );
+            let _ = tokio::fs::create_dir_all(&default_dir).await;
+            default_dir
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -176,12 +283,12 @@ pub fn status() -> serde_json::Value {
     }
 }
 
-async fn bind_bridges() -> Result<Vec<TcpListener>, String> {
+async fn bind_bridges(tailscale_address: Option<IpAddr>) -> Result<Vec<TcpListener>, String> {
     let mut addresses = vec![
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(Ipv6Addr::LOCALHOST),
     ];
-    if let Some(address) = detect_tailscale_ipv4() {
+    if let Some(address) = tailscale_address {
         if !address.is_loopback() && !addresses.contains(&address) {
             addresses.push(address);
         }
@@ -197,8 +304,10 @@ async fn bind_bridges() -> Result<Vec<TcpListener>, String> {
                 ));
             }
             Err(error) => {
-                eprintln!(
-                    "Cubo Core could not bind optional address {address}:{CORE_PORT}: {error}"
+                tracing::warn!(
+                    target: "engine",
+                    %address, %error,
+                    "Cubo Core could not bind optional address"
                 );
             }
         }
@@ -233,24 +342,78 @@ fn detect_tailscale_ipv4() -> Option<IpAddr> {
     None
 }
 
-fn is_loopback_origin(origin: &HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    let Ok(url) = reqwest::Url::parse(origin) else {
-        return false;
-    };
-    matches!(
-        url.host_str(),
-        Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
-    )
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// Lowercased host and effective port of an Origin header.
+fn origin_host_port(origin: &HeaderValue) -> Option<(String, Option<u16>)> {
+    let origin = origin.to_str().ok()?;
+    let url = reqwest::Url::parse(origin).ok()?;
+    let host = url
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())?;
+    Some((host, url.port_or_known_default()))
+}
+
+/// Which browser origins may call the /v1 API. Exact allowlisted origins
+/// (dev servers, the Tauri webview, the web deployment) pass as-is; loopback
+/// and own-hostname/Tailscale origins pass only on Cubo's own ports, so an
+/// unrelated local app on some other port is not silently trusted.
+struct OriginPolicy {
+    allowed_origins: Arc<Vec<HeaderValue>>,
+    allowed_hosts: Arc<Vec<String>>,
+}
+
+impl OriginPolicy {
+    fn allows(&self, origin: &HeaderValue) -> bool {
+        if self.allowed_origins.iter().any(|allowed| allowed == origin) {
+            return true;
+        }
+        let Some((host, port)) = origin_host_port(origin) else {
+            return false;
+        };
+        if !port.is_some_and(|port| ALLOWED_ORIGIN_PORTS.contains(&port)) {
+            return false;
+        }
+        is_loopback_host(&host) || self.allowed_hosts.contains(&host)
+    }
+}
+
+/// Hostnames and addresses pages can use to reach this machine over the
+/// network: the system hostname and the detected Tailscale IPv4.
+fn local_machine_hosts(tailscale_address: Option<IpAddr>) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for executable in ["hostname", "/bin/hostname"] {
+        if let Ok(output) = Command::new(executable).output() {
+            if output.status.success() {
+                let name = String::from_utf8_lossy(&output.stdout).trim().to_ascii_lowercase();
+                if !name.is_empty() {
+                    hosts.push(name.clone());
+                    // macOS reports "<name>.local"; peers reach the machine by
+                    // the bare name (MagicDNS/LAN), so allow both forms.
+                    if let Some(bare) = name.strip_suffix(".local") {
+                        hosts.push(bare.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(address) = tailscale_address {
+        hosts.push(address.to_string());
+    }
+    hosts
 }
 
 fn bridge_router(state: BridgeState) -> Router {
-    let allowed_origins = allowed_origins(state.web_origin.as_deref());
-    let allow_origin = AllowOrigin::predicate(move |origin: &HeaderValue, _| {
-        is_loopback_origin(origin) || allowed_origins.iter().any(|allowed| allowed == origin)
+    let policy = Arc::new(OriginPolicy {
+        allowed_origins: allowed_origins(state.web_origin.as_deref()),
+        allowed_hosts: state.allowed_hosts.clone(),
     });
+    let cors_policy = policy.clone();
+    let allow_origin =
+        AllowOrigin::predicate(move |origin: &HeaderValue, _| cors_policy.allows(origin));
     let cors = CorsLayer::new()
         .allow_origin(allow_origin)
         .allow_methods([
@@ -273,13 +436,21 @@ fn bridge_router(state: BridgeState) -> Router {
             CONTENT_RANGE,
             CONTENT_TYPE,
             HeaderName::from_static("x-cubo-duration"),
+            HeaderName::from_static("x-cubo-start"),
         ]);
 
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/pair", post(pair_device))
+        .route("/v1/system", get(system_stats))
+        .route("/v1/folders", get(list_folders).post(create_folder))
         .route("/v1/torrents", post(add_torrent))
         .route("/v1/torrents/{id}/stats", get(torrent_stats))
         .route("/v1/torrents/{id}/stream/{file_index}", get(stream_torrent))
+        .route(
+            "/v1/torrents/{id}/files/{file_index}/subtitle-match",
+            get(torrent_subtitle_match),
+        )
         .route("/v1/torrents/{id}/hls/{file_index}/{file}", get(hls_file))
         .route("/v1/library", get(library_snapshot))
         .route("/v1/library/progress", post(record_playback))
@@ -290,11 +461,17 @@ fn bridge_router(state: BridgeState) -> Router {
         )
         .route("/v1/cache", get(cache_status).delete(clear_cache))
         .route("/v1/cache/settings", put(update_cache_settings))
+        .route("/v1/cache/directory", put(update_cache_directory))
         .route("/v1/cache/{id}", axum::routing::delete(delete_cache_item))
+        .route("/v1/client-log", post(client_log))
         .fallback(web_fallback)
         .with_state(state)
         .layer(cors)
-        .layer(middleware::from_fn(add_private_network_header))
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(move |request, next| {
+            let policy = policy.clone();
+            add_private_network_header(policy, request, next)
+        }))
 }
 
 fn allowed_origins(web_origin: Option<&str>) -> Arc<Vec<HeaderValue>> {
@@ -311,7 +488,7 @@ fn allowed_origins(web_origin: Option<&str>) -> Arc<Vec<HeaderValue>> {
 /// itself bundles the UI, so only the "open Core in a browser" flow needs this.
 fn resolve_web_origin() -> Result<Option<Arc<str>>, String> {
     let origin = if cfg!(debug_assertions) {
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:4200"
     } else {
         WEB_DEPLOYMENT_URL
     };
@@ -329,13 +506,25 @@ fn resolve_web_origin() -> Result<Option<Arc<str>>, String> {
     Ok(Some(origin.to_owned().into()))
 }
 
-async fn add_private_network_header(request: axum::extract::Request, next: Next) -> Response {
+/// Browsers gate public-site requests to local servers behind a preflight
+/// asking for private-network access. Grant it only to origins that already
+/// pass the CORS policy — answering "yes" unconditionally would erode the
+/// exact protection the browser is trying to provide.
+async fn add_private_network_header(
+    policy: Arc<OriginPolicy>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
     let wants_private_network = request
         .headers()
         .get("access-control-request-private-network")
         .is_some_and(|value| value == "true");
+    let origin_allowed = request
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .is_some_and(|origin| policy.allows(origin));
     let mut response = next.run(request).await;
-    if wants_private_network {
+    if wants_private_network && origin_allowed {
         response.headers_mut().insert(
             HeaderName::from_static("access-control-allow-private-network"),
             HeaderValue::from_static("true"),
@@ -344,22 +533,181 @@ async fn add_private_network_header(request: axum::extract::Request, next: Next)
     response
 }
 
-async fn health(State(state): State<BridgeState>) -> impl IntoResponse {
-    Json(json!({
+/// Ingests a diagnostic event emitted by the web app (stream selection,
+/// fallback switches, playback errors) into the same structured log the
+/// engine writes to, so one file tells the whole story of a session.
+async fn client_log(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(payload): Json<ClientLogPayload>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+
+    let data = payload
+        .data
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+
+    match payload.level.as_str() {
+        "error" => tracing::error!(
+            target: "client",
+            event = %payload.event,
+            data = %data,
+            "web app report",
+        ),
+        "warn" => tracing::warn!(
+            target: "client",
+            event = %payload.event,
+            data = %data,
+            "web app report",
+        ),
+        _ => tracing::info!(
+            target: "client",
+            event = %payload.event,
+            data = %data,
+            "web app report",
+        ),
+    }
+
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct ClientLogPayload {
+    level: String,
+    event: String,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+/// Discovery endpoint. With pairing enabled, the session token — full
+/// control of this Core — is only handed to callers on this same machine
+/// (loopback); a remote device (another tailnet machine) gets
+/// `pairingRequired` instead and must present a pairing code at /v1/pair to
+/// receive its own token. While PAIRING_ENABLED is false, every caller gets
+/// the token (pre-pairing behavior).
+async fn health(
+    State(state): State<BridgeState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let is_local_caller = !crate::pairing::PAIRING_ENABLED || peer.ip().is_loopback();
+    let mut body = json!({
         "name": "cubo-core",
         "version": env!("CARGO_PKG_VERSION"),
         "engine": "rqbit",
         "engineVersion": librqbit::version(),
-        "sessionToken": state.token,
         "webUrl": state.web_origin,
         "transcode": state.transcode.available(),
-    }))
+        "pairingRequired": !is_local_caller,
+    });
+    if is_local_caller {
+        body["sessionToken"] = json!(state.token.as_ref());
+    }
+    Json(body)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairBody {
+    code: String,
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+/// Exchanges a current pairing code (shown by `cubo pair` on the machine
+/// running Core) for a long-lived device token.
+async fn pair_device(State(state): State<BridgeState>, Json(body): Json<PairBody>) -> Response {
+    if !crate::pairing::PAIRING_ENABLED {
+        return bridge_error(StatusCode::NOT_FOUND, "Pairing is not enabled on this Core.".into());
+    }
+    let pairing = state.pairing.clone();
+    let attempt =
+        tokio::task::spawn_blocking(move || pairing.attempt_pair(&body.code, body.device_name))
+            .await;
+    match attempt {
+        Ok(PairAttempt::Accepted(token)) => Json(json!({ "token": token })).into_response(),
+        Ok(PairAttempt::Rejected) => bridge_error(
+            StatusCode::UNAUTHORIZED,
+            "That code is not right or has expired. Run `cubo pair` on the machine running Cubo for a fresh one.".into(),
+        ),
+        Ok(PairAttempt::Throttled) => bridge_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many attempts. Wait a minute, then try a fresh code.".into(),
+        ),
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn system_stats(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    // Sampling CPU takes ~250ms; keep it off the async runtime.
+    let download_dir = state.current_download_dir().await;
+    let snapshot =
+        tokio::task::spawn_blocking(move || system::snapshot(&download_dir)).await;
+    match snapshot {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct FoldersQuery {
+    path: Option<String>,
+}
+
+async fn list_folders(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Query(query): Query<FoldersQuery>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let path = query.path;
+    match tokio::task::spawn_blocking(move || system::list_folders(path.as_deref())).await {
+        Ok(Ok(listing)) => Json(listing).into_response(),
+        Ok(Err(error)) => bridge_error(StatusCode::BAD_REQUEST, error),
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateFolderBody {
+    parent: String,
+    name: String,
+}
+
+async fn create_folder(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateFolderBody>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    match tokio::task::spawn_blocking(move || system::create_folder(&body.parent, &body.name)).await
+    {
+        Ok(Ok(folder)) => Json(folder).into_response(),
+        Ok(Err(error)) => bridge_error(StatusCode::BAD_REQUEST, error),
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheSettingsUpdate {
     max_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheDirectoryUpdate {
+    directory: String,
 }
 
 #[derive(Deserialize)]
@@ -389,8 +737,13 @@ async fn record_playback(
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
+    if update.session_started || update.watched_delta_seconds > 0.0 {
+        state.mark_playback();
+    }
+    // Ticks arrive every ~10 s; echoing the whole library back each time
+    // serialized hundreds of items for a response nobody reads.
     match state.store.record_playback(update).await {
-        Ok(snapshot) => Json(snapshot).into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
@@ -434,12 +787,77 @@ async fn update_cache_settings(
     match state.store.update_cache_limit(update.max_bytes).await {
         Ok(snapshot) => {
             let maintenance = state.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(error) = enforce_cache_limit(&maintenance).await {
-                    eprintln!("Cubo cache maintenance failed: {error}");
+                    tracing::warn!(target: "engine", error = %error, "cache maintenance failed");
                 }
             });
             Json(snapshot.cache).into_response()
+        }
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn update_cache_directory(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(update): Json<CacheDirectoryUpdate>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+
+    let _swap = state.cache_swap.lock().await;
+    if state.is_playback_active() {
+        return bridge_error(
+            StatusCode::CONFLICT,
+            "Pause playback before changing the cache folder.".into(),
+        );
+    }
+
+    let old_dir = state.current_download_dir().await;
+    let new_dir = match prepare_cache_directory(&update.directory, state.store.path(), &old_dir) {
+        Ok(path) => path,
+        Err(error) => return bridge_error(StatusCode::BAD_REQUEST, error),
+    };
+    if paths_match(&old_dir, &new_dir) {
+        let snapshot = state.store.snapshot().await;
+        return Json(json!({
+            "maxBytes": snapshot.cache.max_bytes,
+            "directory": old_dir.to_string_lossy(),
+        }))
+        .into_response();
+    }
+
+    match system::folder_contains_files(&new_dir) {
+        Ok(true) => {
+            return bridge_error(
+                StatusCode::BAD_REQUEST,
+                "That folder already has files. Pick an empty folder.".into(),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return bridge_error(StatusCode::BAD_REQUEST, error),
+    }
+
+    if let Err(error) = empty_cache(&state, &old_dir).await {
+        return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+
+    match state.store.update_cache_directory(new_dir.clone()).await {
+        Ok(snapshot) => {
+            *state.download_dir.write().await = new_dir.clone();
+            tracing::info!(
+                target: "engine",
+                from = %old_dir.display(),
+                to = %new_dir.display(),
+                "cache directory changed"
+            );
+            Json(json!({
+                "maxBytes": snapshot.cache.max_bytes,
+                "directory": new_dir.to_string_lossy(),
+            }))
+            .into_response()
         }
         Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
@@ -450,10 +868,12 @@ async fn cache_status(State(state): State<BridgeState>, headers: HeaderMap) -> R
         return unauthorized();
     }
     let snapshot = state.store.snapshot().await;
-    match cache_size(state.download_dir.clone()).await {
+    let download_dir = state.current_download_dir().await;
+    match cache_size(download_dir.clone()).await {
         Ok(used_bytes) => Json(json!({
             "usedBytes": used_bytes,
             "maxBytes": snapshot.cache.max_bytes,
+            "directory": download_dir.to_string_lossy(),
             "itemCount": snapshot.cache_entries.len(),
             "entries": snapshot.cache_entries,
         }))
@@ -488,7 +908,8 @@ async fn delete_cache_item(
         })
         .map(|entry| entry.files.clone())
         .unwrap_or_default();
-    remove_entry_files(&state.download_dir, &entry_files).await;
+    let download_dir = state.current_download_dir().await;
+    remove_entry_files(&download_dir, &entry_files).await;
 
     if let Err(error) = state.store.remove_cache_entry(&id).await {
         return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
@@ -500,23 +921,22 @@ async fn clear_cache(State(state): State<BridgeState>, headers: HeaderMap) -> Re
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
-    if let Err(error) = delete_all_torrents(&state).await {
-        return bridge_error(StatusCode::BAD_GATEWAY, error);
-    }
-    if let Err(error) = state.store.clear_cache_entries().await {
-        return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-    }
-    // The download directory belongs exclusively to this cache; wiping the
-    // leftovers reclaims files rqbit no longer knows about (older sessions).
-    let download_dir = state.download_dir.clone();
-    let wiped = tokio::task::spawn_blocking(move || wipe_dir_contents(&download_dir))
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-    match wiped {
+    let download_dir = state.current_download_dir().await;
+    match empty_cache(&state, &download_dir).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
+}
+
+/// Deletes every torrent rqbit still knows, drops the cache index, and wipes
+/// `download_dir`. Used by explicit clear and by a directory swap.
+async fn empty_cache(state: &BridgeState, download_dir: &std::path::Path) -> Result<(), String> {
+    delete_all_torrents(state).await?;
+    state.store.clear_cache_entries().await?;
+    let download_dir = download_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || wipe_dir_contents(&download_dir))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Asks rqbit to delete a torrent and its files. Returns Ok whether it
@@ -550,7 +970,14 @@ async fn remove_entry_files(download_dir: &std::path::Path, files: &[String]) {
     let _ = tokio::task::spawn_blocking(move || {
         for file in &files {
             let path = std::path::Path::new(file);
-            if !path.starts_with(&download_dir) {
+            // `starts_with` compares components without collapsing "..", so
+            // "<cache>/../../etc/x" would pass it while remove_file resolves
+            // the ".." and escapes. Recorded names come from torrent metadata
+            // (untrusted); refuse any parent-directory component outright.
+            let has_parent_component = path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir));
+            if has_parent_component || !path.starts_with(&download_dir) {
                 continue;
             }
             let _ = std::fs::remove_file(path);
@@ -594,14 +1021,15 @@ async fn cache_maintenance_loop(state: BridgeState) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
         if let Err(error) = enforce_cache_limit(&state).await {
-            eprintln!("Cubo cache maintenance failed: {error}");
+            tracing::warn!(target: "engine", error = %error, "cache maintenance failed");
         }
     }
 }
 
 async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     let snapshot = state.store.snapshot().await;
-    let mut used_bytes = cache_size(state.download_dir.clone()).await?;
+    let download_dir = state.current_download_dir().await;
+    let mut used_bytes = cache_size(download_dir.clone()).await?;
     if used_bytes <= snapshot.cache.max_bytes {
         return Ok(());
     }
@@ -609,6 +1037,9 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     let mut entries = snapshot.cache_entries;
     entries.sort_by_key(|entry| entry.last_accessed_at);
     for entry in entries {
+        if used_bytes <= snapshot.cache.max_bytes {
+            return Ok(());
+        }
         let id = entry
             .torrent_id
             .map(|value| value.to_string())
@@ -616,19 +1047,18 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         // Delete through rqbit when it still knows the torrent, and always
         // remove the recorded files — after a restart only the files exist.
         if rqbit_delete(state, &id).await.is_ok() {
-            remove_entry_files(&state.download_dir, &entry.files).await;
+            // Charge the entry's own files against the running total instead
+            // of re-walking the whole tree after every deletion.
+            let freed = entry_files_size(&entry.files).await;
+            remove_entry_files(&download_dir, &entry.files).await;
             state.store.remove_cache_entry(&id).await?;
-        }
-        used_bytes = cache_size(state.download_dir.clone()).await?;
-        if used_bytes <= snapshot.cache.max_bytes {
-            return Ok(());
+            used_bytes = used_bytes.saturating_sub(freed);
         }
     }
 
     // Still over the limit: whatever remains is untracked (downloaded before
     // file paths were recorded). Reclaim the oldest items, sparing anything
     // touched in the last 10 minutes — that could be an active stream.
-    let download_dir = state.download_dir.clone();
     let max_bytes = snapshot.cache.max_bytes;
     tokio::task::spawn_blocking(move || reclaim_untracked(&download_dir, max_bytes))
         .await
@@ -638,6 +1068,7 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
 fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String> {
     const ACTIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
+    let mut used_bytes = directory_size(dir).map_err(|error| error.to_string())?;
     let mut items: Vec<(std::path::PathBuf, std::time::SystemTime)> = std::fs::read_dir(dir)
         .map_err(|error| error.to_string())?
         .flatten()
@@ -649,19 +1080,46 @@ fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String
     items.sort_by_key(|(_, modified)| *modified);
 
     for (path, modified) in items {
-        if directory_size(dir).map_err(|error| error.to_string())? <= max_bytes {
+        if used_bytes <= max_bytes {
             return Ok(());
         }
         if modified.elapsed().unwrap_or_default() < ACTIVE_GRACE {
             continue;
         }
+        // Track what each removal frees so the tree is walked once, not once
+        // per deletion.
+        let freed = if path.is_dir() {
+            directory_size(&path).unwrap_or(0)
+        } else {
+            path.metadata().map(|meta| meta.len()).unwrap_or(0)
+        };
         let _ = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
         };
+        used_bytes = used_bytes.saturating_sub(freed);
     }
     Ok(())
+}
+
+/// Sums the sizes of an entry's recorded files. Missing files count as zero —
+/// they were already gone before eviction ran.
+async fn entry_files_size(files: &[String]) -> u64 {
+    let files = files.to_vec();
+    tokio::task::spawn_blocking(move || {
+        files
+            .iter()
+            .map(|file| {
+                std::path::Path::new(file)
+                    .metadata()
+                    .map(|meta| meta.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    })
+    .await
+    .unwrap_or(0)
 }
 
 async fn delete_all_torrents(state: &BridgeState) -> Result<(), String> {
@@ -683,14 +1141,14 @@ async fn delete_all_torrents(state: &BridgeState) -> Result<(), String> {
             .map(|value| value.to_string())
             .unwrap_or(torrent.info_hash);
         if let Err(error) = rqbit_delete(state, &id).await {
-            eprintln!("Cubo cache clear: {error}");
+            tracing::error!(target: "engine", error = %error, "cache clear failed");
         }
     }
     Ok(())
 }
 
-async fn cache_size(download_dir: Arc<PathBuf>) -> Result<u64, String> {
-    tokio::task::spawn_blocking(move || directory_size(download_dir.as_path()))
+async fn cache_size(download_dir: PathBuf) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || directory_size(&download_dir))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
@@ -886,8 +1344,9 @@ async fn add_torrent(
     match state
         .client
         .post(format!(
-            "http://127.0.0.1:{}/torrents?overwrite=true",
-            state.rqbit_port
+            "http://127.0.0.1:{}/torrents?overwrite=true&output_folder={}",
+            state.rqbit_port,
+            urlencoding::encode(&state.current_download_dir().await.to_string_lossy())
         ))
         .body(body)
         .send()
@@ -918,6 +1377,14 @@ async fn add_torrent(
                     .unwrap_or_default()
                     .to_owned();
                 if !info_hash.is_empty() {
+                    tracing::info!(
+                        target: "engine",
+                        torrent_id = torrent_id.unwrap_or(0),
+                        info_hash = %info_hash,
+                        media_key = media_key.as_deref().unwrap_or("-"),
+                        title = title.as_deref().unwrap_or("-"),
+                        "torrent added"
+                    );
                     // Record absolute file paths so cache deletion keeps
                     // working after restarts, when rqbit no longer knows the
                     // torrent but the files are still on disk.
@@ -956,7 +1423,7 @@ async fn add_torrent(
                         .touch_cache(torrent_id, info_hash.clone(), media_key, title, files)
                         .await
                     {
-                        eprintln!("Could not update Cubo cache index: {error}");
+                        tracing::warn!(target: "engine", error = %error, "could not update cache index");
                     }
                 }
 
@@ -995,7 +1462,7 @@ async fn add_torrent(
                             state.rqbit_port
                         );
                         let transcode = state.transcode.clone();
-                        tauri::async_runtime::spawn(async move {
+                        tokio::spawn(async move {
                             transcode.prewarm(key, input_url).await;
                         });
                     }
@@ -1022,6 +1489,9 @@ async fn torrent_stats(
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
+    // Buffering polls this until the torrent is live — treat that as watching
+    // so a directory swap cannot yank the files out from under a start.
+    state.mark_playback();
 
     match state
         .client
@@ -1043,7 +1513,7 @@ async fn stream_torrent(
     Query(query): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if query.token != state.token.as_ref() {
+    if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
 
@@ -1061,6 +1531,156 @@ async fn stream_torrent(
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleMatchInfo {
+    video_hash: String,
+    video_size: u64,
+    filename: String,
+}
+
+/// Release-matching data for external subtitles. OpenSubtitles hashes
+/// identify the EXACT release, so a matched track is synced by construction
+/// instead of being timed against whatever copy its author used — the root
+/// cause of badly-synced subs when matching by IMDb ID alone.
+async fn torrent_subtitle_match(
+    State(state): State<BridgeState>,
+    Path((id, file_index)): Path<(String, usize)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let key = format!("{id}:{file_index}");
+    if let Some(hit) = state.subtitle_matches.lock().await.get(&key) {
+        return Json(hit.clone()).into_response();
+    }
+
+    // File metadata from rqbit. Some responses keep details under "details",
+    // others at the top level; accept both, like add_torrent does.
+    let details = match state
+        .client
+        .get(format!(
+            "http://127.0.0.1:{}/torrents/{id}",
+            state.rqbit_port
+        ))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    };
+    if !details.status().is_success() {
+        return bridge_error(
+            StatusCode::NOT_FOUND,
+            format!("torrent {id} is not known to this Core"),
+        );
+    }
+    let parsed = match details.json::<serde_json::Value>().await {
+        Ok(value) => value,
+        Err(error) => return bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    };
+    let files = parsed
+        .pointer("/files")
+        .or_else(|| parsed.pointer("/details/files"))
+        .and_then(serde_json::Value::as_array);
+    let Some(files) = files else {
+        return bridge_error(StatusCode::BAD_GATEWAY, "torrent has no file list".into());
+    };
+    let Some(file) = files.get(file_index) else {
+        return bridge_error(StatusCode::NOT_FOUND, "file index out of range".into());
+    };
+    let Some(filename) = file.get("name").and_then(serde_json::Value::as_str) else {
+        return bridge_error(StatusCode::BAD_GATEWAY, "torrent file has no name".into());
+    };
+    let Some(size) = file.get("length").and_then(serde_json::Value::as_u64) else {
+        return bridge_error(StatusCode::BAD_GATEWAY, "torrent file has no length".into());
+    };
+
+    let stream_url = format!(
+        "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
+        state.rqbit_port
+    );
+    let hash = match release_hash(&state.client, &stream_url, size).await {
+        Ok(hash) => hash,
+        Err(error) => return bridge_error(StatusCode::BAD_GATEWAY, error),
+    };
+
+    let info = SubtitleMatchInfo {
+        video_hash: format!("{hash:016x}"),
+        video_size: size,
+        filename: filename.to_owned(),
+    };
+    {
+        let mut cached = state.subtitle_matches.lock().await;
+        if cached.len() >= 16 {
+            cached.clear();
+        }
+        cached.insert(key, info.clone());
+    }
+    Json(info).into_response()
+}
+
+const RELEASE_HASH_CHUNK: u64 = 65_536;
+
+/// OpenSubtitles movie hash: the file size plus wrapped u64 sums over both
+/// edge 64 KiB chunks. Reads go through rqbit's ranged stream endpoint, so
+/// the tail is pulled from peers on demand — this works even while the
+/// torrent is still downloading, and piece verification guarantees the bytes
+/// are the real release's.
+async fn release_hash(
+    client: &reqwest::Client,
+    stream_url: &str,
+    size: u64,
+) -> Result<u64, String> {
+    if size < RELEASE_HASH_CHUNK * 2 {
+        return Err("file too small for release hashing".into());
+    }
+    let head = read_stream_range(client, stream_url, 0, RELEASE_HASH_CHUNK - 1).await?;
+    let tail = read_stream_range(
+        client,
+        stream_url,
+        size - RELEASE_HASH_CHUNK,
+        size - 1,
+    )
+    .await?;
+    combine_release_hash(size, &head, &tail)
+}
+
+/// OpenSubtitles hash arithmetic over the two edge chunks: seed with the
+/// file size, then wrapped-add every little-endian u64 word.
+fn combine_release_hash(size: u64, head: &[u8], tail: &[u8]) -> Result<u64, String> {
+    if head.len() as u64 != RELEASE_HASH_CHUNK || tail.len() as u64 != RELEASE_HASH_CHUNK {
+        return Err("short read while hashing".into());
+    }
+    let mut hash = size;
+    for chunk in [head, tail] {
+        for word in chunk.chunks_exact(8) {
+            hash = hash.wrapping_add(u64::from_le_bytes(word.try_into().expect("8 bytes")));
+        }
+    }
+    Ok(hash)
+}
+
+async fn read_stream_range(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end_inclusive: u64,
+) -> Result<Bytes, String> {
+    let response = client
+        .get(url)
+        .header(RANGE, format!("bytes={start}-{end_inclusive}"))
+        .timeout(Duration::from_secs(45))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("stream range read failed ({})", response.status()));
+    }
+    response.bytes().await.map_err(|error| error.to_string())
+}
+
 /// Serves the remux pipeline for one torrent file. `media.m3u8` starts (or
 /// reuses) the ffmpeg job and returns the playlist with the session token
 /// appended to every segment URI; any other name serves a segment from disk.
@@ -1069,7 +1689,7 @@ async fn hls_file(
     Path((id, file_index, file)): Path<(String, usize, String)>,
     Query(query): Query<HlsQuery>,
 ) -> Response {
-    if query.token != state.token.as_ref() {
+    if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
     if !state.transcode.available() {
@@ -1127,6 +1747,7 @@ async fn hls_file(
             return bridge_error(StatusCode::GATEWAY_TIMEOUT, error);
         }
         let duration = state.transcode.job_duration(&key).await;
+        let actual_start = state.transcode.job_actual_start(&key).await;
         let nonce = state.transcode.job_nonce(&key).await.unwrap_or_default();
 
         return match tokio::fs::read_to_string(job_dir.join("media.m3u8")).await {
@@ -1136,7 +1757,9 @@ async fn hls_file(
                         (CONTENT_TYPE, "application/vnd.apple.mpegurl"),
                         (HeaderName::from_static("cache-control"), "no-store"),
                     ],
-                    rewrite_playlist(&content, &state.token, &nonce),
+                    // Echo back the token the caller authorized with — never
+                    // the session token, which a paired device must not see.
+                    rewrite_playlist(&content, &query.token, &nonce),
                 )
                     .into_response();
                 if let Some(duration) = duration {
@@ -1146,11 +1769,21 @@ async fn hls_file(
                             .insert(HeaderName::from_static("x-cubo-duration"), value);
                     }
                 }
+                if let Some(actual_start) = actual_start {
+                    if let Ok(value) = HeaderValue::from_str(&format!("{actual_start:.3}")) {
+                        response
+                            .headers_mut()
+                            .insert(HeaderName::from_static("x-cubo-start"), value);
+                    }
+                }
                 response
             }
             Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         };
     }
+
+    // Segment fetches stop when the player is paused; playlist polls do not.
+    state.mark_playback();
 
     // Segment names come from ffmpeg; refuse anything that could escape the
     // job directory.
@@ -1214,7 +1847,117 @@ fn is_authorized(state: &BridgeState, headers: &HeaderMap) -> bool {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == state.token.as_ref())
+        .is_some_and(|token| is_valid_token(state, token))
+}
+
+/// The per-run session token (local callers) or any paired device token.
+fn is_valid_token(state: &BridgeState, token: &str) -> bool {
+    token == state.token.as_ref() || state.pairing.is_device_token(token)
+}
+
+fn expand_user_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(trimmed));
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        return home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(trimmed));
+    }
+    PathBuf::from(trimmed)
+}
+
+fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn is_too_shallow(path: &std::path::Path) -> bool {
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::RootDir) => components.next().is_none(),
+        Some(std::path::Component::Prefix(_)) => matches!(
+            (components.next(), components.next()),
+            (None, None) | (Some(std::path::Component::RootDir), None)
+        ),
+        _ => false,
+    }
+}
+
+fn is_system_path(path: &std::path::Path) -> bool {
+    let lowered = path.to_string_lossy().to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "/system",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/etc",
+        "/private/var",
+        "/windows",
+        "/program files",
+        "/program files (x86)",
+        "c:\\windows",
+        "c:\\program files",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        lowered == *prefix
+            || lowered.starts_with(&format!("{prefix}/"))
+            || lowered.starts_with(&format!("{prefix}\\"))
+    })
+}
+
+fn prepare_cache_directory(
+    raw: &str,
+    store_path: &std::path::Path,
+    old_dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let path = expand_user_path(raw);
+    if !path.is_absolute() {
+        return Err("Use an absolute path on the machine running Cubo Core.".into());
+    }
+    if is_too_shallow(&path) {
+        return Err("That location is too close to the system root.".into());
+    }
+    if is_system_path(&path) {
+        return Err("That folder is a system location and cannot be used as the cache.".into());
+    }
+    if !path.is_dir() {
+        return Err("Pick an existing folder on this Core.".into());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("Could not open that folder: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("That path is not a folder.".into());
+    }
+
+    let store = store_path
+        .canonicalize()
+        .unwrap_or_else(|_| store_path.to_path_buf());
+    if store.starts_with(&canonical) {
+        return Err(
+            "That folder holds Cubo library data and cannot be wiped as cache.".into(),
+        );
+    }
+
+    let old = old_dir
+        .canonicalize()
+        .unwrap_or_else(|_| old_dir.to_path_buf());
+    if canonical != old && canonical.starts_with(&old) {
+        return Err(
+            "Pick a folder outside the current cache. A subfolder would be deleted when the old cache is cleared.".into(),
+        );
+    }
+    Ok(canonical)
 }
 
 fn unauthorized() -> Response {
@@ -1286,13 +2029,36 @@ mod tests {
         assert!(!origins.iter().any(|origin| origin == "*"));
     }
 
+    #[test]
+    fn release_hash_follows_the_opensubtitles_spec() {
+        // 128 KiB file of 0xFF bytes: size + 2 chunks * 8192 words * u64::MAX.
+        let chunk = vec![0xFF_u8; RELEASE_HASH_CHUNK as usize];
+        let size = (RELEASE_HASH_CHUNK * 2) as u64;
+        let hash = combine_release_hash(size, &chunk, &chunk).expect("hash");
+        assert_eq!(hash, size.wrapping_add(16_384u64.wrapping_mul(u64::MAX)));
+
+        // Distinct head/tail content must both contribute.
+        let mut other = chunk.clone();
+        other[0] = 0x01;
+        let mixed = combine_release_hash(size, &chunk, &other).expect("hash");
+        assert_ne!(mixed, hash);
+
+        // Short reads are rejected rather than hashed incorrectly.
+        assert!(combine_release_hash(size, &chunk[..8], &chunk).is_err());
+
+        // Hex form is the fixed-width lowercase OpenSubtitles expects.
+        let hex = format!("{hash:016x}");
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
     #[tokio::test]
     async fn bridge_is_discoverable_and_requires_its_session_token() {
         let web_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind test web app");
         let web_port = web_listener.local_addr().expect("test web address").port();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             axum::serve(
                 web_listener,
                 Router::new().route(
@@ -1316,17 +2082,27 @@ mod tests {
             .await
             .expect("load test store");
         let transcode_dir = test_dir.join("transcode");
+        let pairing =
+            Arc::new(PairingManager::load(&test_dir).expect("load test pairing manager"));
+        let pairing_dir = test_dir.clone();
         let state = BridgeState {
             rqbit_port: 1,
             token: "test-session-token".into(),
             client: reqwest::Client::new(),
             web_origin: Some(format!("http://127.0.0.1:{web_port}").into()),
-            download_dir: Arc::new(test_dir),
+            allowed_hosts: Arc::new(vec!["kenobi.test".into()]),
+            download_dir: Arc::new(RwLock::new(test_dir)),
+            playback_last_ms: Arc::new(AtomicU64::new(0)),
+            cache_swap: Arc::new(Mutex::new(())),
             store,
             transcode: Arc::new(TranscodeManager::new(transcode_dir)),
+            subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
+            pairing,
         };
-        tauri::async_runtime::spawn(async move {
-            axum::serve(bridge_listener, bridge_router(state))
+        tokio::spawn(async move {
+            let service =
+                bridge_router(state).into_make_service_with_connect_info::<SocketAddr>();
+            axum::serve(bridge_listener, service)
                 .await
                 .expect("serve test Cubo bridge");
         });
@@ -1348,7 +2124,7 @@ mod tests {
 
         let preflight = client
             .request(Method::OPTIONS, format!("{base_url}/v1/torrents"))
-            .header(ORIGIN, "http://localhost:3000")
+            .header(ORIGIN, "http://localhost:4200")
             .header("access-control-request-method", "POST")
             .header(
                 "access-control-request-headers",
@@ -1361,7 +2137,7 @@ mod tests {
         assert_eq!(preflight.status(), StatusCode::OK);
         assert_eq!(
             preflight.headers().get("access-control-allow-origin"),
-            Some(&HeaderValue::from_static("http://localhost:3000"))
+            Some(&HeaderValue::from_static("http://localhost:4200"))
         );
         assert_eq!(
             preflight
@@ -1372,7 +2148,7 @@ mod tests {
 
         let health = client
             .get(format!("{base_url}/v1/health"))
-            .header(ORIGIN, "http://localhost:3000")
+            .header(ORIGIN, "http://localhost:4200")
             .send()
             .await
             .expect("health response");
@@ -1387,15 +2163,77 @@ mod tests {
             desktop_dev.headers().get("access-control-allow-origin"),
             Some(&HeaderValue::from_static("http://localhost:1420"))
         );
+        // Loopback origins on unrelated ports (some other local app) are NOT
+        // trusted — "it runs on my machine" is not an identity.
+        let stranger_local = client
+            .get(format!("{base_url}/v1/health"))
+            .header(ORIGIN, "http://localhost:5500")
+            .send()
+            .await
+            .expect("unrelated local origin response");
+        assert!(stranger_local
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
         let health: serde_json::Value = health.json().await.expect("health JSON");
         assert_eq!(health["name"], "cubo-core");
+        // The test client connects over loopback, so it is trusted with the
+        // session token either way; pairingRequired only ever turns true for
+        // remote callers, and only while the pairing flow is enabled.
+        assert_eq!(health["pairingRequired"], false);
         assert!(health["sessionToken"]
             .as_str()
             .is_some_and(|token| !token.is_empty()));
 
+        if crate::pairing::PAIRING_ENABLED {
+            // Pairing: a wrong code is rejected, a current authenticator code
+            // mints a device token that authorizes API calls.
+            let bad_pair = client
+                .post(format!("{base_url}/v1/pair"))
+                .json(&json!({ "code": "000000" }))
+                .send()
+                .await
+                .expect("pair response");
+            assert!(
+                bad_pair.status() == StatusCode::UNAUTHORIZED
+                    || bad_pair.status() == StatusCode::TOO_MANY_REQUESTS
+            );
+
+            let (code, _) =
+                crate::pairing::current_code_for_dir(&pairing_dir).expect("pairing code");
+            let paired = client
+                .post(format!("{base_url}/v1/pair"))
+                .json(&json!({ "code": code, "deviceName": "test laptop" }))
+                .send()
+                .await
+                .expect("pair response");
+            assert_eq!(paired.status(), StatusCode::OK);
+            let paired: serde_json::Value = paired.json().await.expect("pair JSON");
+            let device_token = paired["token"].as_str().expect("device token");
+            let library = client
+                .get(format!("{base_url}/v1/library"))
+                .header(AUTHORIZATION, format!("Bearer {device_token}"))
+                .send()
+                .await
+                .expect("library via device token");
+            assert_eq!(library.status(), StatusCode::OK);
+        } else {
+            // While disabled, the pair endpoint must not exist as far as
+            // callers can tell — even a valid code is turned away.
+            let (code, _) =
+                crate::pairing::current_code_for_dir(&pairing_dir).expect("pairing code");
+            let refused = client
+                .post(format!("{base_url}/v1/pair"))
+                .json(&json!({ "code": code }))
+                .send()
+                .await
+                .expect("pair response");
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        }
+
         let unauthorized = client
             .post(format!("{base_url}/v1/torrents"))
-            .header(ORIGIN, "http://localhost:3000")
+            .header(ORIGIN, "http://localhost:4200")
             .body("magnet:?xt=urn:btih:test")
             .send()
             .await
@@ -1412,5 +2250,35 @@ mod tests {
             .headers()
             .get("access-control-allow-origin")
             .is_none());
+    }
+
+    #[test]
+    fn cache_paths_expand_home_and_reject_roots() {
+        if let Some(home) = super::home_dir() {
+            assert_eq!(super::expand_user_path("~/cubo-cache"), home.join("cubo-cache"));
+        }
+        assert!(super::is_too_shallow(std::path::Path::new("/")));
+        assert!(super::is_system_path(std::path::Path::new("/usr/bin")));
+        assert!(!super::is_system_path(std::path::Path::new(
+            "/Users/someone/Movies/cubo"
+        )));
+    }
+
+    #[test]
+    fn cache_directory_refuses_a_subfolder_of_the_current_cache() {
+        let root = std::env::temp_dir().join(format!("cubo-cache-test-{}", Uuid::new_v4()));
+        let current = root.join("current");
+        let nested = current.join("nested");
+        let store = root.join("cubo-state.json");
+        std::fs::create_dir_all(&nested).expect("create nested cache");
+        std::fs::write(&store, "{}").expect("write store");
+        let error = super::prepare_cache_directory(
+            nested.to_str().expect("utf8 path"),
+            &store,
+            &current,
+        )
+        .expect_err("nested cache must be refused");
+        assert!(error.contains("subfolder"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

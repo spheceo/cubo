@@ -61,19 +61,24 @@ machine's Tailscale IP) in Core settings.
 
 ## Setup
 
-1. Run `pnpm install`.
+1. Install [bun](https://bun.sh), then run `bun install`.
 2. Add `TMDB_API_KEY` to `apps/web/.env.local`.
-3. Run `pnpm dev` to start the Vite dev server and Tauri together.
+3. Run `bun dev` to start the Vite dev server and Tauri together.
 
 The Vite dev server also serves the `api/` functions locally, so the Vercel
 CLI is not needed for development.
 
 Useful commands:
 
-- `pnpm dev:web` starts only the website at `http://localhost:3000`.
-- `pnpm dev:desktop` starts Tauri, which also starts the website automatically.
-- `pnpm typecheck` checks the TypeScript packages and Rust core.
-- `pnpm build` builds the web app and desktop bundle.
+- `bun dev` runs everything with labeled output: the app (4200), the marketing
+  site (4300), and the desktop shell (whose embedded engine is Core).
+- `bun dev:web` starts only the app at `http://localhost:4200`.
+- `bun dev:site` starts the marketing site at `http://localhost:4300`.
+- `bun dev:desktop` starts the app + Tauri together, without the marketing site.
+- `bun dev:core` runs a headless engine via the CLI. Do not combine it with
+  `bun dev*` — the desktop app and the headless core fight over port 8765.
+- `bun typecheck` checks the TypeScript packages and Rust core.
+- `bun build` builds the web app and desktop bundle.
 
 ## Deploying to Vercel
 
@@ -94,7 +99,7 @@ both if the deployment ever moves from `https://app.cubo.spheceo.com`):
   deployment Core proxies for the browser gateway on port `8765`, and the web
   origin it trusts for cross-origin playback requests.
 
-Then just run `pnpm build`.
+Then just run `bun build`.
 
 Connecting to a direct loopback, LAN, or Tailscale IP may trigger the browser's
 Local Network Access permission. An HTTPS Tailscale Serve URL avoids mixed

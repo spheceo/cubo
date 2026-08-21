@@ -15,12 +15,75 @@ import { isBrowserPlayableFilename } from '@/lib/media-compatibility';
 import { rankPreviewStreams } from '@/lib/stream-select';
 import { useCore } from './core-provider';
 
-const PREVIEW_SECONDS = 30;
+const PREVIEW_SECONDS = 40;
 const PREPARE_DELAY_MS = 100;
 
-function randomPreviewEpisode(item: MediaDetails): { season: number; episode: number } | null {
+/** Preview randomness is stable for the day: the first visit picks a spot
+ *  (and an episode, for shows), every later visit that day reuses it, and
+ *  the choice is dropped at midnight so tomorrow feels fresh again. */
+interface DailyPreviewChoice {
+  day: string;
+  season?: number;
+  episode?: number;
+  /** Position of the chosen start within the eligible span, 0..1. */
+  fraction: number;
+}
+
+function todayStamp(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+const PREVIEW_CHOICE_KEY = 'cubo.preview.v1';
+
+function loadDailyChoice(key: string): DailyPreviewChoice | null {
+  try {
+    const all = JSON.parse(window.localStorage.getItem(PREVIEW_CHOICE_KEY) ?? '{}') as Record<
+      string,
+      DailyPreviewChoice
+    >;
+    const entry = all[key];
+    if (!entry || entry.day !== todayStamp()) return null;
+    if (typeof entry.fraction !== 'number' || Number.isNaN(entry.fraction)) return null;
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+function saveDailyChoice(key: string, choice: DailyPreviewChoice): void {
+  try {
+    const all = JSON.parse(window.localStorage.getItem(PREVIEW_CHOICE_KEY) ?? '{}') as Record<
+      string,
+      DailyPreviewChoice
+    >;
+    // Drop stale days so the map cannot grow forever.
+    const today = todayStamp();
+    for (const existing of Object.keys(all)) {
+      if (all[existing].day !== today) delete all[existing];
+    }
+    all[key] = choice;
+    window.localStorage.setItem(PREVIEW_CHOICE_KEY, JSON.stringify(all));
+  } catch {
+    // Persistence is best-effort; randomize again next time instead.
+  }
+}
+
+function choosePreviewEpisode(
+  item: MediaDetails,
+  key: string,
+): { season: number; episode: number } | null {
   const eligibleSeasons = item.seasons.filter((season) => season.episodeCount > 1);
   if (eligibleSeasons.length === 0) return null;
+
+  // Reuse today's episode when one was already picked; otherwise roll for a
+  // new one and remember it until midnight.
+  const saved = loadDailyChoice(key);
+  if (saved?.season != null && saved.episode != null) {
+    const known = eligibleSeasons.find((season) => season.seasonNumber === saved.season);
+    if (known && saved.episode >= 1 && saved.episode <= known.episodeCount) {
+      return { season: saved.season, episode: saved.episode };
+    }
+  }
 
   const season = eligibleSeasons[Math.floor(Math.random() * eligibleSeasons.length)];
   const firstHalfEnd = Math.min(
@@ -49,6 +112,8 @@ export function AutoPreview({
   const { connect } = useCore();
   const videoRef = useRef<HTMLVideoElement>(null);
   const startedRef = useRef(false);
+  /** Episode picked for today's preview, persisted alongside the position. */
+  const previewEpisodeRef = useRef<{ season?: number; episode?: number } | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewActive, setPreviewActive] = useState(false);
   const activeChangeRef = useRef(onActiveChange);
@@ -64,14 +129,18 @@ export function AutoPreview({
     setPreviewActive(false);
     setMuted(true);
     startedRef.current = false;
+    previewEpisodeRef.current = null;
 
     if (!item.imdbId || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     let cancelled = false;
+    const abort = new AbortController();
 
     async function preparePreview() {
       try {
-        const target = item.mediaType === 'tv' ? randomPreviewEpisode(item) : null;
+        const choiceKey = `${item.mediaType}:${item.id}`;
+        const target = item.mediaType === 'tv' ? choosePreviewEpisode(item, choiceKey) : null;
         if (item.mediaType === 'tv' && !target) return;
+        previewEpisodeRef.current = target ?? null;
 
         const connection = await connect();
         const streams = await queryClient.fetchQuery(
@@ -99,7 +168,10 @@ export function AutoPreview({
 
         const torrentId = added.id ?? added.infoHash;
         if (torrentId === null || torrentId === '') return;
-        await waitUntilLive(connection, torrentId, { timeoutMs: 90_000 });
+        await waitUntilLive(connection, torrentId, {
+          timeoutMs: 90_000,
+          signal: abort.signal,
+        });
         if (!cancelled) setPreviewUrl(streamUrl(connection, torrentId, fileIndex));
       } catch {
         // Artwork remains the complete fallback when Core or a preview source is unavailable.
@@ -109,6 +181,9 @@ export function AutoPreview({
     const idle = window.setTimeout(() => void preparePreview(), PREPARE_DELAY_MS);
     return () => {
       cancelled = true;
+      // Stop the readiness polling immediately — hovering across several
+      // titles would otherwise stack concurrent 500 ms poll loops.
+      abort.abort();
       window.clearTimeout(idle);
       videoRef.current?.pause();
     };
@@ -165,7 +240,19 @@ export function AutoPreview({
     );
     const earliestStart = Math.min(20, latestStart);
     const span = Math.max(0, latestStart - earliestStart);
-    video.currentTime = earliestStart + Math.random() * span;
+
+    // One random spot per title per day — same clip on every visit today.
+    const choiceKey = `${item.mediaType}:${item.id}`;
+    let fraction = loadDailyChoice(choiceKey)?.fraction;
+    if (fraction == null || !Number.isFinite(fraction)) {
+      fraction = Math.random();
+      saveDailyChoice(choiceKey, {
+        day: todayStamp(),
+        ...(previewEpisodeRef.current ?? {}),
+        fraction,
+      });
+    }
+    video.currentTime = earliestStart + fraction * span;
   }
 
   function startPreview() {

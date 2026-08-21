@@ -11,20 +11,20 @@ export function SiteFooter() {
       <Link href="/library" className="cursor-pointer transition-colors hover:text-white/60">
         Library
       </Link>
+      <Link href="/legal" className="cursor-pointer transition-colors hover:text-white/60">
+        Legal
+      </Link>
       <button
         type="button"
         onClick={openSettings}
         className="flex cursor-pointer items-center gap-2 border-0 bg-transparent p-0 text-sm text-white/35 transition-colors hover:text-white/60"
       >
-        Core settings
+        Core
         <span
           aria-hidden="true"
           className={`size-1.5 rounded-full ${connection ? 'bg-accent' : 'bg-faint'}`}
         />
       </button>
-      <Link href="/legal" className="cursor-pointer transition-colors hover:text-white/60">
-        Legal
-      </Link>
     </footer>
   );
 }

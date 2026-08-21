@@ -35,6 +35,14 @@ const MULTI_AUDIO_RE = /\b(?:multi|dual[ ._-]?audio|dubbed)\b/i;
  *  rank with the dubs — last. Soft-sub markers like MULTiSUBS stay fine. */
 const HARDSUB_RE = /\b(?:hc|hard[ ._-]?subs?|\w*subbed|korsubs?|vostfr|napisy)\b/i;
 
+/** In-theatre captures and pre-release screeners (CAM/CAMRip, TELESYNC/TS,
+ *  TELECINE/TC, HDTS/HDTO, SCREENER/DVDSCR …). Torrentio labels these
+ *  "1080p" based on the file's pixel dimensions, so quality alone cannot
+ *  tell them apart from real releases; a camcorder pointed at a screen must
+ *  never win an auto-pick over a genuine web/bluray rip. */
+const CAPTURED_RELEASE_RE =
+  /\b(?:cam(?:rip)?|telesync|telecine|ts|hdts|hdto|tc|screener|scr|dvdscr|bdscr|workprint)\b/i;
+
 /** Torrentio marks stream languages with country-flag emoji — a far stronger
  *  dub signal than release-name tokens, since English-original releases
  *  almost never say "English" while dubs often carry only a flag. */
@@ -69,6 +77,14 @@ function flaggedLanguages(hint: string): Set<string> {
 
 function rank(stream: Stream): number {
   return QUALITY_RANK[stream.quality?.toLowerCase() ?? ''] ?? 4;
+}
+
+/** 0 = proper release, 1 = cinema capture / screener. Checked across name,
+ *  title and filename: Torrentio carries the release type in `name`
+ *  ("Torrentio\nCAM") while `quality` still reads "1080p". */
+function capturedReleaseRank(stream: Stream): number {
+  const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
+  return CAPTURED_RELEASE_RE.test(hint) ? 1 : 0;
 }
 
 /** Buckets seeders so "plenty" sources compete on bitrate instead of raw swarm size. */
@@ -112,7 +128,8 @@ export interface PlaybackCapabilities {
 }
 
 /** Playable streams, best first: original-language audio (a dubbed release
- *  should never win the auto-pick), then preferred quality, then direct-play
+ *  should never win the auto-pick), then real releases over cinema captures,
+ *  then preferred quality, then direct-play
  *  files (fully seekable, no converter), then a healthy swarm, then the
  *  larger file (higher bitrate). When the connected Core can transcode, MKV
  *  and exotic-audio sources join the pool as the fallback within each tier. */
@@ -127,6 +144,8 @@ export function rankStreams(
       const byLanguage =
         audioLanguageRank(a, nativeLanguage) - audioLanguageRank(b, nativeLanguage);
       if (byLanguage !== 0) return byLanguage;
+      const byCapture = capturedReleaseRank(a) - capturedReleaseRank(b);
+      if (byCapture !== 0) return byCapture;
       const byQuality = rank(a) - rank(b);
       if (byQuality !== 0) return byQuality;
       const byDirect =
@@ -157,6 +176,8 @@ export function rankPreviewStreams(
     const byLanguage =
       audioLanguageRank(a, nativeLanguage) - audioLanguageRank(b, nativeLanguage);
     if (byLanguage !== 0) return byLanguage;
+    const byCapture = capturedReleaseRank(a) - capturedReleaseRank(b);
+    if (byCapture !== 0) return byCapture;
     const byBucket = seederBucket(b.seeders) - seederBucket(a.seeders);
     if (byBucket !== 0) return byBucket;
     const bySeeders = (b.seeders ?? 0) - (a.seeders ?? 0);

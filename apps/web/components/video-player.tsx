@@ -17,22 +17,32 @@ import {
   IoPlayBack,
   IoPlayForward,
   IoSettingsSharp,
-  IoTabletLandscape,
   IoVolumeHigh,
   IoVolumeLow,
   IoVolumeMute,
 } from 'react-icons/io5';
+import {
+  MdClosedCaption,
+  MdClosedCaptionOff,
+  MdPictureInPictureAlt,
+} from 'react-icons/md';
 import { IoIosArrowBack } from 'react-icons/io';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from '@/components/link';
 import { isDesktopRuntime } from '@/lib/local-engine';
+import type { CaptionColor, CaptionSize } from '@/lib/caption-prefs';
+import { CAPTION_COLORS } from '@/lib/caption-prefs';
+import {
+  loadFramingPref,
+  saveFramingPref,
+  type FramingMode,
+} from '@/lib/framing-prefs';
+import { findActiveCue, loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { formatTime } from '@/lib/format';
 
 const HIDE_DELAY_MS = 2600;
 const SKIP_SECONDS = 10;
-const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 
 type BufferedRange = {
   start: number;
@@ -53,11 +63,19 @@ export function VideoPlayer({
   timeOffset = 0,
   title,
   subtitle,
+  logoPath = null,
   backHref,
+  onBack,
   onPickSubtitle,
+  onEnableCaptions,
+  captionSize = 'medium',
+  onPickCaptionSize,
+  captionColor = 'white',
+  onPickCaptionColor,
   subtitles,
   activeSubtitleId,
   initialTime = 0,
+  startTimeLocal = null,
   onPlaybackProgress,
   onSeekOutside,
   onError,
@@ -72,11 +90,26 @@ export function VideoPlayer({
   timeOffset?: number;
   title: string;
   subtitle: string | null;
+  /** TMDB logotype for the playing title, shown by the buffering loader. */
+  logoPath?: string | null;
   backHref: string;
+  /** History-back navigation; falls back to `backHref` when absent. */
+  onBack?: () => void;
   onPickSubtitle: (id: string | null) => void;
+  /** Enables captions using the viewer's saved language preference.
+   *  Falls back to the first track when not provided. */
+  onEnableCaptions?: () => void;
+  captionSize?: CaptionSize;
+  onPickCaptionSize: (size: CaptionSize) => void;
   subtitles: PlayerSubtitle[];
   activeSubtitleId: string | null;
   initialTime?: number;
+  /** Playlist-local position to jump to once the source can seek — used after
+   *  a seek restart to make up the gap between the keyframe ffmpeg landed on
+   *  and the exact spot the viewer asked for. Applied once per source. */
+  startTimeLocal?: number | null;
+  captionColor?: CaptionColor;
+  onPickCaptionColor: (color: CaptionColor) => void;
   onPlaybackProgress: (
     positionSeconds: number,
     durationSeconds: number,
@@ -100,6 +133,24 @@ export function VideoPlayer({
   const lastProgressReport = useRef(0);
   const lastProgressWallTime = useRef(0);
   const sessionReported = useRef(false);
+  /** One-shot local seek (seek-restart catch-up), applied per source. */
+  const localSeekApplied = useRef<string | null>(null);
+
+  // Framing preference is player-global (like a TV picture-size setting):
+  // it follows the viewer across titles, so the player owns it directly.
+  const [framing, setFraming] = useState<FramingMode>(() => loadFramingPref());
+  const pickFraming = useCallback((mode: FramingMode) => {
+    setFraming(mode);
+    saveFramingPref(mode);
+  }, []);
+
+  const goBack = useCallback(() => {
+    if (onBack) {
+      onBack();
+      return;
+    }
+    window.location.assign(backHref);
+  }, [onBack, backHref]);
 
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(true);
@@ -109,14 +160,13 @@ export function VideoPlayer({
   const [bufferedRanges, setBufferedRanges] = useState<BufferedRange[]>([]);
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
-  const [speed, setSpeed] = useState(1);
-  const [speedOpen, setSpeedOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
   const [pipSupported, setPipSupported] = useState(false);
+  const [activeCueText, setActiveCueText] = useState<string | null>(null);
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
 
@@ -128,6 +178,242 @@ export function VideoPlayer({
   onSeekOutsideRef.current = onSeekOutside;
   const timeOffsetRef = useRef(timeOffset);
   timeOffsetRef.current = timeOffset;
+
+  // Subtitles are rendered by Cubo, not the browser's native track layer:
+  // cues are timed against the original file, so they are looked up against
+  // ABSOLUTE movie time (timeOffset + currentTime) — the same invariant as
+  // every other displayed position. This keeps them aligned on remuxed
+  // sources and re-aligns automatically after seek restarts.
+  const subtitleCuesRef = useRef<SubtitleCue[]>([]);
+  /** Set by the cue-display effect; lets the cue-loading effect repaint the
+   *  visible caption once even while the frame loop sleeps (video paused). */
+  const refreshCueRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    subtitleCuesRef.current = [];
+    setActiveCueText(null);
+    if (!activeSubtitleId) return;
+    const track = subtitles.find((entry) => entry.id === activeSubtitleId);
+    if (!track) return;
+    let cancelled = false;
+    void loadSubtitleCues(track.src).then((cues) => {
+      if (cancelled) return;
+      subtitleCuesRef.current = cues;
+      // Repaint immediately: the frame loop sleeps while the video is
+      // paused, so captions toggled on during a pause would otherwise stay
+      // blank until play/seek.
+      refreshCueRef.current();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSubtitleId, subtitles]);
+
+  useEffect(() => {
+    if (!activeSubtitleId) return;
+    let frame: number | null = null;
+    const update = () => {
+      const video = videoRef.current;
+      const cues = subtitleCuesRef.current;
+      if (!video || cues.length === 0) return;
+      const cue = findActiveCue(cues, timeOffsetRef.current + video.currentTime);
+      const text = cue?.text ?? null;
+      setActiveCueText((previous) => (previous === text ? previous : text));
+    };
+    const tick = () => {
+      update();
+      // The frame loop only runs while the picture moves; waking 60+ times a
+      // second through a two-hour film that is PAUSED burns battery for
+      // nothing. Play/seek events (and a cue-file load) restart or repaint.
+      if (videoRef.current?.paused) {
+        frame = null;
+        return;
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    const resume = () => {
+      update();
+      if (frame === null) frame = requestAnimationFrame(tick);
+    };
+    // Lets the cue-loading effect force one repaint while paused.
+    refreshCueRef.current = update;
+    const video = videoRef.current;
+    video?.addEventListener('play', resume);
+    // A paused seek must still refresh the visible cue once.
+    video?.addEventListener('seeked', resume);
+    frame = requestAnimationFrame(tick);
+    return () => {
+      refreshCueRef.current = () => undefined;
+      video?.removeEventListener('play', resume);
+      video?.removeEventListener('seeked', resume);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [activeSubtitleId]);
+
+  // Framing scales the video layer inside the overflow-hidden player box —
+  // the same instant trick zoom extensions use, but native. Fit is the
+  // untouched layout; fill modes crop the empty axis; Auto canvas-samples
+  // the frame and crops only genuine black bars, never picture content.
+  //
+  // Auto deliberately over-cautious: dark scenes make naive bar detectors
+  // flap constantly. So bars must be a real thickness, targets within 4% of
+  // the current zoom are ignored entirely, and a new target only applies
+  // after it repeats on consecutive samples (~3s of agreement). Geometry
+  // changes (resize, fullscreen) skip the voting — they are not guesses.
+  const appliedScaleRef = useRef(1);
+  useEffect(() => {
+    const video = videoRef.current;
+    const container = containerRef.current;
+    if (!video || !container) return;
+
+    /** Displayed size under contain-fit, plus both full-fill scales. */
+    const metrics = () => {
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
+      if (!vw || !vh || !cw || !ch) return null;
+      const videoAspect = vw / vh;
+      const boxAspect = cw / ch;
+      // Contain-fit: width-bound when the video is relatively wider.
+      const shownWidth = videoAspect >= boxAspect ? cw : ch * videoAspect;
+      const shownHeight = videoAspect >= boxAspect ? cw / videoAspect : ch;
+      // Pixels-per-source-height for contain layout (also = scale 1).
+      const base = Math.min(cw / videoAspect, ch);
+      return { base, fillWidth: cw / shownWidth, fillHeight: ch / shownHeight };
+    };
+
+    const apply = (scale: number, animate = false) => {
+      const safe = Number.isFinite(scale) ? Math.min(Math.max(scale, 1), 4) : 1;
+      appliedScaleRef.current = safe;
+      video.style.transformOrigin = 'center';
+      video.style.transition = animate ? 'transform 450ms ease' : '';
+      video.style.transform = safe === 1 ? '' : `scale(${safe})`;
+    };
+
+    /** Fractions of edge rows/columns that are uniform near-black bars, or
+     *  null when sampling is impossible (cross-origin taint, no data yet).
+     *  Runs thinner than 2% of the frame are discarded as noise. */
+    const sampleBars = () => {
+      try {
+        if (!video.videoWidth) return null;
+        const w = 96;
+        const h = Math.max(2, Math.round(w / (video.videoWidth / video.videoHeight)));
+        const minRun = Math.max(2, Math.round(Math.min(w, h) * 0.02));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) return null;
+        context.drawImage(video, 0, 0, w, h);
+        const { data } = context.getImageData(0, 0, w, h);
+        const bright = (index: number) =>
+          0.2126 * data[index] + 0.7152 * data[index + 1] + 0.0722 * data[index + 2] > 26;
+        const rowHasContent = (y: number) => {
+          for (let x = 0; x < w; x += 1) if (bright((y * w + x) * 4)) return true;
+          return false;
+        };
+        const colHasContent = (x: number) => {
+          for (let y = 0; y < h; y += 1) if (bright((y * w + x) * 4)) return true;
+          return false;
+        };
+        let top = 0;
+        while (top < h / 2 && !rowHasContent(top)) top += 1;
+        let bottom = 0;
+        while (bottom < h / 2 && !rowHasContent(h - 1 - bottom)) bottom += 1;
+        let left = 0;
+        while (left < w / 2 && !colHasContent(left)) left += 1;
+        let right = 0;
+        while (right < w / 2 && !colHasContent(w - 1 - right)) right += 1;
+        return {
+          vBars: top >= minRun || bottom >= minRun ? (top + bottom) / h : 0,
+          hBars: left >= minRun || right >= minRun ? (left + right) / w : 0,
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    const update = (immediate = false) => {
+      if (framing === 'fit') {
+        apply(1);
+        return;
+      }
+      const m = metrics();
+      if (!m) return;
+      if (framing === 'fill-width') {
+        apply(m.fillWidth);
+        return;
+      }
+      if (framing === 'fill-height') {
+        apply(m.fillHeight);
+        return;
+      }
+      // Auto: contain-fit the detected content region instead of the whole
+      // frame. With no detectable bars this lands exactly on scale 1.
+      let scale = 1;
+      const bars = sampleBars();
+      if (bars && (bars.vBars > 0.01 || bars.hBars > 0.01)) {
+        const contentWidthUnits = (video.videoWidth / video.videoHeight) * (1 - bars.hBars);
+        const contentHeightUnits = 1 - bars.vBars;
+        const cw = container.clientWidth;
+        const ch = container.clientHeight;
+        if (cw && ch && contentWidthUnits > 0 && contentHeightUnits > 0) {
+          const contentBase =
+            Math.min(cw / contentWidthUnits, ch / contentHeightUnits);
+          scale = contentBase / m.base;
+        }
+      }
+      if (Number.isNaN(scale)) return;
+
+      const applied = appliedScaleRef.current;
+      if (Math.abs(scale - applied) < 0.04 * applied) {
+        autoVotes.votes = 0;
+        return;
+      }
+      if (Math.abs(scale - autoVotes.scale) < 0.01) autoVotes.votes += 1;
+      else {
+        autoVotes.scale = scale;
+        autoVotes.votes = 1;
+      }
+      if (immediate || autoVotes.votes >= 2) apply(autoVotes.scale, true);
+    };
+
+    const autoVotes = { scale: 1, votes: 0 };
+
+    update(true);
+    // Geometry changes are facts, not measurements: recompute immediately.
+    const onGeometryChange = () => update(true);
+    const observer = new ResizeObserver(onGeometryChange);
+    observer.observe(container);
+    video.addEventListener('loadedmetadata', onGeometryChange);
+    video.addEventListener('resize', onGeometryChange);
+
+    // Letterboxing changes scene by scene; re-check periodically in Auto.
+    let sampler: number | null = null;
+    if (framing === 'auto') {
+      sampler = window.setInterval(() => update(false), 1500);
+    }
+
+    return () => {
+      observer.disconnect();
+      video.removeEventListener('loadedmetadata', onGeometryChange);
+      video.removeEventListener('resize', onGeometryChange);
+      if (sampler !== null) window.clearInterval(sampler);
+      apply(1);
+    };
+  }, [framing]);
+
+  const captionsOn = activeSubtitleId !== null;
+  const toggleCaptions = useCallback(() => {
+    if (captionsOn) {
+      onPickSubtitle(null);
+    } else if (onEnableCaptions) {
+      onEnableCaptions();
+    } else {
+      onPickSubtitle(subtitles[0]?.id ?? null);
+    }
+  }, [captionsOn, onEnableCaptions, onPickSubtitle, subtitles]);
+
 
   const resolveDuration = useCallback(
     (video: HTMLVideoElement) => {
@@ -189,15 +475,6 @@ export function VideoPlayer({
   }, [src, hls]);
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    for (let index = 0; index < video.textTracks.length; index += 1) {
-      const track = video.textTracks[index];
-      track.mode = subtitles[index]?.id === activeSubtitleId ? 'showing' : 'disabled';
-    }
-  }, [activeSubtitleId, subtitles]);
-
-  useEffect(() => {
     if (!settingsOpen) return;
     const closeOnOutside = (event: PointerEvent) => {
       if (!settingsRef.current?.contains(event.target as Node)) setSettingsOpen(false);
@@ -216,7 +493,7 @@ export function VideoPlayer({
     };
   }, [settingsOpen]);
 
-  const keepControls = speedOpen || settingsOpen || !playing || blocked;
+  const keepControls = settingsOpen || !playing || blocked;
 
   const revealControls = useCallback(() => {
     setControlsVisible(true);
@@ -238,6 +515,7 @@ export function VideoPlayer({
     },
     [],
   );
+
 
   const reportPlayback = useCallback(
     (sessionStarted = false) => {
@@ -389,6 +667,10 @@ export function VideoPlayer({
         case 'm':
           toggleMute();
           break;
+        case 'c':
+          event.preventDefault();
+          toggleCaptions();
+          break;
         case 'f':
           toggleFullscreen();
           break;
@@ -399,7 +681,24 @@ export function VideoPlayer({
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [togglePlay, seekBy, toggleMute, toggleFullscreen, revealControls]);
+  }, [togglePlay, seekBy, toggleMute, toggleFullscreen, toggleCaptions, revealControls]);
+
+  // One-shot catch-up after a seek restart: the new playlist begins at the
+  // keyframe ffmpeg landed on (earlier than requested), so close the gap by
+  // seeking locally as soon as the source can seek. Reset per source.
+  useEffect(() => {
+    localSeekApplied.current = null;
+  }, [src]);
+
+  useEffect(() => {
+    if (startTimeLocal == null || startTimeLocal < 0.25) return;
+    if (localSeekApplied.current === src) return;
+    const video = videoRef.current;
+    if (!video || video.seekable.length === 0) return;
+    localSeekApplied.current = src;
+    const seekableEnd = Math.max(0, video.seekable.end(video.seekable.length - 1) - 0.5);
+    video.currentTime = Math.min(startTimeLocal, seekableEnd);
+  }, [startTimeLocal, src, currentTime]);
 
   function syncBuffered(video: HTMLVideoElement) {
     const ranges = video.buffered;
@@ -407,7 +706,20 @@ export function VideoPlayer({
     for (let index = 0; index < ranges.length; index += 1) {
       nextRanges.push({ start: ranges.start(index), end: ranges.end(index) });
     }
-    setBufferedRanges(nextRanges);
+    // Buffered ranges rarely change; returning the previous reference lets
+    // React bail out instead of re-rendering the whole player.
+    setBufferedRanges((previous) => {
+      if (
+        previous.length === nextRanges.length &&
+        previous.every(
+          (range, index) =>
+            range.start === nextRanges[index].start && range.end === nextRanges[index].end,
+        )
+      ) {
+        return previous;
+      }
+      return nextRanges;
+    });
   }
 
   function ratioFromPointer(clientX: number): number {
@@ -438,6 +750,8 @@ export function VideoPlayer({
   const shownTime = scrubTime ?? timeOffset + currentTime;
   const playedRatio = duration ? Math.min(1, shownTime / duration) : 0;
   const volumeLevel = muted || volume === 0 ? 'muted' : volume < 0.5 ? 'low' : 'high';
+  const captionHex =
+    CAPTION_COLORS.find((entry) => entry.value === captionColor)?.hex ?? '#ffffff';
 
   return (
     <div
@@ -476,7 +790,6 @@ export function VideoPlayer({
         onTimeUpdate={(event) => {
           const video = event.currentTarget;
           setCurrentTime(video.currentTime);
-          syncBuffered(video);
           if (performance.now() - lastProgressReport.current >= 10_000) {
             reportPlayback(false);
           }
@@ -494,29 +807,16 @@ export function VideoPlayer({
             initialSeekApplied.current = true;
             video.currentTime = initialTime;
           }
-        }}
-        onVolumeChange={(event) => {
+        }}        onVolumeChange={(event) => {
           setVolume(event.currentTarget.volume);
           setMuted(event.currentTarget.muted);
         }}
-        onRateChange={(event) => setSpeed(event.currentTarget.playbackRate)}
         onError={onError}
-      >
-        {subtitles.map((track) => (
-          <track
-            key={track.id}
-            kind="subtitles"
-            src={track.src}
-            srcLang={track.language}
-            label={track.label}
-            default={track.id === activeSubtitleId}
-          />
-        ))}
-      </video>
+      />
 
       {waiting && !blocked ? (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
-          <LogoLoader title={title} progress={null} size="sm" />
+          <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
         </div>
       ) : null}
 
@@ -535,24 +835,23 @@ export function VideoPlayer({
 
       {/* Top chrome */}
       <div
-        className={`pointer-events-none absolute inset-x-0 top-0 flex items-start bg-linear-to-b from-black/80 via-black/30 to-transparent px-4 pb-12 pt-4 transition-opacity duration-300 sm:px-6 ${
+        className={`pointer-events-none absolute inset-x-0 top-0 flex items-start justify-start bg-linear-to-b from-black/80 via-black/30 to-transparent px-4 pb-12 pt-4 transition-opacity duration-300 sm:px-6 ${
           controlsVisible ? 'opacity-100' : 'opacity-0'
         }`}
       >
-        <Link
-          href={backHref}
-          className="desktop-back-offset pointer-events-auto flex min-w-0 items-center gap-4 text-white transition-colors hover:text-white/80"
+        <button
+          type="button"
+          onClick={goBack}
+          className="desktop-back-offset pointer-events-auto flex min-w-0 max-w-full cursor-pointer items-center gap-3 text-left text-white transition-colors hover:text-white/80"
         >
-          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-black/55 backdrop-blur-md">
-            <IoIosArrowBack size={22} />
-          </span>
-          <span className="min-w-0">
+          <IoIosArrowBack size={26} className="shrink-0 drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]" />
+          <span className="min-w-0 text-left">
             <span className="block truncate font-semibold">{title}</span>
             {subtitle ? (
               <span className="block truncate text-sm text-white/45">{subtitle}</span>
             ) : null}
           </span>
-        </Link>
+        </button>
 
       </div>
 
@@ -675,45 +974,18 @@ export function VideoPlayer({
           </p>
 
           <div className="ml-auto flex items-center gap-1.5 sm:gap-2.5">
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => {
-                  setSpeedOpen((open) => !open);
-                  setSettingsOpen(false);
-                }}
-                aria-label="Playback speed"
-                className="cursor-pointer rounded-full px-2.5 py-1.5 text-[0.75rem] font-medium tabular-nums text-white/80 transition-colors hover:bg-white/10 hover:text-white"
-              >
-                {speed}×
-              </button>
-              {speedOpen ? (
-                <div className="absolute bottom-10 right-0 w-24 overflow-hidden rounded-xl border border-white/10 bg-black/90 py-1 backdrop-blur-sm">
-                  {SPEEDS.map((option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() => {
-                        if (videoRef.current) videoRef.current.playbackRate = option;
-                        setSpeedOpen(false);
-                      }}
-                      className={`block w-full cursor-pointer px-3 py-1.5 text-left text-[0.75rem] tabular-nums transition-colors hover:bg-white/10 ${
-                        option === speed ? 'text-white' : 'text-white/75'
-                      }`}
-                    >
-                      {option}×
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
+            <ControlButton
+              label={captionsOn ? 'Turn off captions' : 'Turn on captions'}
+              onClick={toggleCaptions}
+            >
+              {captionsOn ? <MdClosedCaption size={21} /> : <MdClosedCaptionOff size={21} />}
+            </ControlButton>
 
             <div ref={settingsRef} className="relative">
               <ControlButton
                 label="Playback settings"
                 onClick={() => {
                   setSettingsOpen((open) => !open);
-                  setSpeedOpen(false);
                 }}
               >
                 <IoSettingsSharp size={20} />
@@ -723,6 +995,12 @@ export function VideoPlayer({
                   subtitles={subtitles}
                   activeSubtitleId={activeSubtitleId}
                   onPickSubtitle={onPickSubtitle}
+                  captionSize={captionSize}
+                  onPickCaptionSize={onPickCaptionSize}
+                  captionColor={captionColor}
+                  onPickCaptionColor={onPickCaptionColor}
+                  framing={framing}
+                  onPickFraming={pickFraming}
                 />
               ) : null}
             </div>
@@ -737,7 +1015,7 @@ export function VideoPlayer({
                   else void video.requestPictureInPicture().catch(() => undefined);
                 }}
               >
-                <IoTabletLandscape size={21} />
+                <MdPictureInPictureAlt size={22} />
               </ControlButton>
             ) : null}
 
@@ -750,6 +1028,31 @@ export function VideoPlayer({
           </div>
         </div>
       </div>
+
+      {/* Subtitle overlay — Cubo-rendered instead of native tracks so cues
+          stay aligned with absolute movie time and can be styled freely.
+          Sits low by default and eases up above the controls while shown. */}
+      {activeCueText ? (
+        <div
+          aria-live="off"
+          className={`pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-[8%] transition-transform duration-300 ease-out ${
+            controlsVisible ? '-translate-y-[7.5rem]' : '-translate-y-[6.5rem]'
+          }`}
+        >
+          <span
+            className={`whitespace-pre-line text-center font-medium leading-snug [text-shadow:0_1px_2px_rgba(0,0,0,0.9),0_0_12px_rgba(0,0,0,0.6)] ${
+              captionSize === 'small'
+                ? '[font-size:clamp(0.95rem,0.95rem+1vh,1.5rem)]'
+                : captionSize === 'large'
+                  ? '[font-size:clamp(1.5rem,1.5rem+1.7vh,2.6rem)]'
+                  : '[font-size:clamp(1.2rem,1.2rem+1.35vh,2.1rem)]'
+            }`}
+            style={{ color: captionHex }}
+          >
+            {activeCueText}
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }
