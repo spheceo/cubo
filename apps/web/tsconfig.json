@@ -9,6 +9,6 @@
       "@/*": ["./*"]
     }
   },
-  "include": ["vite-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "include": ["vite-env.d.ts", "**/*.ts", "**/*.tsx", "../../legal.ts"],
   "exclude": ["node_modules", "dist"]
 }
