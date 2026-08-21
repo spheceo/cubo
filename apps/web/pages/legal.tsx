@@ -1,59 +1,79 @@
-import { IoArrowBack } from 'react-icons/io5';
-import { useNavigate } from 'react-router';
+import { useEffect, useState } from 'react';
+import {
+  FALLBACK_LEGAL,
+  fetchPublishedLegal,
+  legalDocFrom,
+  splitInlineMarkdown,
+  type LegalDoc,
+} from '../../../legal';
 import { useDocumentTitle } from '@/lib/use-document-title';
+
+function useLegalDoc(): LegalDoc {
+  const [doc, setDoc] = useState(() => legalDocFrom(FALLBACK_LEGAL));
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPublishedLegal().then((live) => {
+      if (!cancelled && live) setDoc(live);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return doc;
+}
+
+function LegalInlineText({ text }: { text: string }) {
+  return (
+    <>
+      {splitInlineMarkdown(text).map((part, index) =>
+        part.type === 'link' ? (
+          <a
+            key={index}
+            href={part.href}
+            rel="noreferrer"
+            className="text-fg underline underline-offset-[3px] hover:text-muted"
+          >
+            {part.label}
+          </a>
+        ) : (
+          <span key={index}>{part.value}</span>
+        ),
+      )}
+    </>
+  );
+}
 
 export function LegalPage() {
   useDocumentTitle('Legal');
-  const navigate = useNavigate();
-  const currentYear = new Date().getFullYear();
+  const doc = useLegalDoc();
 
   return (
-    <main className="min-h-dvh bg-[#0f0f0f] px-6 py-24 text-white">
-      <article className="mx-auto max-w-2xl">
-        <button
-          type="button"
-          onClick={() => navigate(-1)}
-          className="mb-10 flex cursor-pointer items-center gap-2 text-sm text-white/40 transition-colors hover:text-white/70"
-        >
-          <IoArrowBack size={16} />
-          Back
-        </button>
-
-        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-white/35">Legal</p>
-        <h1 className="mt-3 text-4xl font-bold">Legal Information</h1>
-
-        <div className="mt-12 space-y-8 text-[15px] leading-relaxed text-white/60">
-          <p>
-            Cubo is a content discovery interface. It does not upload, store, or host any media
-            files. Catalogue information comes from publicly available metadata APIs, and playback
-            is handled entirely by Cubo Core running on hardware you control.
-          </p>
-
-          <p>
-            Because Cubo hosts nothing, it has no technical ability to remove content from networks
-            or servers it does not operate. Removal requests must be sent to the platforms where the
-            material actually resides — only those platforms can act on their own files.
-          </p>
-
-          <p>
-            Cubo respects intellectual property rights. If you are a rights holder seeking to report
-            content, we will assist by pointing you to the source where the material was indexed, and
-            we will cooperate with legitimate legal requests to the extent that is technically
-            possible.
-          </p>
-
-          <p>
-            Cubo maintains no ownership or control over any media content. Users are solely
-            responsible for how they configure Cubo Core and for how they interact with the
-            third-party services reached through it, including compliance with the laws that apply
-            where they live.
-          </p>
-        </div>
-
-        <p className="mt-20 text-sm text-white/25">
-          &copy; {currentYear} Cubo. All rights reserved.
+    <main className="min-h-dvh bg-background px-6 pt-28 pb-8 text-fg sm:px-10">
+      <div className="max-w-3xl">
+        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-faint">Legal</p>
+        <h1 className="mt-3 text-[clamp(2.4rem,5.5vw,3.6rem)] font-bold leading-[1.03] tracking-[-0.035em]">
+          {doc.title}
+        </h1>
+        <p className="mt-6 max-w-xl text-[1.05rem] leading-relaxed text-pretty text-muted">
+          <LegalInlineText text={doc.lede} />
         </p>
-      </article>
+
+        <section className="mt-12 border-t border-line">
+          {doc.sections.map((section) => (
+            <article key={section.title} className="border-b border-line py-7">
+              <h2 className="text-[1.02rem] font-semibold tracking-[-0.012em]">{section.title}</h2>
+              {section.paragraphs.map((paragraph) => (
+                <p
+                  key={paragraph}
+                  className="mt-2.5 max-w-[62ch] text-[0.95rem] leading-relaxed text-pretty text-muted"
+                >
+                  <LegalInlineText text={paragraph} />
+                </p>
+              ))}
+            </article>
+          ))}
+        </section>
+      </div>
     </main>
   );
 }
