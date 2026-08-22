@@ -174,7 +174,11 @@ fn root_folders() -> Vec<FolderInfo> {
         }
     }
 
-    folders.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+    folders.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
     folders
 }
 
@@ -208,7 +212,11 @@ fn list_child_folders(path: &Path) -> Result<FolderListing, String> {
             folders.push(info);
         }
     }
-    folders.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+    folders.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
     Ok(FolderListing {
         path: canonical.to_string_lossy().into_owned(),
         folders,
@@ -360,7 +368,10 @@ fn gpu_stats() -> GpuStats {
     #[cfg(not(target_os = "macos"))]
     {
         let output = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=name,utilization.gpu", "--format=csv,noheader,nounits"])
+            .args([
+                "--query-gpu=name,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ])
             .output();
         match output {
             Ok(output) if output.status.success() => {
@@ -381,7 +392,10 @@ fn gpu_stats() -> GpuStats {
                             .unwrap_or(0.0),
                     );
                 }
-                GpuStats { adapters, usage_percent: usage }
+                GpuStats {
+                    adapters,
+                    usage_percent: usage,
+                }
             }
             _ => GpuStats::default(),
         }
@@ -410,7 +424,11 @@ mod tests {
         fs::write(occupied.join("secret.bin"), b"nope").unwrap();
 
         let listing = list_folders(Some(root.to_str().unwrap())).unwrap();
-        let names: Vec<_> = listing.folders.iter().map(|folder| folder.name.as_str()).collect();
+        let names: Vec<_> = listing
+            .folders
+            .iter()
+            .map(|folder| folder.name.as_str())
+            .collect();
         assert_eq!(names, ["empty", "occupied"]);
         let empty_info = listing
             .folders

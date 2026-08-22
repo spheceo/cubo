@@ -51,7 +51,16 @@ reintroduces it.
    deletion driven only through its API silently removes nothing.
 8. **Auto stream fallback.** A mid-play source failure advances down the
    ranked list and resumes at the last reported position; the manual source
-   picker stays hidden.
+   picker stays hidden. A remux seek restart is not a source failure:
+   killing ffmpeg makes the current playlist 404, and treating that as
+   `source_failed` used to open the next torrent at the pre-seek time.
+9. **Remux playlist polls must not restart ffmpeg.** hls.js keeps GETting
+   the playlist URL it was given, which includes that job's `start=`. A
+   later seek starts a new job at a new offset; leftover polls of the old
+   URL used to call `ensure_job` with the old start, kill the seek remux,
+   and return `X-Cubo-Start: 0` — playhead at the beginning, picture hours
+   later. Each kickoff carries a monotonic `gen=`; an older generation
+   serves the current job and never evicts it (`transcode.rs`).
 
 ## Security model (added 2026-08-21) — do not weaken
 

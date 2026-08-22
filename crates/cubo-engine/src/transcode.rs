@@ -96,7 +96,12 @@ fn pick_audio_stream(streams: &[FfprobeStream]) -> Option<&FfprobeStream> {
     let is_audio = |stream: &&FfprobeStream| stream.codec_type.as_deref() == Some("audio");
     let is_english = |stream: &&FfprobeStream| {
         matches!(
-            stream.tags.language.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            stream
+                .tags
+                .language
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
             Some("eng" | "en" | "english")
         )
     };
@@ -128,6 +133,10 @@ struct ActiveJob {
     /// into this one — that mismatch played audio from one scene over video
     /// from another.
     nonce: String,
+    /// Client-issued seek id. hls.js keeps polling the playlist URL it was
+    /// given — including the previous `start=` — and a lower generation is a
+    /// leftover poll that must not kill a newer remux.
+    generation: u64,
     probe: MediaProbe,
     child: Child,
 }
@@ -232,34 +241,30 @@ impl TranscodeManager {
     /// returning its directory. A different start offset restarts ffmpeg with
     /// an input seek (`-ss`), which is how seeking into unconverted regions
     /// works: the new playlist's time zero equals `start_seconds`.
+    ///
+    /// `generation` is the client's seek id (`0` = old client, no id). A
+    /// request from an older generation never evicts a newer job — that is
+    /// how leftover hls.js polls of the previous playlist URL are ignored.
     pub async fn ensure_job(
         &self,
         key: &str,
         input_url: &str,
         probe: &MediaProbe,
         start_seconds: f64,
+        generation: u64,
     ) -> Result<PathBuf, String> {
         let ffmpeg = self.ffmpeg.as_ref().ok_or("ffmpeg is not available")?;
         let mut active = self.active.lock().await;
 
-        // An input seek lands on the keyframe AT/BEFORE the target; measure
-        // that spot so the client can map playlist time to absolute movie
-        // time truthfully (subtitle alignment + reported positions).
-        let actual_start = if start_seconds > 0.1 {
-            match self.ffprobe.as_ref() {
-                Some(ffprobe) => {
-                    find_keyframe_before(ffprobe, input_url, start_seconds)
-                        .await
-                        .unwrap_or(start_seconds)
-                }
-                None => start_seconds,
-            }
-        } else {
-            start_seconds
-        };
-
         if let Some(job) = active.as_mut() {
-            if job.key == key && same_start(job.start_seconds, start_seconds) {
+            if job_covers_request(
+                &job.key,
+                job.start_seconds,
+                job.generation,
+                key,
+                start_seconds,
+                nonzero_generation(generation),
+            ) {
                 // A finished ffmpeg with a playlist on disk is still a valid
                 // job; only restart when it died before producing anything.
                 let finished = matches!(job.child.try_wait(), Ok(Some(_)));
@@ -267,7 +272,23 @@ impl TranscodeManager {
                     return Ok(job.dir.clone());
                 }
             }
-            let mut previous = active.take().expect("checked above");
+        }
+
+        // An input seek lands on the keyframe AT/BEFORE the target; measure
+        // that spot so the client can map playlist time to absolute movie
+        // time truthfully (subtitle alignment + reported positions).
+        let actual_start = if start_seconds > 0.1 {
+            match self.ffprobe.as_ref() {
+                Some(ffprobe) => find_keyframe_before(ffprobe, input_url, start_seconds)
+                    .await
+                    .unwrap_or(start_seconds),
+                None => start_seconds,
+            }
+        } else {
+            start_seconds
+        };
+
+        if let Some(mut previous) = active.take() {
             let _ = previous.child.kill().await;
             let _ = tokio::fs::remove_dir_all(&previous.dir).await;
         }
@@ -298,9 +319,7 @@ impl TranscodeManager {
             // With it, both streams start together at the keyframe.
             command.args(["-noaccurate_seek", "-ss", &format!("{start_seconds:.3}")]);
         }
-        command
-            .args(["-i", input_url])
-            .args(["-map", "0:v:0"]);
+        command.args(["-i", input_url]).args(["-map", "0:v:0"]);
         match probe.audio_stream_index {
             Some(index) => command.args(["-map", &format!("0:{index}")]),
             None => command.args(["-map", "0:a:0?"]),
@@ -351,6 +370,7 @@ impl TranscodeManager {
             start_seconds,
             actual_start_seconds: actual_start,
             nonce: uuid::Uuid::new_v4().simple().to_string(),
+            generation,
             probe: probe.clone(),
             child,
         });
@@ -451,14 +471,23 @@ impl TranscodeManager {
         self.prewarming.lock().await.remove(&key);
     }
 
-    /// True when the job for `key` at `start_seconds` is alive or already
-    /// left a playlist on disk — i.e. its playlist can be served without
-    /// probing the source again. Playlist polls hit this path every few
-    /// seconds.
-    pub async fn job_usable(&self, key: &str, start_seconds: f64) -> bool {
+    /// True when the job for `key` can be served without probing or
+    /// restarting ffmpeg. Playlist polls hit this path every few seconds;
+    /// `generation` lets a leftover poll of an older `start=` keep the
+    /// current job instead of killing it.
+    pub async fn job_usable(&self, key: &str, start_seconds: f64, generation: Option<u64>) -> bool {
         let mut active = self.active.lock().await;
-        let Some(job) = active.as_mut() else { return false };
-        if job.key != key || !same_start(job.start_seconds, start_seconds) {
+        let Some(job) = active.as_mut() else {
+            return false;
+        };
+        if !job_covers_request(
+            &job.key,
+            job.start_seconds,
+            job.generation,
+            key,
+            start_seconds,
+            generation,
+        ) {
             return false;
         }
         let finished = matches!(job.child.try_wait(), Ok(Some(_)));
@@ -487,16 +516,44 @@ fn same_start(a: f64, b: f64) -> bool {
     (a - b).abs() < 0.25
 }
 
+fn nonzero_generation(generation: u64) -> Option<u64> {
+    (generation > 0).then_some(generation)
+}
+
+/// Whether `job` can satisfy this playlist request without restarting ffmpeg.
+///
+/// A matching `start` always hits the running job. A *lower* client
+/// generation is a leftover hls.js poll of a previous playlist URL — those
+/// used to call `ensure_job` with the old offset and kill the seek remux,
+/// after which `X-Cubo-Start` reported the beginning while the picture was
+/// hours later. Old clients send no generation and keep the previous
+/// last-writer-wins behaviour.
+fn job_covers_request(
+    job_key: &str,
+    job_start: f64,
+    job_generation: u64,
+    key: &str,
+    start_seconds: f64,
+    generation: Option<u64>,
+) -> bool {
+    if job_key != key {
+        return false;
+    }
+    if same_start(job_start, start_seconds) {
+        return true;
+    }
+    match generation {
+        Some(gen) if gen <= job_generation => true,
+        _ => false,
+    }
+}
+
 /// Finds the timestamp of the last video keyframe at/before `target` — the
 /// spot an input seek (`-ss`) with `-noaccurate_seek` actually lands on.
 /// Packet-level scan of a narrow read interval, so this is fast (no decoding).
 /// Returns None when ffprobe fails or finds nothing; callers fall back to the
 /// requested target (the pre-measurement behaviour).
-async fn find_keyframe_before(
-    ffprobe: &Path,
-    input_url: &str,
-    target: f64,
-) -> Option<f64> {
+async fn find_keyframe_before(ffprobe: &Path, input_url: &str, target: f64) -> Option<f64> {
     let from = (target - 20.0).max(0.0);
     let to = target + 0.25;
     let output = Command::new(ffprobe)
@@ -574,4 +631,38 @@ fn find_tool(name: &str) -> Option<PathBuf> {
         }
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{job_covers_request, same_start};
+
+    #[test]
+    fn matching_start_is_always_the_current_job() {
+        assert!(job_covers_request("2:0", 9.6, 1, "2:0", 9.6, Some(1)));
+        assert!(job_covers_request("2:0", 9.6, 1, "2:0", 9.6, None));
+        assert!(!same_start(2601.177, 2600.0));
+        assert!(same_start(2601.177, 2601.2));
+    }
+
+    #[test]
+    fn stale_generation_does_not_restart_a_newer_seek() {
+        // hls.js still polling start=9.6&gen=1 after a seek to 2601 gen=2.
+        assert!(job_covers_request("4:0", 2601.177, 2, "4:0", 9.6, Some(1),));
+    }
+
+    #[test]
+    fn newer_generation_at_a_different_start_restarts() {
+        assert!(!job_covers_request("4:0", 9.6, 1, "4:0", 2601.177, Some(2),));
+    }
+
+    #[test]
+    fn old_clients_without_generation_still_restart_on_seek() {
+        assert!(!job_covers_request("4:0", 9.6, 0, "4:0", 2601.177, None));
+    }
+
+    #[test]
+    fn a_different_file_never_reuses_the_job() {
+        assert!(!job_covers_request("2:0", 0.0, 1, "4:0", 0.0, Some(1)));
+    }
 }

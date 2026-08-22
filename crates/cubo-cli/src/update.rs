@@ -156,6 +156,7 @@ pub async fn run() {
         Some(release) => {
             println!("Updating Cubo to {}...", release.tag);
             if perform(&release.asset_name).await {
+                crate::persist::restart_if_installed();
                 println!("Done. Restart Cubo when you like.");
             }
         }
