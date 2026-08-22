@@ -115,6 +115,10 @@ struct HlsQuery {
     /// Seconds into the source the remux should begin at. Seeking into an
     /// unconverted region restarts ffmpeg here instead of waiting for it.
     start: Option<f64>,
+    /// Monotonic seek id from the player. Leftover hls.js polls of a
+    /// previous playlist URL carry an older value and must not restart
+    /// ffmpeg at that stale offset.
+    gen: Option<u64>,
 }
 
 /// Progress ticks every 10s while playing; this window covers a missed tick
@@ -215,8 +219,8 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 tokio::spawn(async move {
                     // Connect info lets /v1/health tell loopback callers
                     // (handed the session token) from remote ones (must pair).
-                    let service = listener_router
-                        .into_make_service_with_connect_info::<SocketAddr>();
+                    let service =
+                        listener_router.into_make_service_with_connect_info::<SocketAddr>();
                     if let Err(error) = axum::serve(listener, service).await {
                         tracing::error!(target: "engine", error = %error, "Cubo bridge exited");
                     }
@@ -387,7 +391,9 @@ fn local_machine_hosts(tailscale_address: Option<IpAddr>) -> Vec<String> {
     for executable in ["hostname", "/bin/hostname"] {
         if let Ok(output) = Command::new(executable).output() {
             if output.status.success() {
-                let name = String::from_utf8_lossy(&output.stdout).trim().to_ascii_lowercase();
+                let name = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_ascii_lowercase();
                 if !name.is_empty() {
                     hosts.push(name.clone());
                     // macOS reports "<name>.local"; peers reach the machine by
@@ -621,7 +627,10 @@ struct PairBody {
 /// running Core) for a long-lived device token.
 async fn pair_device(State(state): State<BridgeState>, Json(body): Json<PairBody>) -> Response {
     if !crate::pairing::PAIRING_ENABLED {
-        return bridge_error(StatusCode::NOT_FOUND, "Pairing is not enabled on this Core.".into());
+        return bridge_error(
+            StatusCode::NOT_FOUND,
+            "Pairing is not enabled on this Core.".into(),
+        );
     }
     let pairing = state.pairing.clone();
     let attempt =
@@ -647,8 +656,7 @@ async fn system_stats(State(state): State<BridgeState>, headers: HeaderMap) -> R
     }
     // Sampling CPU takes ~250ms; keep it off the async runtime.
     let download_dir = state.current_download_dir().await;
-    let snapshot =
-        tokio::task::spawn_blocking(move || system::snapshot(&download_dir)).await;
+    let snapshot = tokio::task::spawn_blocking(move || system::snapshot(&download_dir)).await;
     match snapshot {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
@@ -1637,13 +1645,7 @@ async fn release_hash(
         return Err("file too small for release hashing".into());
     }
     let head = read_stream_range(client, stream_url, 0, RELEASE_HASH_CHUNK - 1).await?;
-    let tail = read_stream_range(
-        client,
-        stream_url,
-        size - RELEASE_HASH_CHUNK,
-        size - 1,
-    )
-    .await?;
+    let tail = read_stream_range(client, stream_url, size - RELEASE_HASH_CHUNK, size - 1).await?;
     combine_release_hash(size, &head, &tail)
 }
 
@@ -1705,7 +1707,9 @@ async fn hls_file(
         // hls.js polls this URL every few seconds while the playlist grows.
         // A running job's playlist is served straight from disk — probing the
         // source again here blocked every poll behind a fresh ffprobe.
-        if !state.transcode.job_usable(&key, start).await {
+        // `gen` distinguishes a real seek restart from a leftover poll of
+        // the previous `start=` URL (which must not kill the new remux).
+        if !state.transcode.job_usable(&key, start, query.gen).await {
             let input_url = format!(
                 "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
                 state.rqbit_port
@@ -1733,7 +1737,7 @@ async fn hls_file(
             }
             if let Err(error) = state
                 .transcode
-                .ensure_job(&key, &input_url, &probe, start)
+                .ensure_job(&key, &input_url, &probe, start, query.gen.unwrap_or(0))
                 .await
             {
                 return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
@@ -1828,10 +1832,7 @@ fn rewrite_playlist(content: &str, token: &str, nonce: &str) -> String {
         .lines()
         .map(|line| {
             if line.starts_with("#EXT-X-MAP") {
-                line.replace(
-                    "URI=\"init.mp4\"",
-                    &format!("URI=\"init.mp4?{params}\""),
-                )
+                line.replace("URI=\"init.mp4\"", &format!("URI=\"init.mp4?{params}\""))
             } else if !line.starts_with('#') && !line.trim().is_empty() {
                 format!("{line}?{params}")
             } else {
@@ -1944,9 +1945,7 @@ fn prepare_cache_directory(
         .canonicalize()
         .unwrap_or_else(|_| store_path.to_path_buf());
     if store.starts_with(&canonical) {
-        return Err(
-            "That folder holds Cubo library data and cannot be wiped as cache.".into(),
-        );
+        return Err("That folder holds Cubo library data and cannot be wiped as cache.".into());
     }
 
     let old = old_dir
@@ -2049,7 +2048,9 @@ mod tests {
         // Hex form is the fixed-width lowercase OpenSubtitles expects.
         let hex = format!("{hash:016x}");
         assert_eq!(hex.len(), 16);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[tokio::test]
@@ -2082,8 +2083,7 @@ mod tests {
             .await
             .expect("load test store");
         let transcode_dir = test_dir.join("transcode");
-        let pairing =
-            Arc::new(PairingManager::load(&test_dir).expect("load test pairing manager"));
+        let pairing = Arc::new(PairingManager::load(&test_dir).expect("load test pairing manager"));
         let pairing_dir = test_dir.clone();
         let state = BridgeState {
             rqbit_port: 1,
@@ -2100,8 +2100,7 @@ mod tests {
             pairing,
         };
         tokio::spawn(async move {
-            let service =
-                bridge_router(state).into_make_service_with_connect_info::<SocketAddr>();
+            let service = bridge_router(state).into_make_service_with_connect_info::<SocketAddr>();
             axum::serve(bridge_listener, service)
                 .await
                 .expect("serve test Cubo bridge");
@@ -2255,7 +2254,10 @@ mod tests {
     #[test]
     fn cache_paths_expand_home_and_reject_roots() {
         if let Some(home) = super::home_dir() {
-            assert_eq!(super::expand_user_path("~/cubo-cache"), home.join("cubo-cache"));
+            assert_eq!(
+                super::expand_user_path("~/cubo-cache"),
+                home.join("cubo-cache")
+            );
         }
         assert!(super::is_too_shallow(std::path::Path::new("/")));
         assert!(super::is_system_path(std::path::Path::new("/usr/bin")));
@@ -2272,12 +2274,9 @@ mod tests {
         let store = root.join("cubo-state.json");
         std::fs::create_dir_all(&nested).expect("create nested cache");
         std::fs::write(&store, "{}").expect("write store");
-        let error = super::prepare_cache_directory(
-            nested.to_str().expect("utf8 path"),
-            &store,
-            &current,
-        )
-        .expect_err("nested cache must be refused");
+        let error =
+            super::prepare_cache_directory(nested.to_str().expect("utf8 path"), &store, &current)
+                .expect_err("nested cache must be refused");
         assert!(error.contains("subfolder"));
         let _ = std::fs::remove_dir_all(&root);
     }

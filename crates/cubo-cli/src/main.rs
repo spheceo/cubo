@@ -1,9 +1,10 @@
-//! Cubo CLI — `cubo serve`, `cubo search`, `cubo update`.
+//! Cubo CLI — `cubo persist`, `cubo serve`, `cubo search`, `cubo update`.
 //!
 //! Runs the exact same Core engine as the desktop app, headless. The web app
 //! at the canonical deployment auto-detects it on localhost:8765.
 
 mod paths;
+mod persist;
 mod search;
 mod update;
 
@@ -20,7 +21,7 @@ use std::path::PathBuf;
     name = "cubo",
     version,
     about,
-    after_help = "Run `cubo serve` to start streaming from this machine."
+    after_help = "Run `cubo persist` to keep Cubo running in the background.\nOr `cubo serve` to run it in this terminal."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,6 +49,10 @@ enum Command {
     Pair,
     /// Update the Cubo CLI to the latest release.
     Update,
+    /// Keep Cubo running in the background (starts on login, restarts if it exits).
+    Persist,
+    /// Stop the background service started by `cubo persist`.
+    Unpersist,
 }
 
 #[tokio::main]
@@ -66,6 +71,11 @@ async fn main() {
         }
         Command::Pair => pair(),
         Command::Update => update::run().await,
+        Command::Persist => {
+            maybe_prompt_update(cli.no_update_check).await;
+            persist::install();
+        }
+        Command::Unpersist => persist::uninstall(),
     }
 }
 
@@ -166,6 +176,7 @@ async fn serve(no_open: bool) {
     println!();
     println!("  Keep this terminal window open while you stream.");
     println!("  Stop Cubo here any time with Ctrl+C.");
+    println!("  To keep it running after you close the terminal: cubo persist");
     println!();
 
     if !no_open {

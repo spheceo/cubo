@@ -913,7 +913,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "cubo"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "cubo-engine",
  "serde_json",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "cubo-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "cubo-engine",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "cubo-engine"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "axum",

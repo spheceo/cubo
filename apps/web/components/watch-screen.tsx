@@ -185,6 +185,15 @@ export function WatchScreen({
     fileIndex: number;
   } | null>(null);
   const seekAttemptRef = useRef(0);
+  /** Incremented on every remux kickoff so leftover hls.js polls of the
+   *  previous playlist URL cannot restart ffmpeg at the old offset. */
+  const remuxGenRef = useRef(0);
+  /** True from the moment a remux seek is requested until the old player
+   *  has unmounted — killing ffmpeg looks like a fatal HLS error. */
+  const seekingRef = useRef(false);
+  /** Absolute target of an in-flight remux seek; blocks stale progress
+   *  flushes from overwriting `lastPositionRef` with the pre-seek time. */
+  const seekTargetRef = useRef<number | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
 
   // The fill eases toward whatever ceiling the current stage set, so it keeps
@@ -332,7 +341,13 @@ export function WatchScreen({
           // `resume`) — that measured offset is what keeps absolute times
           // truthful; the local jump closes any gap up to the exact spot.
           setStage(STAGE.buffering);
-          const remux = await startRemux(connection, id, fileIndex, resume);
+          const remux = await startRemux(
+            connection,
+            id,
+            fileIndex,
+            resume,
+            ++remuxGenRef.current,
+          );
           url = remux.url;
           durationHint = remux.durationSeconds;
           usesHls = true;
@@ -483,6 +498,9 @@ export function WatchScreen({
       watchedDeltaSeconds: number,
       sessionStarted: boolean,
     ) => {
+      // A remux seek's old player still reports time (and flushes on
+      // src swap); that must not overwrite the seek target.
+      if (seekingRef.current || seekTargetRef.current != null) return;
       lastPositionRef.current = positionSeconds;
       const connection = playbackConnection.current;
       if (!connection) return;
@@ -536,6 +554,9 @@ export function WatchScreen({
     const context = remuxContext.current;
     if (!context) return;
     const attempt = (seekAttemptRef.current += 1);
+    lastPositionRef.current = targetSeconds;
+    seekTargetRef.current = targetSeconds;
+    seekingRef.current = true;
     setSeekConverting(true);
     try {
       const remux = await startRemux(
@@ -543,9 +564,9 @@ export function WatchScreen({
         context.id,
         context.fileIndex,
         targetSeconds,
+        ++remuxGenRef.current,
       );
       if (seekAttemptRef.current !== attempt) return;
-      lastPositionRef.current = targetSeconds;
       // The restarted converter begins at its own landing keyframe — adopt
       // it as the new absolute origin, then close the gap locally.
       setVideoTimeOffset(remux.startSeconds);
@@ -562,12 +583,29 @@ export function WatchScreen({
           local_jump: gap >= 0.25 ? gap : 0,
         },
       );
-    } catch {
+    } catch (reason) {
       // The converter could not restart there; playback continues in place.
+      shipClientLog(
+        context.connection,
+        'warn',
+        'remux_seek_failed',
+        {
+          requested: targetSeconds,
+          error: reason instanceof Error ? reason.message : undefined,
+        },
+      );
     } finally {
       if (seekAttemptRef.current === attempt) setSeekConverting(false);
     }
   }, []);
+
+  // Drop the seek guards only after React has unmounted the old player —
+  // its HLS fatal error and progress flush run in that commit's cleanups.
+  useEffect(() => {
+    if (seekConverting) return;
+    seekingRef.current = false;
+    seekTargetRef.current = null;
+  }, [seekConverting]);
 
   // Refresh Continue Watching once the viewer leaves the player. The small
   // delay lets the player's final progress flush land first. Leaving also
@@ -649,6 +687,10 @@ export function WatchScreen({
           onPlaybackProgress={savePlaybackProgress}
           onSeekOutside={(target) => void requestRemuxSeek(target)}
           onError={() => {
+            // Restarting ffmpeg for a seek kills the current playlist;
+            // that looks identical to a dead source and must not fall
+            // through to the next torrent at the old resume position.
+            if (seekingRef.current || seekTargetRef.current != null) return;
             // A source died mid-play: quietly move down the ranked list and
             // resume where the viewer was instead of dead-ending on an error.
             const failedIndex = sources.findIndex(

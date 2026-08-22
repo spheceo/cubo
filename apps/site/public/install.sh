@@ -64,10 +64,11 @@ esac
 
 echo
 echo "Cubo installed. To start streaming:"
-echo "  1. Run:            cubo serve"
-echo "  2. A browser tab opens app.cubo.spheceo.com automatically."
-echo "     (Or open it yourself any time.)"
-echo "  3. Search titles:  cubo search \"avengers\""
-echo "  4. Update later:   cubo update"
+echo "  1. Keep it running: cubo persist"
+echo "     (Starts on login, restarts if it exits — like a background service.)"
+echo "  2. Or this terminal: cubo serve"
+echo "     A browser tab opens app.cubo.spheceo.com automatically."
+echo "  3. Search titles:   cubo search \"avengers\""
+echo "  4. Update later:    cubo update"
 echo
 echo "Logs are saved to ~/.local/share/cubo/logs/cubo.log"

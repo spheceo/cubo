@@ -480,11 +480,13 @@ export function hlsPlaylistUrl(
   idOrHash: number | string,
   fileIndex: number,
   startSeconds = 0,
+  generation?: number,
 ): string {
   const id = encodeURIComponent(String(idOrHash));
   const token = encodeURIComponent(engine.token);
   const start = startSeconds > 0 ? `&start=${startSeconds.toFixed(3)}` : '';
-  return `${engine.baseUrl}/v1/torrents/${id}/hls/${fileIndex}/media.m3u8?token=${token}${start}`;
+  const gen = generation && generation > 0 ? `&gen=${generation}` : '';
+  return `${engine.baseUrl}/v1/torrents/${id}/hls/${fileIndex}/media.m3u8?token=${token}${start}${gen}`;
 }
 
 /** Kicks off (and validates) the Core-side remux for one torrent file,
@@ -502,8 +504,9 @@ export async function startRemux(
   idOrHash: number | string,
   fileIndex: number,
   startSeconds = 0,
+  generation?: number,
 ): Promise<{ url: string; durationSeconds: number | null; startSeconds: number }> {
-  const url = hlsPlaylistUrl(engine, idOrHash, fileIndex, startSeconds);
+  const url = hlsPlaylistUrl(engine, idOrHash, fileIndex, startSeconds, generation);
   const response = await coreFetch(url);
   if (!response.ok) {
     let detail = 'This source could not be converted for the browser.';
@@ -517,12 +520,20 @@ export async function startRemux(
   }
   const duration = Number(response.headers.get('X-Cubo-Duration'));
   const actualStart = Number(response.headers.get('X-Cubo-Start'));
+  const landed =
+    Number.isFinite(actualStart) && actualStart >= 0 ? actualStart : startSeconds;
+  // A leftover poll of an older playlist URL used to restart ffmpeg at the
+  // beginning while this request asked for minutes in. Adopting that header
+  // as the absolute origin puts the playhead at ~0 while the picture is
+  // hours later — refuse it so the caller can retry or keep the last job.
+  if (startSeconds > 60 && landed < 1) {
+    throw new Error('The converter restarted at the beginning instead of the requested time.');
+  }
   return {
     url,
     durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
     // Older Cores don't send the header; assume the seek landed exactly.
-    startSeconds:
-      Number.isFinite(actualStart) && actualStart >= 0 ? actualStart : startSeconds,
+    startSeconds: landed,
   };
 }
 
