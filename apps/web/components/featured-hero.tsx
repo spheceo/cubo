@@ -5,9 +5,10 @@ import { useEffect, useRef, useState } from 'react';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
 import { Link } from '@/components/link';
 import { formatRuntime } from '@/lib/format';
-import { episodeLabel, latestHistoryForTitle, watchLaterItem } from '@/lib/library';
+import { episodeLabel, latestHistoryForTitle, playButtonLabel, watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
 import { useCore } from './core-provider';
+import { EpisodeList } from './episode-list';
 import { WatchLaterButton } from './watch-later-button';
 import { WatchPlayLink } from './watch-play-link';
 
@@ -44,16 +45,17 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
   const { library } = useCore();
   const resume = latestHistoryForTitle(library?.history, item.mediaType, item.id);
   const firstSeason = item.mediaType === 'tv' ? (item.seasons[0]?.seasonNumber ?? 1) : undefined;
+  const resumeSeason = resume?.season ?? firstSeason ?? 1;
   const resumeLabel = episodeLabel(resume?.season, resume?.episode);
   const playHref =
     item.mediaType === 'tv'
-      ? watchHref(item, resume?.season ?? firstSeason ?? 1, resume?.episode ?? 1)
+      ? watchHref(item, resumeSeason, resume?.episode ?? 1)
       : watchHref(item);
-  const playLabel =
-    item.mediaType === 'tv' && resumeLabel ? `Continue ${resumeLabel}` : 'Watch Now';
+  const playLabel = playButtonLabel(item.mediaType, resume, firstSeason ?? 1);
 
   const details = [
     year,
+    resumeLabel,
     item.mediaType === 'tv'
       ? item.numberOfSeasons
         ? `${item.numberOfSeasons} ${item.numberOfSeasons === 1 ? 'Season' : 'Seasons'}`
@@ -145,8 +147,17 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
               <p className="line-clamp-3">{item.overview}</p>
             </div>
 
-            <div className="flex items-center gap-4">
+            <div className="flex flex-wrap items-center gap-4">
               <WatchPlayLink href={playHref} label={playLabel} progress={resume?.progress ?? 0} />
+              {item.mediaType === 'tv' && item.seasons.length > 0 ? (
+                <EpisodeList
+                  key={resumeSeason}
+                  showId={item.id}
+                  seasons={item.seasons}
+                  initialSeason={resumeSeason}
+                  size="md"
+                />
+              ) : null}
               <WatchLaterButton item={watchLaterItem(item)} />
               <Link
                 href={titleHref(item)}

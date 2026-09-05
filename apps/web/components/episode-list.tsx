@@ -13,11 +13,13 @@ export function EpisodeList({
   seasons,
   initialSeason,
   initialEpisodes,
+  size = 'lg',
 }: {
   showId: number;
   seasons: SeasonSummary[];
   initialSeason: number;
-  initialEpisodes: Episode[];
+  initialEpisodes?: Episode[];
+  size?: 'md' | 'lg';
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -25,7 +27,10 @@ export function EpisodeList({
 
   const seasonQuery = useQuery({
     ...tmdbQueries.season(showId, season),
-    initialData: season === initialSeason ? initialEpisodes : undefined,
+    initialData:
+      season === initialSeason && initialEpisodes && initialEpisodes.length > 0
+        ? initialEpisodes
+        : undefined,
     placeholderData: keepPreviousData,
   });
   const episodes = seasonQuery.data ?? [];
@@ -87,9 +92,11 @@ export function EpisodeList({
       <button
         type="button"
         onClick={openDialog}
-        className="flex h-14 items-center justify-center gap-3 rounded-full bg-surface px-7 font-semibold text-white transition-colors hover:bg-control"
+        className={`flex items-center justify-center rounded-full bg-surface font-semibold text-white transition-colors hover:bg-control ${
+          size === 'lg' ? 'h-14 gap-3 px-7' : 'h-12 gap-2 px-5'
+        }`}
       >
-        <IoList size={22} />
+        <IoList size={size === 'lg' ? 22 : 20} />
         Episodes
       </button>
 

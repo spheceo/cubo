@@ -20,6 +20,16 @@ export function episodeLabel(season?: number | null, episode?: number | null): s
   return `S${season} E${episode}`;
 }
 
+export function playButtonLabel(
+  mediaType: MediaType,
+  resume?: Pick<LibraryItem, 'season' | 'episode'> | null,
+  firstSeason = 1,
+): string {
+  if (mediaType !== 'tv') return 'Watch Now';
+  const current = episodeLabel(resume?.season, resume?.episode);
+  return current ? `Continue ${current}` : `Watch ${episodeLabel(firstSeason, 1)}`;
+}
+
 /** Most recently touched history row for a title. Earlier episodes stay stored. */
 export function latestHistoryForTitle(
   history: LibraryItem[] | undefined,

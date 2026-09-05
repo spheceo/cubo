@@ -9,7 +9,7 @@ import { useEffect, useRef, useState } from 'react';
 import { FaStar } from 'react-icons/fa';
 import { formatNextEpisodeLabel } from '@/lib/air-date';
 import { formatRuntime } from '@/lib/format';
-import { episodeLabel, latestHistoryForTitle, watchLaterItem } from '@/lib/library';
+import { latestHistoryForTitle, playButtonLabel, watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
 import { useCore } from './core-provider';
 import { EpisodeList } from './episode-list';
@@ -37,18 +37,12 @@ export function TitleDetail({
   const firstSeason = details.seasons[0]?.seasonNumber ?? 1;
   const resumeSeason = resume?.season ?? firstSeason;
   const resumeEpisode = resume?.episode ?? episodes[0]?.episodeNumber ?? 1;
-  const resumeLabel = episodeLabel(resume?.season, resume?.episode);
   const nextAirs = details.nextEpisode ? formatNextEpisodeLabel(details.nextEpisode) : null;
   const playHref =
     details.mediaType === 'tv'
       ? watchHref(details, resumeSeason, resumeEpisode)
       : watchHref(details);
-  const playLabel =
-    details.mediaType === 'tv'
-      ? resumeLabel
-        ? `Continue ${resumeLabel}`
-        : 'Watch S1 E1'
-      : 'Watch Now';
+  const playLabel = playButtonLabel(details.mediaType, resume, firstSeason);
 
   return (
     <main className="h-dvh overflow-hidden bg-background text-white">
