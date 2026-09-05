@@ -1,15 +1,7 @@
 import { createClient } from '@cubo/core';
 
-/** Canonical deployment. The bundled desktop build has no serverless functions
- *  on its tauri:// origin, so it calls the deployed API directly; everywhere
- *  else (Vercel, Vite dev, Core's browser gateway) the API is same-origin. */
-export const DEPLOYED_SITE_URL = 'https://app.cubo.spheceo.com';
-
-const DESKTOP_ORIGINS = new Set(['tauri://localhost', 'http://tauri.localhost']);
-
-export const API_BASE = DESKTOP_ORIGINS.has(window.location.origin)
-  ? DEPLOYED_SITE_URL
-  : '';
+/** Same-origin API (Vercel, Vite dev, or Core's browser gateway). */
+export const API_BASE = '';
 
 export function apiUrl(path: string): string {
   return `${API_BASE}${path}`;

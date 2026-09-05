@@ -69,7 +69,7 @@ fn install_inner() -> Result<(), String> {
     println!();
     if port_in_use() {
         println!("  Something is already listening on port {ENGINE_PORT}.");
-        println!("  If that is a foreground `cubo serve` or the desktop app,");
+        println!("  If that is a foreground `cubo serve`,");
         println!("  stop it — the background service takes the port after that.");
         println!();
     }

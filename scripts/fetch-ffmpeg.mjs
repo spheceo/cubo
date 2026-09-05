@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Downloads static ffmpeg + ffprobe builds into src-tauri/binaries/ with the
- * target-triple names Tauri's externalBin (sidecar) bundling expects, e.g.
- * ffmpeg-aarch64-apple-darwin. Run before `tauri build`:
+ * Downloads static ffmpeg + ffprobe builds into scripts/binaries/ with
+ * target-triple names, e.g. ffmpeg-aarch64-apple-darwin. CI packs them next
+ * to the `cubo` CLI binary, where transcode.rs::find_tool looks first:
  *
- *   node apps/desktop/scripts/fetch-ffmpeg.mjs [--target <triple>]
+ *   node scripts/fetch-ffmpeg.mjs [--target <triple>]
  *
  * Without --target the host platform's triple is used. Existing binaries are
  * kept, so repeated runs are free.
@@ -131,7 +131,7 @@ async function main() {
   if (!source) throw new Error(`No ffmpeg source configured for target ${triple}`);
 
   const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-  const binariesDir = path.join(scriptDir, '..', 'src-tauri', 'binaries');
+  const binariesDir = path.join(scriptDir, 'binaries');
   await mkdir(binariesDir, { recursive: true });
 
   const extension = triple.includes('windows') ? '.exe' : '';

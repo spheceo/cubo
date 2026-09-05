@@ -7,14 +7,14 @@ import {
 import gsap from 'gsap';
 import { useEffect, useRef, useState } from 'react';
 import { FaStar } from 'react-icons/fa';
-import { IoPlay } from 'react-icons/io5';
-import { Link } from '@/components/link';
 import { formatNextEpisodeLabel } from '@/lib/air-date';
 import { formatRuntime } from '@/lib/format';
-import { watchLaterItem } from '@/lib/library';
+import { episodeLabel, latestHistoryForTitle, watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
+import { useCore } from './core-provider';
 import { EpisodeList } from './episode-list';
 import { WatchLaterButton } from './watch-later-button';
+import { WatchPlayLink } from './watch-play-link';
 
 /** Kino's small-caps section label, reused for every block below the fold. */
 export function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -32,12 +32,23 @@ export function TitleDetail({
   const year = details.releaseDate.slice(0, 4);
   const rating = details.voteAverage ? details.voteAverage.toFixed(1) : '';
   const runtime = formatRuntime(details.runtime);
+  const { library } = useCore();
+  const resume = latestHistoryForTitle(library?.history, details.mediaType, details.id);
   const firstSeason = details.seasons[0]?.seasonNumber ?? 1;
+  const resumeSeason = resume?.season ?? firstSeason;
+  const resumeEpisode = resume?.episode ?? episodes[0]?.episodeNumber ?? 1;
+  const resumeLabel = episodeLabel(resume?.season, resume?.episode);
   const nextAirs = details.nextEpisode ? formatNextEpisodeLabel(details.nextEpisode) : null;
   const playHref =
     details.mediaType === 'tv'
-      ? watchHref(details, firstSeason, episodes[0]?.episodeNumber ?? 1)
+      ? watchHref(details, resumeSeason, resumeEpisode)
       : watchHref(details);
+  const playLabel =
+    details.mediaType === 'tv'
+      ? resumeLabel
+        ? `Continue ${resumeLabel}`
+        : 'Watch S1 E1'
+      : 'Watch Now';
 
   return (
     <main className="h-dvh overflow-hidden bg-background text-white">
@@ -104,19 +115,19 @@ export function TitleDetail({
           ) : null}
 
           <div className="mt-10 flex flex-wrap items-center gap-4">
-            <Link
+            <WatchPlayLink
               href={playHref}
-              className="flex h-14 w-60 items-center justify-center gap-3 rounded-full bg-white font-semibold text-black"
-            >
-              <IoPlay size={22} />
-              {details.mediaType === 'tv' ? 'Watch S1 E1' : 'Watch Now'}
-            </Link>
+              label={playLabel}
+              progress={resume?.progress ?? 0}
+              size="lg"
+            />
             <WatchLaterButton item={watchLaterItem(details)} size="lg" />
             {details.mediaType === 'tv' && details.seasons.length > 0 ? (
               <EpisodeList
+                key={resumeSeason}
                 showId={details.id}
                 seasons={details.seasons}
-                initialSeason={firstSeason}
+                initialSeason={resumeSeason}
                 initialEpisodes={episodes}
               />
             ) : null}

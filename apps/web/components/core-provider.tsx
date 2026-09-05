@@ -14,9 +14,7 @@ import {
   connectCoreEndpoint,
   currentOriginCoreEndpoint,
   discoverLocalEngine,
-  embeddedCoreEndpoint,
   getLibrary,
-  isDesktopRuntime,
   PairingRequiredError,
   removeHistoryItem,
   setWatchLater,
@@ -33,8 +31,6 @@ interface CoreContextValue {
   endpoint: string;
   /** True when this page is served by Cubo Core itself (port 8765). */
   isHosted: boolean;
-  /** True when running inside the desktop shell that owns Cubo Core. */
-  isDesktop: boolean;
   library: CoreLibrarySnapshot | null;
   openSettings: () => void;
   /** Resolves a live Core connection, connecting on demand. */
@@ -57,7 +53,6 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
   const [connectionChecked, setConnectionChecked] = useState(false);
   const [savedEndpoint, setSavedEndpoint] = useState('');
   const [hostedEndpoint, setHostedEndpoint] = useState('');
-  const [desktopRuntime, setDesktopRuntime] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [library, setLibrary] = useState<CoreLibrarySnapshot | null>(null);
   /** A reachable Core that wants a pairing code before it will talk to us. */
@@ -66,8 +61,6 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const stored = window.localStorage.getItem(STORAGE_KEY) ?? '';
     const pageCoreEndpoint = currentOriginCoreEndpoint();
-    const desktop = isDesktopRuntime();
-    setDesktopRuntime(desktop);
 
     const surfacePairing = (reason: unknown) => {
       if (reason instanceof PairingRequiredError) {
@@ -76,7 +69,7 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
-    if (!pageCoreEndpoint && !desktop) {
+    if (!pageCoreEndpoint) {
       setSavedEndpoint(stored);
       // Probe for a Core eagerly so playback starts faster and the
       // disconnected banner reflects a real failed attempt, not a guess.
@@ -87,14 +80,13 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const automaticEndpoint = desktop ? embeddedCoreEndpoint() : pageCoreEndpoint;
-    void connectCoreEndpoint(automaticEndpoint)
+    void connectCoreEndpoint(pageCoreEndpoint)
       .then((hosted) => {
-        if (!desktop) setHostedEndpoint(hosted.baseUrl);
+        setHostedEndpoint(hosted.baseUrl);
         setConnection(hosted);
       })
       .catch((reason: unknown) => {
-        if (!desktop) setSavedEndpoint(stored);
+        setSavedEndpoint(stored);
         surfacePairing(reason);
       })
       .finally(() => setConnectionChecked(true));
@@ -105,9 +97,7 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
     // mount-effect race where a fast click on a Core-hosted page would probe
     // 127.0.0.1 on the viewing device instead of the Core serving the page.
     const pageCoreEndpoint = currentOriginCoreEndpoint();
-    const next = isDesktopRuntime()
-      ? await connectCoreEndpoint(embeddedCoreEndpoint())
-      : pageCoreEndpoint
+    const next = pageCoreEndpoint
       ? await connectCoreEndpoint(pageCoreEndpoint)
       : await discoverLocalEngine(hostedEndpoint || savedEndpoint);
     setConnection(next);
@@ -175,9 +165,8 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
     () => ({
       connection,
       connectionChecked,
-      endpoint: desktopRuntime ? embeddedCoreEndpoint() : hostedEndpoint || savedEndpoint,
+      endpoint: hostedEndpoint || savedEndpoint,
       isHosted: hostedEndpoint !== '',
-      isDesktop: desktopRuntime,
       library,
       openSettings: () => setSettingsOpen(true),
       connect,
@@ -189,7 +178,6 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
       connection,
       connectionChecked,
       hostedEndpoint,
-      desktopRuntime,
       savedEndpoint,
       library,
       connect,
@@ -206,8 +194,7 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
         <CoreSettings
           endpoint={value.endpoint}
           connection={connection}
-          currentOriginCore={value.isHosted || value.isDesktop}
-          embeddedCore={value.isDesktop}
+          currentOriginCore={value.isHosted}
           initialPairingEndpoint={pairingEndpoint}
           onSave={saveCore}
           onClose={() => setSettingsOpen(false)}

@@ -28,7 +28,6 @@ import {
 } from 'react-icons/md';
 import { IoIosArrowBack } from 'react-icons/io';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { isDesktopRuntime } from '@/lib/local-engine';
 import type { CaptionColor, CaptionSize } from '@/lib/caption-prefs';
 import { CAPTION_COLORS } from '@/lib/caption-prefs';
 import {
@@ -444,8 +443,8 @@ export function VideoPlayer({
     }
 
     // Remuxed sources ALWAYS go through hls.js — never the native HLS stack.
-    // Core's playlist grows while ffmpeg works, and native players (Safari,
-    // WKWebView in the desktop app) treat a growing playlist as a live
+    // Core's playlist grows while ffmpeg works, and native players (Safari)
+    // treat a growing playlist as a live
     // broadcast: play() snaps to the live edge and seeking is confined to a
     // sliding window. hls.js with an explicit startPosition keeps normal
     // video-on-demand behaviour.
@@ -594,22 +593,6 @@ export function VideoPlayer({
   }, [resolveDuration, revealControls, seekToAbsolute]);
 
   const toggleFullscreen = useCallback(() => {
-    // WKWebView in the desktop shell doesn't implement element fullscreen —
-    // toggle the native window instead (also feels more at home on desktop).
-    if (isDesktopRuntime()) {
-      void (async () => {
-        try {
-          const { getCurrentWindow } = await import('@tauri-apps/api/window');
-          const appWindow = getCurrentWindow();
-          const next = !(await appWindow.isFullscreen());
-          await appWindow.setFullscreen(next);
-          setFullscreen(next);
-        } catch {
-          // Missing permission or non-Tauri context; nothing to do.
-        }
-      })();
-      return;
-    }
     if (document.fullscreenElement) void document.exitFullscreen();
     else void containerRef.current?.requestFullscreen().catch(() => undefined);
   }, []);
@@ -842,7 +825,7 @@ export function VideoPlayer({
         <button
           type="button"
           onClick={goBack}
-          className="desktop-back-offset pointer-events-auto flex min-w-0 max-w-full cursor-pointer items-center gap-3 text-left text-white transition-colors hover:text-white/80"
+          className="pointer-events-auto flex min-w-0 max-w-full cursor-pointer items-center gap-3 text-left text-white transition-colors hover:text-white/80"
         >
           <IoIosArrowBack size={26} className="shrink-0 drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]" />
           <span className="min-w-0 text-left">

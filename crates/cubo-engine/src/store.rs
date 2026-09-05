@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-const DEFAULT_CACHE_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+const DEFAULT_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_HISTORY_ITEMS: usize = 500;
 /// Playback progress ticks arrive every few seconds; the state file is
 /// rewritten at most this often, with a trailing flush for the final tick.

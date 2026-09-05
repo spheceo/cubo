@@ -7,13 +7,6 @@ import {
   type LegalDoc,
 } from '../../legal';
 
-const RELEASES_BASE = 'https://github.com/spheceo/cubo/releases/latest/download';
-const DOWNLOADS = {
-  macArm: `${RELEASES_BASE}/cubo-macos-apple-silicon.dmg`,
-  macIntel: `${RELEASES_BASE}/cubo-macos-intel.dmg`,
-  windows: `${RELEASES_BASE}/cubo-windows-x64-setup.exe`,
-};
-
 const TMDB = 'https://image.tmdb.org/t/p';
 
 /** Curated stills for the marketing collage — visual only, not a catalog.
@@ -327,44 +320,7 @@ function DownloadPage({
             kind="PowerShell"
             cmd={INSTALL_COMMANDS.windows}
           />
-          <FileOption
-            icon={<AppleIcon />}
-            os="macOS"
-            kind="Apple Silicon"
-            file="cubo-macos-apple-silicon.dmg"
-            href={DOWNLOADS.macArm}
-          />
-          <FileOption
-            icon={<AppleIcon />}
-            os="macOS"
-            kind="Intel"
-            file="cubo-macos-intel.dmg"
-            href={DOWNLOADS.macIntel}
-          />
-          <FileOption
-            icon={<WindowsIcon />}
-            os="Windows"
-            kind="64-bit"
-            file="cubo-windows-x64-setup.exe"
-            href={DOWNLOADS.windows}
-          />
         </ul>
-
-        <details className="fine-print">
-          <summary>First-launch notes (unsigned-app quirks)</summary>
-          <div>
-            <p>
-              Cubo isn&rsquo;t notarized yet, so macOS calls the app
-              &ldquo;damaged&rdquo; on first launch. Run this once, then open it
-              normally:
-            </p>
-            <code className="command">xattr -cr /Applications/cubo.app</code>
-            <p>
-              On Windows, choose &ldquo;More info &rarr; Run anyway&rdquo; if
-              SmartScreen appears. Updates install themselves after that.
-            </p>
-          </div>
-        </details>
       </section>
 
       {version ? (
@@ -409,32 +365,6 @@ function CommandOption({
         {copied ? <CheckIcon /> : <CopyIcon />}
         {copied ? 'Copied' : 'Copy'}
       </button>
-    </li>
-  );
-}
-
-/** One row of the "every option" table, ending in a download link. */
-function FileOption({
-  icon,
-  os,
-  kind,
-  file,
-  href,
-}: {
-  icon: ReactNode;
-  os: string;
-  kind: string;
-  file: string;
-  href: string;
-}) {
-  return (
-    <li className="dl-row">
-      <RowName icon={icon} os={os} kind={kind} />
-      <code className="dl-row-cmd dl-row-file">{file}</code>
-      <a className="row-btn" href={href}>
-        <DownloadIcon />
-        Download
-      </a>
     </li>
   );
 }
@@ -720,14 +650,6 @@ function CheckIcon() {
   return (
     <Glyph>
       <path d="M4.8 12.6l4.8 4.8L19.4 7.2" />
-    </Glyph>
-  );
-}
-
-function DownloadIcon() {
-  return (
-    <Glyph>
-      <path d="M12 3.6v11.2M7.4 10.4l4.6 4.6 4.6-4.6M4.2 19.4h15.6" />
     </Glyph>
   );
 }

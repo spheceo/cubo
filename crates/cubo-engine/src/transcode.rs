@@ -174,6 +174,10 @@ impl TranscodeManager {
         self.ffmpeg.is_some() && self.ffprobe.is_some()
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub async fn probe(&self, input_url: &str) -> Result<MediaProbe, String> {
         let ffprobe = self.ffprobe.as_ref().ok_or("ffprobe is not available")?;
         let output = tokio::time::timeout(
@@ -603,8 +607,8 @@ fn sanitize_key(key: &str) -> String {
         .collect()
 }
 
-/// Locates a bundled or system ffmpeg tool. The directory next to the app
-/// executable is checked first so a Tauri sidecar wins over system installs.
+/// Locates a bundled or system ffmpeg tool. The directory next to the CLI
+/// executable is checked first so a release sidecar wins over system installs.
 fn find_tool(name: &str) -> Option<PathBuf> {
     let file_name = if cfg!(windows) {
         format!("{name}.exe")

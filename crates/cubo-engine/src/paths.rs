@@ -1,5 +1,4 @@
-//! Filesystem layout for Cubo data. Deliberately independent of the desktop
-//! app's Tauri-managed directories so both can coexist.
+//! Filesystem layout for Cubo data.
 
 use std::path::PathBuf;
 

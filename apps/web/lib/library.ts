@@ -1,4 +1,10 @@
-import { watchHref, type MediaDetails, type MediaType, type WatchLaterItem } from '@cubo/core';
+import {
+  watchHref,
+  type LibraryItem,
+  type MediaDetails,
+  type MediaType,
+  type WatchLaterItem,
+} from '@cubo/core';
 
 export function playbackKey(
   mediaType: MediaType,
@@ -7,6 +13,45 @@ export function playbackKey(
   episode?: number | null,
 ): string {
   return [mediaType, mediaId, season ?? '-', episode ?? '-'].join(':');
+}
+
+export function episodeLabel(season?: number | null, episode?: number | null): string | null {
+  if (season == null || episode == null) return null;
+  return `S${season} E${episode}`;
+}
+
+/** Most recently touched history row for a title. Earlier episodes stay stored. */
+export function latestHistoryForTitle(
+  history: LibraryItem[] | undefined,
+  mediaType: MediaType,
+  mediaId: number,
+): LibraryItem | undefined {
+  let latest: LibraryItem | undefined;
+  for (const item of history ?? []) {
+    if (item.mediaType !== mediaType || item.mediaId !== mediaId) continue;
+    if (!latest || item.lastWatchedAt > latest.lastWatchedAt) latest = item;
+  }
+  return latest;
+}
+
+/** One card per title — always the last season/episode touched. */
+export function continueWatchingItems(
+  history: LibraryItem[] | undefined,
+  mediaType?: MediaType,
+): LibraryItem[] {
+  const latestByTitle = new Map<string, LibraryItem>();
+  for (const item of history ?? []) {
+    if (mediaType && item.mediaType !== mediaType) continue;
+    const id = `${item.mediaType}:${item.mediaId}`;
+    const current = latestByTitle.get(id);
+    if (!current || item.lastWatchedAt > current.lastWatchedAt) {
+      latestByTitle.set(id, item);
+    }
+  }
+  return [...latestByTitle.values()]
+    .filter((item) => item.positionSeconds >= 30 && item.progress < 0.9)
+    .sort((a, b) => b.lastWatchedAt - a.lastWatchedAt)
+    .slice(0, 8);
 }
 
 export function watchLaterItem(details: MediaDetails): WatchLaterItem {

@@ -1,6 +1,6 @@
 node_modules
 dist
-apps/desktop/src-tauri/binaries/
+scripts/binaries/
 .next
 target
 .vercel

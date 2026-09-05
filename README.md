@@ -1,9 +1,8 @@
 # cubo
 
-Cubo is one React app (Vite) that ships to three places: the browser via Vercel,
-the desktop app via Tauri (bundled, works offline from Vercel), and the local
-Core gateway. The same Vercel project hosts the static UI and the small
-serverless API routes that hold the secrets (TMDB key, Torrentio proxy).
+Cubo is one React app (Vite) that ships to the browser via Vercel and through
+the local Core gateway. The same Vercel project hosts the static UI and the
+small serverless API routes that hold the secrets (TMDB key, Torrentio proxy).
 
 ```text
 Vercel project (apps/web)
@@ -15,14 +14,14 @@ Vercel project (apps/web)
         │
         ├── automatic: http://127.0.0.1:8765
         └── configured: https://media.example-tailnet.ts.net
-            └── Tauri + rqbit playback bridge
+            └── Cubo Core (CLI) + rqbit playback bridge
 ```
 
-The Core starts automatically with Cubo Desktop and always uses port `8765`.
-Startup fails clearly if that port is already occupied. It exposes a health
-endpoint for browser discovery and requires a per-launch token for playback
-operations. The raw rqbit API remains on a separate ephemeral loopback port and
-is not exposed to the frontend.
+Core is the `cubo` CLI (`cubo persist` or `cubo serve`) and always uses port
+`8765`. Startup fails clearly if that port is already occupied. It exposes a
+health endpoint for browser discovery and requires a per-launch token for
+playback operations. The raw rqbit API remains on a separate ephemeral
+loopback port and is not exposed to the frontend.
 
 At startup, Core binds `127.0.0.1:8765` and automatically detects the machine's
 Tailscale IPv4 address using `tailscale ip -4`. When Tailscale is available, it
@@ -32,11 +31,9 @@ LAN interfaces.
 Opening `http://127.0.0.1:8765`, a directly bound Tailscale IP such as
 `http://100.64.0.10:8765`, or a Tailscale Serve HTTPS hostname loads the Cubo
 web interface through the Core, which reverse-proxies the web deployment (the
-local Vite server at `http://127.0.0.1:3000` in development, the
+local Vite server at `http://127.0.0.1:4200` in development, the
 `WEB_DEPLOYMENT_URL` constant in release builds). The interface detects that it
-is Core-hosted and connects playback to that device automatically. The desktop
-app itself never needs this, because production builds bundle the UI from
-`apps/web/dist`.
+is Core-hosted and connects playback to that device automatically.
 
 ## Remote Core over Tailscale
 
@@ -63,22 +60,19 @@ machine's Tailscale IP) in Core settings.
 
 1. Install [bun](https://bun.sh), then run `bun install`.
 2. Add `TMDB_API_KEY` to `apps/web/.env.local`.
-3. Run `bun dev` to start the Vite dev server and Tauri together.
+3. Run `bun dev` to start the Vite app and marketing site.
 
 The Vite dev server also serves the `api/` functions locally, so the Vercel
 CLI is not needed for development.
 
 Useful commands:
 
-- `bun dev` runs everything with labeled output: the app (4200), the marketing
-  site (4300), and the desktop shell (whose embedded engine is Core).
+- `bun dev` runs the app (4200) and the marketing site (4300).
 - `bun dev:web` starts only the app at `http://localhost:4200`.
 - `bun dev:site` starts the marketing site at `http://localhost:4300`.
-- `bun dev:desktop` starts the app + Tauri together, without the marketing site.
-- `bun dev:core` runs a headless engine via the CLI. Do not combine it with
-  `bun dev*` — the desktop app and the headless core fight over port 8765.
+- `bun dev:core` runs the engine via the CLI.
 - `bun typecheck` checks the TypeScript packages and Rust core.
-- `bun build` builds the web app and desktop bundle.
+- `bun build` builds the web app and marketing site.
 
 ## Deploying to Vercel
 
@@ -89,17 +83,11 @@ environment variables — the functions in `apps/web/api/` pick it up.
 
 ## Production builds
 
-Desktop builds bundle the UI, so the app always has its interface. The only
-configuration is the canonical deployment URL, hardcoded in two places (change
-both if the deployment ever moves from `https://app.cubo.spheceo.com`):
-
-- `DEPLOYED_SITE_URL` in `apps/web/lib/api.ts` — where the bundled desktop UI
-  sends API requests, since its `tauri://localhost` origin has no functions.
-- `WEB_DEPLOYMENT_URL` in `apps/desktop/src-tauri/src/engine.rs` — the
-  deployment Core proxies for the browser gateway on port `8765`, and the web
-  origin it trusts for cross-origin playback requests.
-
-Then just run `bun build`.
+The canonical web deployment URL is hardcoded in
+`WEB_DEPLOYMENT_URL` in `crates/cubo-engine/src/engine.rs` — the origin Core
+proxies for the browser gateway on port `8765`, and the origin it trusts for
+cross-origin playback requests. Change that constant if the deployment moves
+from `https://app.cubo.spheceo.com`.
 
 Connecting to a direct loopback, LAN, or Tailscale IP may trigger the browser's
 Local Network Access permission. An HTTPS Tailscale Serve URL avoids mixed

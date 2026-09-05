@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { IoClose } from 'react-icons/io5';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { Link } from '@/components/link';
+import { continueWatchingItems, episodeLabel } from '@/lib/library';
 import { useCore } from './core-provider';
 
 export function ContinueWatching({
@@ -13,10 +14,7 @@ export function ContinueWatching({
   className?: string;
 }) {
   const { library, removeFromHistory } = useCore();
-  const items = (library?.history ?? [])
-    .filter((item) => item.positionSeconds >= 30 && item.progress < 0.9)
-    .filter((item) => (mediaType ? item.mediaType === mediaType : true))
-    .slice(0, 8);
+  const items = continueWatchingItems(library?.history, mediaType);
 
   if (items.length === 0) return null;
 
@@ -48,7 +46,8 @@ function ContinueWatchingCard({
   const backdrop = backdropUrl(item.backdropPath, 'w780');
   const logo = logoUrl(item.logoPath, 'w300');
   const percent = Math.min(100, Math.round(item.progress * 100));
-  const title = item.subtitle ? `${item.title} · ${item.subtitle}` : item.title;
+  const episode = episodeLabel(item.season, item.episode);
+  const title = episode ? `${item.title} · ${episode}` : item.title;
 
   return (
     <>
@@ -90,9 +89,12 @@ function ContinueWatchingCard({
               />
             ) : (
               <h3 className="line-clamp-2 max-w-[62%] text-xl font-semibold leading-tight text-white">
-                {title}
+                {item.title}
               </h3>
             )}
+            {episode ? (
+              <p className="mt-2 text-sm font-semibold text-white/80">{episode}</p>
+            ) : null}
           </div>
         </Link>
         <div className="mx-auto mt-3 h-1 w-[62%] overflow-hidden rounded-full bg-[#4f4f4f]">

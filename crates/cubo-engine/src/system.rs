@@ -319,6 +319,17 @@ pub fn snapshot(download_dir: &Path) -> SystemSnapshot {
     }
 }
 
+/// Free bytes on the volume that holds `path`. `None` when the volume
+/// cannot be identified — callers must not treat that as zero free space.
+pub fn volume_free_bytes(path: &Path) -> Option<u64> {
+    let stats = storage_stats(path);
+    if stats.total_bytes == 0 {
+        None
+    } else {
+        Some(stats.free_bytes)
+    }
+}
+
 fn storage_stats(download_dir: &Path) -> StorageStats {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let probe = nearest_existing_parent(download_dir);

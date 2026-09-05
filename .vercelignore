@@ -5,7 +5,6 @@
 **/.turbo
 **/*.log
 .vercel
-apps/desktop/src-tauri/gen
 *.png
 *.jpg
 design-qa.md
