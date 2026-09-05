@@ -35,7 +35,7 @@ import {
   saveFramingPref,
   type FramingMode,
 } from '@/lib/framing-prefs';
-import { playInBackground } from '@/lib/background-playback';
+import { cancelAutoplayUnmute, playInBackground } from '@/lib/background-playback';
 import { logoUrl } from '@cubo/core';
 import { findActiveCue, loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { LogoLoader } from './logo-loader';
@@ -49,6 +49,39 @@ type BufferedRange = {
   start: number;
   end: number;
 };
+
+/** True when `time` sits inside a buffered (not merely seekable) range.
+ *  EVENT remux playlists report the whole converted window as seekable long
+ *  before those bytes are in MSE — seeking there every tick chases the
+ *  loaded edge and looks like 2× playback. */
+function timeRangesCover(ranges: TimeRanges, time: number, slack = 0.35): boolean {
+  for (let index = 0; index < ranges.length; index += 1) {
+    if (time >= ranges.start(index) - slack && time <= ranges.end(index) + slack) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * TODO(refresh-remux-autoplay): a document reload of /watch must not call
+ * play() on its own. In-app Play (Home → Watch) is fine — that click is a
+ * user gesture and remuxed HLS starts cleanly. A refresh is not: Core's
+ * growing EVENT playlist looks live to hls.js, and unmuted/muted autoplay
+ * on reload rushes or snaps toward the converted edge (~2×), then later
+ * attempts to pin currentTime fought the player and stuttered in place.
+ *
+ * Workaround: hold for a Play click after reload. Come back to this when
+ * remuxed HLS can start at playlist time 0 at 1× without a gesture.
+ * Failed approaches: pending-seek servo, startLoad() (rejoins live edge),
+ * wall-clock playhead pin (seeks against itself).
+ */
+function isDocumentReload(): boolean {
+  const entry = performance.getEntriesByType('navigation')[0] as
+    | PerformanceNavigationTiming
+    | undefined;
+  return entry?.type === 'reload';
+}
 
 export type PlayerSubtitle = {
   id: string;
@@ -137,8 +170,9 @@ export function VideoPlayer({
   /** One-shot local seek (seek-restart catch-up), applied per source. */
   const localSeekApplied = useRef<string | null>(null);
   /** False only when the viewer hit pause — browsers pausing a hidden tab
-   *  must not stick. */
-  const userPaused = useRef(false);
+   *  must not stick. Seeded true on document reload (see isDocumentReload). */
+  const reloadHoldRef = useRef(isDocumentReload());
+  const userPaused = useRef(reloadHoldRef.current);
   /** Bumps to cancel an in-flight hidden-tab play() retry loop. */
   const playGeneration = useRef(0);
 
@@ -161,6 +195,16 @@ export function VideoPlayer({
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(true);
   const [blocked, setBlocked] = useState(false);
+  const [heldPaused, setHeldPaused] = useState(() => reloadHoldRef.current);
+  const [reloadHold, setReloadHold] = useState(() => reloadHoldRef.current);
+  /** Absolute time the viewer asked for. Held until the source can actually
+   *  sit there, so the needle does not snap back to the converted window. */
+  const [pendingSeek, setPendingSeek] = useState<number | null>(null);
+  const pendingSeekRef = useRef<number | null>(null);
+  /** One currentTime write per held seek — never a servo. */
+  const pendingSeekKickedRef = useRef(false);
+  /** Viewer mute, as opposed to the autoplay-policy mute. */
+  const userMutedRef = useRef(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [bufferedRanges, setBufferedRanges] = useState<BufferedRange[]>([]);
@@ -430,6 +474,17 @@ export function VideoPlayer({
     [durationHint, hls],
   );
 
+  const markUserPaused = useCallback((paused: boolean) => {
+    userPaused.current = paused;
+    setHeldPaused(paused);
+  }, []);
+
+  const releaseReloadHold = useCallback(() => {
+    if (!reloadHoldRef.current) return;
+    reloadHoldRef.current = false;
+    setReloadHold(false);
+  }, []);
+
   const requestPlay = useCallback((video: HTMLVideoElement) => {
     if (userPaused.current || video.ended) return;
     const generation = ++playGeneration.current;
@@ -437,6 +492,7 @@ export function VideoPlayer({
       video,
       () => userPaused.current || playGeneration.current !== generation,
       setBlocked,
+      () => userMutedRef.current,
     );
   }, []);
 
@@ -444,12 +500,49 @@ export function VideoPlayer({
     playGeneration.current += 1;
   }, []);
 
+  const holdSeek = useCallback((absoluteSeconds: number) => {
+    pendingSeekRef.current = absoluteSeconds;
+    pendingSeekKickedRef.current = false;
+    setPendingSeek(absoluteSeconds);
+  }, []);
+
+  const clearPendingSeek = useCallback(() => {
+    pendingSeekRef.current = null;
+    pendingSeekKickedRef.current = false;
+    setPendingSeek(null);
+  }, []);
+
+  const applyPendingSeek = useCallback(
+    (video: HTMLVideoElement) => {
+      const pending = pendingSeekRef.current;
+      if (pending == null) return;
+      const local = Math.max(0, pending - timeOffsetRef.current);
+      const actual = timeOffsetRef.current + video.currentTime;
+
+      if (Math.abs(actual - pending) < 1.25) {
+        clearPendingSeek();
+        return;
+      }
+
+      if (pendingSeekKickedRef.current) return;
+      if (!timeRangesCover(video.buffered, local)) return;
+      pendingSeekKickedRef.current = true;
+      video.currentTime = local;
+    },
+    [clearPendingSeek],
+  );
+
   useEffect(() => {
     setDuration(hls && durationHint && Number.isFinite(durationHint) ? durationHint : 0);
     setCurrentTime(0);
     setBufferedRanges([]);
     setWaiting(true);
-  }, [src, hls, durationHint]);
+    setBlocked(false);
+    if (!reloadHoldRef.current) markUserPaused(false);
+    pendingSeekRef.current = null;
+    pendingSeekKickedRef.current = false;
+    setPendingSeek(null);
+  }, [src, hls, durationHint, markUserPaused]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -457,7 +550,9 @@ export function VideoPlayer({
 
     let cancelled = false;
     const start = () => {
-      if (cancelled || userPaused.current) return;
+      // Reload hold: wait for Play. Auto-starting remuxed HLS here is the
+      // refresh rush — see isDocumentReload().
+      if (cancelled || userPaused.current || reloadHoldRef.current) return;
       requestPlay(video);
     };
 
@@ -484,7 +579,11 @@ export function VideoPlayer({
         onErrorRef.current();
         return;
       }
-      instance = new Hls({ startPosition: 0 });
+      instance = new Hls({
+        startPosition: 0,
+        lowLatencyMode: false,
+        maxLiveSyncPlaybackRate: 1,
+      });
       instance.loadSource(src);
       instance.attachMedia(video);
       instance.on(Hls.Events.MANIFEST_PARSED, start);
@@ -504,7 +603,9 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
     const resumeIfNeeded = () => {
-      if (userPaused.current || !video.paused || video.ended) return;
+      if (reloadHoldRef.current || userPaused.current || !video.paused || video.ended) {
+        return;
+      }
       requestPlay(video);
     };
     document.addEventListener('visibilitychange', resumeIfNeeded);
@@ -534,7 +635,7 @@ export function VideoPlayer({
     };
   }, [settingsOpen]);
 
-  const keepControls = settingsOpen || !playing || blocked;
+  const keepControls = settingsOpen || heldPaused || blocked || reloadHold;
 
   const revealControls = useCallback(() => {
     setControlsVisible(true);
@@ -571,7 +672,7 @@ export function VideoPlayer({
       lastProgressWallTime.current = video.paused ? 0 : now;
       lastProgressReport.current = now;
       onPlaybackProgress(
-        timeOffsetRef.current + video.currentTime,
+        pendingSeekRef.current ?? timeOffsetRef.current + video.currentTime,
         fullDuration,
         watchedDelta,
         sessionStarted,
@@ -593,14 +694,15 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      userPaused.current = false;
+      releaseReloadHold();
+      markUserPaused(false);
       requestPlay(video);
     } else {
-      userPaused.current = true;
+      markUserPaused(true);
       stopPlayLoop();
       video.pause();
     }
-  }, [requestPlay, stopPlayLoop]);
+  }, [markUserPaused, releaseReloadHold, requestPlay, stopPlayLoop]);
 
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
@@ -614,12 +716,13 @@ export function VideoPlayer({
     });
     navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
     navigator.mediaSession.setActionHandler('play', () => {
-      userPaused.current = false;
+      releaseReloadHold();
+      markUserPaused(false);
       const video = videoRef.current;
       if (video) requestPlay(video);
     });
     navigator.mediaSession.setActionHandler('pause', () => {
-      userPaused.current = true;
+      markUserPaused(true);
       stopPlayLoop();
       videoRef.current?.pause();
     });
@@ -627,42 +730,59 @@ export function VideoPlayer({
       navigator.mediaSession.setActionHandler('play', null);
       navigator.mediaSession.setActionHandler('pause', null);
     };
-  }, [title, subtitle, logoPath, playing, requestPlay, stopPlayLoop]);
+  }, [title, subtitle, logoPath, playing, markUserPaused, releaseReloadHold, requestPlay, stopPlayLoop]);
 
-  /** Seeks to an absolute source position. Inside the converted window it is
-   *  an ordinary seek; outside it (with slack near the frontier, where waiting
-   *  a moment is faster than restarting ffmpeg) the owner restarts the
-   *  converter at the target — no more clamping to a spot before the target
-   *  and hanging there. */
+  /** Seeks to an absolute source position. The needle stays on the requested
+   *  time immediately; if that section is not converted yet we wait (or
+   *  restart ffmpeg) instead of clamping back to the loaded window. */
   const seekToAbsolute = useCallback(
     (absoluteSeconds: number) => {
       const video = videoRef.current;
       if (!video) return;
-      const offset = timeOffsetRef.current;
-      const local = absoluteSeconds - offset;
-      const seekable = video.seekable;
+      const fullDuration = resolveDuration(video);
+      const target = Math.max(
+        0,
+        fullDuration > 0 ? Math.min(fullDuration, absoluteSeconds) : absoluteSeconds,
+      );
+      holdSeek(target);
+      setCurrentTime(target - timeOffsetRef.current);
 
+      const local = target - timeOffsetRef.current;
+      const seekable = video.seekable;
       if (hls && onSeekOutsideRef.current && seekable.length > 0) {
         const seekableStart = seekable.start(0);
         const seekableEnd = seekable.end(seekable.length - 1);
+        // Slack near the frontier: waiting for the next segment is faster
+        // than restarting ffmpeg. Empty seekable means the playlist is
+        // still attaching — hold the needle, do not kick a new remux.
         if (local < seekableStart - 1 || local > seekableEnd + 10) {
-          onSeekOutsideRef.current(Math.max(0, absoluteSeconds));
+          onSeekOutsideRef.current(target);
           return;
         }
       }
-      video.currentTime = clampToSeekable(video, local);
+      pendingSeekKickedRef.current = true;
+      video.currentTime = Math.max(0, local);
     },
-    [hls],
+    [hls, holdSeek, resolveDuration],
   );
 
   const seekBy = useCallback((seconds: number) => {
     const video = videoRef.current;
     if (!video) return;
     const fullDuration = resolveDuration(video);
-    const absolute = timeOffsetRef.current + video.currentTime + seconds;
-    seekToAbsolute(Math.max(0, Math.min(fullDuration || Infinity, absolute)));
+    const head =
+      pendingSeekRef.current ?? timeOffsetRef.current + video.currentTime;
+    seekToAbsolute(Math.max(0, Math.min(fullDuration || Infinity, head + seconds)));
     revealControls();
   }, [resolveDuration, revealControls, seekToAbsolute]);
+
+  const focusPlayer = useCallback(() => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && containerRef.current?.contains(active)) {
+      active.blur();
+    }
+    containerRef.current?.focus({ preventScroll: true });
+  }, []);
 
   const toggleFullscreen = useCallback(() => {
     if (document.fullscreenElement) void document.exitFullscreen();
@@ -672,61 +792,81 @@ export function VideoPlayer({
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    video.muted = !video.muted;
+    const next = !video.muted;
+    video.muted = next;
+    userMutedRef.current = next;
+    if (next) cancelAutoplayUnmute();
   }, []);
 
   useEffect(() => {
-    const onFullscreenChange = () => setFullscreen(Boolean(document.fullscreenElement));
+    const onFullscreenChange = () => {
+      setFullscreen(Boolean(document.fullscreenElement));
+      // Browsers put focus back on the fullscreen button after enter/exit.
+      // Defer so we win that restore — otherwise Space/ArrowLeft hit the
+      // button instead of the player.
+      focusPlayer();
+      requestAnimationFrame(() => {
+        focusPlayer();
+        window.setTimeout(focusPlayer, 0);
+      });
+    };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, []);
+  }, [focusPlayer]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
-      if (
-        event.repeat ||
-        event.metaKey ||
-        event.ctrlKey ||
-        event.altKey ||
-        target?.closest('button, a, input, select, textarea, [contenteditable="true"], [role="button"]')
-      ) {
+      if (target?.closest('input, select, textarea, [contenteditable="true"]')) {
+        return;
+      }
+      if (settingsOpen && target && settingsRef.current?.contains(target)) {
         return;
       }
 
       const video = videoRef.current;
       if (!video) return;
 
+      const take = () => {
+        event.preventDefault();
+        focusPlayer();
+      };
+
       switch (event.key) {
         case ' ':
         case 'k':
-          event.preventDefault();
+          take();
           togglePlay();
           break;
         case 'ArrowLeft':
+          take();
           seekBy(-SKIP_SECONDS);
           break;
         case 'ArrowRight':
+          take();
           seekBy(SKIP_SECONDS);
           break;
         case 'ArrowUp':
-          event.preventDefault();
+          take();
           video.volume = Math.min(1, video.volume + 0.1);
           revealControls();
           break;
         case 'ArrowDown':
-          event.preventDefault();
+          take();
           video.volume = Math.max(0, video.volume - 0.1);
           revealControls();
           break;
         case 'm':
+          take();
           toggleMute();
           break;
         case 'c':
-          event.preventDefault();
+          take();
           toggleCaptions();
           break;
         case 'f':
+          take();
           toggleFullscreen();
           break;
         default:
@@ -734,9 +874,18 @@ export function VideoPlayer({
       }
     };
 
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [togglePlay, seekBy, toggleMute, toggleFullscreen, toggleCaptions, revealControls]);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [
+    settingsOpen,
+    focusPlayer,
+    togglePlay,
+    seekBy,
+    toggleMute,
+    toggleFullscreen,
+    toggleCaptions,
+    revealControls,
+  ]);
 
   // One-shot catch-up after a seek restart: the new playlist begins at the
   // keyframe ffmpeg landed on (earlier than requested), so close the gap by
@@ -802,7 +951,7 @@ export function VideoPlayer({
     });
   }
 
-  const shownTime = scrubTime ?? timeOffset + currentTime;
+  const shownTime = scrubTime ?? pendingSeek ?? timeOffset + currentTime;
   const playedRatio = duration ? Math.min(1, shownTime / duration) : 0;
   const volumeLevel = muted || volume === 0 ? 'muted' : volume < 0.5 ? 'low' : 'high';
   const captionHex =
@@ -811,15 +960,16 @@ export function VideoPlayer({
   return (
     <div
       ref={containerRef}
+      tabIndex={-1}
       onPointerMove={revealControls}
       onPointerLeave={() => !keepControls && setControlsVisible(false)}
-      className={`group/player relative h-full w-full overflow-hidden bg-black ${
+      className={`group/player relative h-full w-full overflow-hidden bg-black outline-none ${
         controlsVisible ? '' : 'cursor-none'
       }`}
     >
       <video
         ref={videoRef}
-        autoPlay
+        autoPlay={!reloadHold}
         playsInline
         preload="auto"
         crossOrigin="anonymous"
@@ -840,19 +990,40 @@ export function VideoPlayer({
           setPlaying(false);
           reportPlayback(false);
           const video = videoRef.current;
-          if (video?.isConnected && !userPaused.current && !video.ended) requestPlay(video);
+          if (
+            video?.isConnected &&
+            !reloadHoldRef.current &&
+            !userPaused.current &&
+            !video.ended
+          ) {
+            requestPlay(video);
+          }
         }}
-        onWaiting={() => setWaiting(true)}
+        onWaiting={() => {
+          if (!userPaused.current) setWaiting(true);
+        }}
         onPlaying={() => setWaiting(false)}
-        onCanPlay={() => setWaiting(false)}
+        onCanPlay={(event) => {
+          const video = event.currentTarget;
+          if (!reloadHoldRef.current && !userPaused.current && video.paused) {
+            requestPlay(video);
+          }
+          if (!video.paused) setWaiting(false);
+        }}
         onTimeUpdate={(event) => {
           const video = event.currentTarget;
-          setCurrentTime(video.currentTime);
+          applyPendingSeek(video);
+          if (pendingSeekRef.current == null) {
+            setCurrentTime(video.currentTime);
+          }
           if (performance.now() - lastProgressReport.current >= 10_000) {
             reportPlayback(false);
           }
         }}
-        onProgress={(event) => syncBuffered(event.currentTarget)}
+        onProgress={(event) => {
+          syncBuffered(event.currentTarget);
+          applyPendingSeek(event.currentTarget);
+        }}
         onDurationChange={(event) => {
           const video = event.currentTarget;
           const fullDuration = resolveDuration(video);
@@ -863,7 +1034,9 @@ export function VideoPlayer({
           // suddenly jump forward mid-watch.
           if (!hls && !initialSeekApplied.current && initialTime > 5 && fullDuration > initialTime) {
             initialSeekApplied.current = true;
-            video.currentTime = initialTime;
+            holdSeek(initialTime);
+            applyPendingSeek(video);
+            if (!reloadHoldRef.current) requestPlay(video);
           }
         }}        onVolumeChange={(event) => {
           setVolume(event.currentTarget.volume);
@@ -872,13 +1045,13 @@ export function VideoPlayer({
         onError={onError}
       />
 
-      {waiting && !blocked ? (
+      {(waiting || pendingSeek != null) && !blocked && !heldPaused && !reloadHold ? (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
           <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
         </div>
       ) : null}
 
-      {blocked ? (
+      {blocked || reloadHold ? (
         <button
           type="button"
           onClick={togglePlay}
@@ -1019,7 +1192,10 @@ export function VideoPlayer({
                 const video = videoRef.current;
                 if (!video) return;
                 video.volume = Number(event.target.value);
-                video.muted = Number(event.target.value) === 0;
+                const nextMuted = Number(event.target.value) === 0;
+                video.muted = nextMuted;
+                userMutedRef.current = nextMuted;
+                if (nextMuted) cancelAutoplayUnmute();
               }}
               className="h-1 w-0 cursor-pointer appearance-none rounded-full bg-white/25 opacity-0 transition-all duration-200 group-hover/vol:w-20 group-hover/vol:opacity-100 focus-visible:w-20 focus-visible:opacity-100 [&::-webkit-slider-thumb]:size-3 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white"
             />
@@ -1115,17 +1291,6 @@ export function VideoPlayer({
   );
 }
 
-/** Keeps a seek target inside what the source can actually serve. Direct
- *  streams are fully seekable so this is a no-op; on a growing HLS playlist it
- *  lands the seek at the conversion frontier instead of being ignored. */
-function clampToSeekable(video: HTMLVideoElement, target: number): number {
-  const seekable = video.seekable;
-  if (seekable.length === 0) return target;
-  const start = seekable.start(0);
-  const end = seekable.end(seekable.length - 1);
-  return Math.max(start, Math.min(target, Math.max(start, end - 0.5)));
-}
-
 function ControlButton({
   label,
   onClick,
@@ -1138,7 +1303,10 @@ function ControlButton({
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={(event) => {
+        onClick();
+        event.currentTarget.blur();
+      }}
       aria-label={label}
       title={label}
       className="flex cursor-pointer items-center justify-center rounded-full p-2 text-white/85 transition-colors hover:bg-white/10 hover:text-white"

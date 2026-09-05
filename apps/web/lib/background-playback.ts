@@ -10,6 +10,9 @@
 let context: AudioContext | null = null;
 let keepalive: AudioBufferSourceNode | null = null;
 let timerWorker: Worker | null = null;
+/** True only when we muted to satisfy autoplay policy — never the viewer's mute. */
+let autoplayMuted = false;
+let unlockUnmute: (() => void) | null = null;
 
 function audioContext(): AudioContext | null {
   const Ctor =
@@ -99,22 +102,54 @@ export function isWatchHref(href: string): boolean {
   return href.startsWith('/watch/');
 }
 
-/** Play even if the tab is hidden. Retries until the caller cancels. */
+/** The viewer chose mute — do not treat it as an autoplay unlock. */
+export function cancelAutoplayUnmute(): void {
+  autoplayMuted = false;
+  if (!unlockUnmute) return;
+  window.removeEventListener('pointerdown', unlockUnmute, true);
+  window.removeEventListener('keydown', unlockUnmute, true);
+  unlockUnmute = null;
+}
+
+/** Play even if the tab is hidden. Retries until the caller cancels.
+ *  Refresh has no user gesture, so unmuted play() is often refused — we
+ *  start muted, then unmute once a real gesture arrives. A viewer mute
+ *  is left alone. */
 export async function playInBackground(
   video: HTMLVideoElement,
   cancelled: () => boolean,
   onResult: (blocked: boolean) => void,
+  userMuted: () => boolean = () => false,
 ): Promise<void> {
   void audioContext()?.resume();
   while (!cancelled()) {
+    if (video.ended) return;
     try {
       await video.play();
       if (cancelled()) return;
+      if (autoplayMuted && !userMuted()) unmuteWhenPossible(video);
       onResult(false);
       releaseWatchKeepalive();
       return;
-    } catch {
+    } catch (error) {
       if (cancelled()) return;
+      const name = error instanceof DOMException ? error.name : '';
+      // Policy block: muted autoplay is allowed. Do not flash the paused
+      // overlay — the picture should start on its own.
+      if (name === 'NotAllowedError' && !video.muted && !userMuted()) {
+        autoplayMuted = true;
+        video.muted = true;
+        continue;
+      }
+      // A resume seek or source attach aborts an in-flight play().
+      if (name === 'AbortError') {
+        try {
+          await delayUnthrottled(120);
+        } catch {
+          return;
+        }
+        continue;
+      }
       onResult(true);
       try {
         await delayUnthrottled(800);
@@ -123,4 +158,23 @@ export async function playInBackground(
       }
     }
   }
+}
+
+/** First click/key after a muted autoplay unlocks sound. */
+function unmuteWhenPossible(video: HTMLVideoElement): void {
+  if (!autoplayMuted || !video.muted) return;
+  video.muted = false;
+  if (!video.muted) {
+    cancelAutoplayUnmute();
+    return;
+  }
+  if (unlockUnmute) return;
+  const unlock = () => {
+    if (!autoplayMuted) return;
+    video.muted = false;
+    cancelAutoplayUnmute();
+  };
+  unlockUnmute = unlock;
+  window.addEventListener('pointerdown', unlock, true);
+  window.addEventListener('keydown', unlock, true);
 }

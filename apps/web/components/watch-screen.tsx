@@ -48,7 +48,7 @@ import {
   type CaptionPrefs,
   type CaptionSize,
 } from '@/lib/caption-prefs';
-import { releaseWatchKeepalive } from '@/lib/background-playback';
+import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playback';
 import { playbackKey } from '@/lib/library';
 import { rankStreams, streamKey } from '@/lib/stream-select';
 import type { SubtitleReleaseHint } from '@cubo/core';
@@ -196,7 +196,10 @@ export function WatchScreen({
   const seekTargetRef = useRef<number | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
 
-  useEffect(() => () => releaseWatchKeepalive(), []);
+  useEffect(() => {
+    armWatchSession();
+    return () => releaseWatchKeepalive();
+  }, []);
 
   // The fill eases toward whatever ceiling the current stage set, so it keeps
   // creeping while a stage takes its time and never jumps backwards. The timer
