@@ -26,7 +26,7 @@ export function WatchPlayLink({
       {percent > 0 ? (
         <span
           aria-hidden
-          className="absolute bottom-0 left-0 block border-b-4 border-black"
+          className="absolute bottom-0 left-0 h-1 bg-star"
           style={{ width: `${percent}%` }}
         />
       ) : null}
