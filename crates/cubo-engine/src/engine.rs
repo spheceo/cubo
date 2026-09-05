@@ -445,6 +445,7 @@ fn bridge_router(state: BridgeState) -> Router {
             RANGE,
             HeaderName::from_static("x-cubo-media-key"),
             HeaderName::from_static("x-cubo-title"),
+            HeaderName::from_static("x-cubo-file-index"),
         ])
         .expose_headers([
             ACCEPT_RANGES,
@@ -2095,36 +2096,52 @@ async fn hls_file(
         let actual_start = state.transcode.job_actual_start(&key).await;
         let nonce = state.transcode.job_nonce(&key).await.unwrap_or_default();
 
-        return match tokio::fs::read_to_string(job_dir.join("media.m3u8")).await {
+        let content = match read_growing_playlist(&job_dir.join("media.m3u8")).await {
             Ok(content) => {
-                let mut response = (
-                    [
-                        (CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-                        (HeaderName::from_static("cache-control"), "no-store"),
-                    ],
-                    // Echo back the token the caller authorized with — never
-                    // the session token, which a paired device must not see.
-                    rewrite_playlist(&content, &query.token, &nonce),
-                )
-                    .into_response();
-                if let Some(duration) = duration {
-                    if let Ok(value) = HeaderValue::from_str(&duration.to_string()) {
-                        response
-                            .headers_mut()
-                            .insert(HeaderName::from_static("x-cubo-duration"), value);
-                    }
-                }
-                if let Some(actual_start) = actual_start {
-                    if let Ok(value) = HeaderValue::from_str(&format!("{actual_start:.3}")) {
-                        response
-                            .headers_mut()
-                            .insert(HeaderName::from_static("x-cubo-start"), value);
-                    }
-                }
-                response
+                state.transcode.remember_playlist(&key, content.clone()).await;
+                Some(content)
             }
-            Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+            Err(error) => {
+                // Prefer the last good playlist over a 404 — hls.js recovers
+                // a missing EVENT playlist by jumping to the live edge.
+                if let Some(cached) = state.transcode.last_playlist(&key).await {
+                    tracing::debug!(target: "engine", error = %error, "playlist read missed a rewrite; serving last good");
+                    Some(cached)
+                } else {
+                    tracing::debug!(target: "engine", error = %error, "playlist read missed a rewrite");
+                    None
+                }
+            }
         };
+        let Some(content) = content else {
+            return bridge_error(StatusCode::SERVICE_UNAVAILABLE, "playlist not ready".into());
+        };
+
+        let mut response = (
+            [
+                (CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                (HeaderName::from_static("cache-control"), "no-store"),
+            ],
+            // Echo back the token the caller authorized with — never
+            // the session token, which a paired device must not see.
+            rewrite_playlist(&content, &query.token, &nonce),
+        )
+            .into_response();
+        if let Some(duration) = duration {
+            if let Ok(value) = HeaderValue::from_str(&duration.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static("x-cubo-duration"), value);
+            }
+        }
+        if let Some(actual_start) = actual_start {
+            if let Ok(value) = HeaderValue::from_str(&format!("{actual_start:.3}")) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static("x-cubo-start"), value);
+            }
+        }
+        return response;
     }
 
     // Segment fetches stop when the player is paused; playlist polls do not.
@@ -2305,7 +2322,25 @@ fn unauthorized() -> Response {
 }
 
 fn bridge_error(status: StatusCode, message: String) -> Response {
+    if status.is_server_error() {
+        tracing::error!(target: "engine", status = %status, error = %message, "request failed");
+    }
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// ffmpeg rewrites `media.m3u8` in place as it appends segments. A poll that
+/// hits the file while it is empty or missing is not a server fault.
+async fn read_growing_playlist(path: &std::path::Path) -> Result<String, String> {
+    let mut last = String::from("playlist not ready");
+    for _ in 0..8 {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) if content.contains("#EXTINF") => return Ok(content),
+            Ok(_) => last = "playlist empty".into(),
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err(last)
 }
 
 fn proxy_response(upstream: reqwest::Response) -> Response {

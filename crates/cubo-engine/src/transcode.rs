@@ -139,6 +139,10 @@ struct ActiveJob {
     generation: u64,
     probe: MediaProbe,
     child: Child,
+    /// Last playlist that contained at least one segment. ffmpeg rewrites
+    /// `media.m3u8` in place; a mid-write read should serve this instead of
+    /// 404ing — hls.js treats a missing EVENT playlist as a live restart.
+    last_playlist: Option<String>,
 }
 
 /// Runs the ffmpeg remux helper: turns MKV / incompatible-audio sources into
@@ -377,6 +381,7 @@ impl TranscodeManager {
             generation,
             probe: probe.clone(),
             child,
+            last_playlist: None,
         });
         Ok(job_dir)
     }
@@ -407,6 +412,21 @@ impl TranscodeManager {
             .as_ref()
             .filter(|job| job.key == key)
             .map(|job| job.dir.clone())
+    }
+
+    pub async fn remember_playlist(&self, key: &str, content: String) {
+        let mut active = self.active.lock().await;
+        if let Some(job) = active.as_mut().filter(|job| job.key == key) {
+            job.last_playlist = Some(content);
+        }
+    }
+
+    pub async fn last_playlist(&self, key: &str) -> Option<String> {
+        let active = self.active.lock().await;
+        active
+            .as_ref()
+            .filter(|job| job.key == key)
+            .and_then(|job| job.last_playlist.clone())
     }
 
     /// Source duration recorded when the job for `key` was started.
