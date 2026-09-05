@@ -1,5 +1,4 @@
-//! Structured file + stderr logging for Cubo Core, shared by the desktop
-//! shell and the headless CLI.
+//! Structured file + stderr logging for Cubo Core.
 //!
 //! Design notes:
 //! - File writes go through `tracing_appender::non_blocking`, so log emission
@@ -23,7 +22,7 @@ pub fn log_path(data_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Installs the global tracing subscriber exactly once. Later calls are
-/// no-ops (the desktop shell and CLI both call this defensively). Returns
+/// no-ops (later callers are defensive). Returns
 /// true when this call was the one that installed it.
 pub fn init(data_dir: &Path) -> bool {
     let logs_dir = data_dir.join("logs");
@@ -39,8 +38,7 @@ pub fn init(data_dir: &Path) -> bool {
 
     let subscriber = tracing_subscriber::registry()
         .with(env_filter)
-        // Terminal: compact, human-readable. The desktop webview never sees
-        // stderr, so this only matters for CLI runs and `tauri dev`.
+        // Terminal: compact, human-readable.
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)

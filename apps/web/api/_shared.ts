@@ -13,8 +13,7 @@ export function proxyPath(url: URL): { path: string; params: URLSearchParams } {
   return { path, params: url.searchParams };
 }
 
-// The desktop app's webview (tauri://localhost) calls these routes
-// cross-origin. GETs are simple requests, so ACAO on the response is
+// Cross-origin GETs are simple requests, so ACAO on the response is
 // sufficient — no preflight handling needed.
 export function sendJson(
   res: ServerResponse,

@@ -28,7 +28,6 @@ import {
   getLibrary,
   getSubtitleMatch,
   shipClientLog,
-  isDesktopRuntime,
   largestFileIndex,
   recordPlayback,
   startRemux,
@@ -635,23 +634,7 @@ export function WatchScreen({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       if (document.fullscreenElement) return;
-      void (async () => {
-        // The desktop app fullscreens the native window, which the DOM
-        // fullscreen API can't see — Escape should exit that, not the player.
-        if (isDesktopRuntime()) {
-          try {
-            const { getCurrentWindow } = await import('@tauri-apps/api/window');
-            const appWindow = getCurrentWindow();
-            if (await appWindow.isFullscreen()) {
-              await appWindow.setFullscreen(false);
-              return;
-            }
-          } catch {
-            // Fall through to navigation.
-          }
-        }
-        goBack();
-      })();
+      goBack();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -741,7 +724,7 @@ export function WatchScreen({
             type="button"
             onClick={goBack}
             aria-label="Go back"
-            className="desktop-back-offset absolute left-6 top-6 z-50 flex cursor-pointer items-center text-white transition-colors hover:text-white/80 sm:left-10 sm:top-10"
+            className="absolute left-6 top-6 z-50 flex cursor-pointer items-center text-white transition-colors hover:text-white/80 sm:left-10 sm:top-10"
           >
             <IoIosArrowBack size={26} className="drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]" />
           </button>

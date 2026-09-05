@@ -3,12 +3,13 @@ import { formatNextEpisodeLabel } from '@/lib/air-date';
 import gsap from 'gsap';
 import { useEffect, useRef, useState } from 'react';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
-import { IoPlay } from 'react-icons/io5';
 import { Link } from '@/components/link';
 import { formatRuntime } from '@/lib/format';
-import { watchLaterItem } from '@/lib/library';
+import { episodeLabel, latestHistoryForTitle, watchLaterItem } from '@/lib/library';
 import { AutoPreview } from './auto-preview';
+import { useCore } from './core-provider';
 import { WatchLaterButton } from './watch-later-button';
+import { WatchPlayLink } from './watch-play-link';
 
 /** Kino splits titles on a colon so the subtitle carries the display weight. */
 function HeroTitle({ title }: { title: string }) {
@@ -40,9 +41,16 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
     item.mediaType === 'tv'
       ? (nextAirs ?? 'Featured Show')
       : 'Featured Movie';
+  const { library } = useCore();
+  const resume = latestHistoryForTitle(library?.history, item.mediaType, item.id);
   const firstSeason = item.mediaType === 'tv' ? (item.seasons[0]?.seasonNumber ?? 1) : undefined;
+  const resumeLabel = episodeLabel(resume?.season, resume?.episode);
   const playHref =
-    item.mediaType === 'tv' ? watchHref(item, firstSeason ?? 1, 1) : watchHref(item);
+    item.mediaType === 'tv'
+      ? watchHref(item, resume?.season ?? firstSeason ?? 1, resume?.episode ?? 1)
+      : watchHref(item);
+  const playLabel =
+    item.mediaType === 'tv' && resumeLabel ? `Continue ${resumeLabel}` : 'Watch Now';
 
   const details = [
     year,
@@ -138,12 +146,7 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
             </div>
 
             <div className="flex items-center gap-4">
-              <Link href={playHref}>
-                <span className="flex h-12 w-48 cursor-pointer items-center justify-center gap-2 rounded-full bg-white font-semibold text-black">
-                  <IoPlay size={20} />
-                  Watch Now
-                </span>
-              </Link>
+              <WatchPlayLink href={playHref} label={playLabel} progress={resume?.progress ?? 0} />
               <WatchLaterButton item={watchLaterItem(item)} />
               <Link
                 href={titleHref(item)}

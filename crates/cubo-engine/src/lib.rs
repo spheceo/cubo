@@ -1,7 +1,7 @@
 //! Cubo Core: the torrent engine, HTTP bridge, and ffmpeg remux pipeline.
-//! Shared by the Tauri desktop shell and the headless `cubo serve` CLI —
-//! both expose the exact same /v1 API so the web app cannot tell them apart.
+//! The `cubo` CLI exposes the /v1 API the web app talks to.
 
+pub mod cache;
 pub mod engine;
 pub mod logging;
 pub mod pairing;

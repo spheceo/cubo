@@ -30,6 +30,7 @@ import {
 
 const GIGABYTE = 1024 ** 3;
 const CACHE_OPTIONS = [10, 25, 50, 100, 250];
+const RECOMMENDED_CACHE_GB = 10;
 
 type CoreTab = 'connection' | 'storage' | 'system';
 
@@ -43,7 +44,6 @@ export function CoreSettings({
   endpoint,
   connection,
   currentOriginCore = false,
-  embeddedCore = false,
   initialPairingEndpoint = '',
   onSave,
   onClose,
@@ -51,7 +51,6 @@ export function CoreSettings({
   endpoint: string;
   connection: LocalEngineConnection | null;
   currentOriginCore?: boolean;
-  embeddedCore?: boolean;
   /** Set when startup discovery found a Core that wants a pairing code. */
   initialPairingEndpoint?: string;
   onSave: (endpoint: string, connection: LocalEngineConnection | null) => void;
@@ -136,7 +135,6 @@ export function CoreSettings({
           <div className="flex items-center justify-between px-6 pt-5">
             <h2 id="core-settings-title" className="text-xl font-semibold">
               Core
-              {embeddedCore ? ' (built in)' : ''}
             </h2>
             <button
               type="button"
@@ -203,7 +201,6 @@ export function CoreSettings({
                 error={error}
                 connection={connection}
                 currentOriginCore={currentOriginCore}
-                embeddedCore={embeddedCore}
                 onDraftChange={setDraft}
                 onSaveEndpoint={(next, nextConnection) => onSave(next, nextConnection)}
                 onClose={onClose}
@@ -319,7 +316,6 @@ function ConnectionPane({
   error,
   connection,
   currentOriginCore,
-  embeddedCore,
   onDraftChange,
   onSaveEndpoint,
   onClose,
@@ -333,7 +329,6 @@ function ConnectionPane({
   error: string | null;
   connection: LocalEngineConnection | null;
   currentOriginCore: boolean;
-  embeddedCore: boolean;
   onDraftChange: (value: string) => void;
   onSaveEndpoint: (endpoint: string, connection: LocalEngineConnection | null) => void;
   onClose: () => void;
@@ -351,9 +346,7 @@ function ConnectionPane({
       <div className="space-y-6">
         <p className="text-sm leading-6 text-white/60">
           {currentOriginCore
-            ? embeddedCore
-              ? 'The desktop app includes Cubo Core, so playback and your library use it automatically.'
-              : 'This interface is served by Cubo Core, so playback uses it automatically.'
+            ? 'This interface is served by Cubo Core, so playback uses it automatically.'
             : 'Playback and your library run through this Core.'}
         </p>
 
@@ -362,7 +355,7 @@ function ConnectionPane({
             <span className="size-3 shrink-0 animate-pulse rounded-full bg-accent" />
             <div className="min-w-0">
               <p className="text-lg font-semibold">
-                {embeddedCore ? 'Built-in Core ready' : 'Core connected'}
+                Core connected
               </p>
               <p className="mt-1.5 truncate text-base text-faint">{connection.baseUrl}</p>
             </div>
@@ -424,9 +417,7 @@ function ConnectionPane({
         </label>
         <p className="mt-2 text-sm leading-6 text-white/60">
           {currentOriginCore
-            ? embeddedCore
-              ? 'The desktop app includes Cubo Core, so playback and your library use it automatically.'
-              : 'This interface is served by Cubo Core, so playback uses it automatically.'
+            ? 'This interface is served by Cubo Core, so playback uses it automatically.'
             : 'Leave this empty to find Cubo Core on this device, or enter a Tailscale address.'}
         </p>
         <input
@@ -554,8 +545,9 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
   return (
     <div className="space-y-6">
       <p className="leading-7 text-white/60">
-        Cubo keeps recently streamed pieces locally. When the limit is reached, the oldest cached
-        title is removed first.
+        Cubo downloads the title you&rsquo;re watching and pauses anything else.
+        10 GB is the recommended cache size. Background downloads also stop
+        when this computer has only 10 GB free.
       </p>
 
       <div className="space-y-5 rounded-2xl bg-[#25252570] p-5 backdrop-blur" aria-busy={!loaded}>
@@ -571,10 +563,11 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
           <div className="text-right text-sm text-faint">
             Maximum
             <Dropdown
-              value={cache ? Math.round(cache.maxBytes / GIGABYTE) : 25}
+              value={cache ? Math.round(cache.maxBytes / GIGABYTE) : RECOMMENDED_CACHE_GB}
               options={CACHE_OPTIONS.map((option) => ({
                 value: option,
-                label: `${option} GB`,
+                label:
+                  option === RECOMMENDED_CACHE_GB ? `${option} GB (recommended)` : `${option} GB`,
               }))}
               disabled={busy || !cache}
               onChange={(gigabytes) => void changeLimit(gigabytes)}

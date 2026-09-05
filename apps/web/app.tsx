@@ -1,9 +1,8 @@
 import { lazy, Suspense } from 'react';
 import { Outlet, Route, Routes, useLocation } from 'react-router';
 import { ConnectionBanner } from '@/components/connection-banner';
+import { StorageWarningBanner } from '@/components/storage-warning-banner';
 import { CoreProvider } from '@/components/core-provider';
-import { UpdateBanner } from '@/components/update-banner';
-import { DesktopWindowFrame } from '@/components/desktop-window-frame';
 import { ScrollToTop } from '@/components/scroll-to-top';
 import { SiteFooter } from '@/components/site-footer';
 import { SiteHeader } from '@/components/site-header';
@@ -41,11 +40,10 @@ function PageFallback() {
 export function App() {
   return (
     <>
-      <DesktopWindowFrame />
       <CoreProvider>
         <ScrollToTop />
+        <StorageWarningBanner />
         <ConnectionBanner />
-        <UpdateBanner />
         <Suspense fallback={<PageFallback />}>
           <Routes>
             <Route element={<SiteLayout />}>

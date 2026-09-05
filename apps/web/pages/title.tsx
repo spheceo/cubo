@@ -3,7 +3,9 @@ import { useQuery } from '@tanstack/react-query';
 import { useParams } from 'react-router';
 import { CatalogError } from '@/components/catalog-error';
 import { TitleSkeleton } from '@/components/page-skeletons';
+import { useCore } from '@/components/core-provider';
 import { TitleDetail } from '@/components/title-detail';
+import { latestHistoryForTitle } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { NotFoundPage } from './not-found';
@@ -17,9 +19,11 @@ export function TitlePage({ mediaType }: { mediaType: MediaType }) {
     ...tmdbQueries.details(mediaType, id),
     enabled: valid,
   });
-  const firstSeason = details.data?.seasons[0]?.seasonNumber ?? 1;
+  const { library } = useCore();
+  const resume = latestHistoryForTitle(library?.history, mediaType, id);
+  const seasonNumber = resume?.season ?? details.data?.seasons[0]?.seasonNumber ?? 1;
   const episodes = useQuery({
-    ...tmdbQueries.season(id, firstSeason),
+    ...tmdbQueries.season(id, seasonNumber),
     enabled: valid && mediaType === 'tv' && details.data != null,
   });
 

@@ -1,7 +1,7 @@
 //! Cubo CLI — `cubo persist`, `cubo serve`, `cubo search`, `cubo update`.
 //!
-//! Runs the exact same Core engine as the desktop app, headless. The web app
-//! at the canonical deployment auto-detects it on localhost:8765.
+//! Headless Cubo Core. The web app at the canonical deployment auto-detects
+//! it on localhost:8765.
 
 mod paths;
 mod persist;
@@ -149,7 +149,7 @@ async fn serve(no_open: bool) {
             // Common cause worth explaining plainly: another Cubo already runs.
             eprintln!("Cubo failed to start: {error}");
             eprintln!(
-                "If another copy of Cubo (desktop or CLI) is already running, stop it first — \
+                "If another copy of Cubo is already running, stop it first — \
                  only one engine can own port {port_hint}.",
                 port_hint = 8765
             );

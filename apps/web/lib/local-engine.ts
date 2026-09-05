@@ -113,6 +113,9 @@ export interface CacheStatus {
   directory: string;
   itemCount: number;
   entries: CacheEntry[];
+  diskFreeBytes?: number;
+  diskReserveBytes?: number;
+  diskPressure?: boolean;
 }
 
 type CoreRequestInit = RequestInit & {
@@ -142,8 +145,8 @@ function coreFetch(url: string, init: RequestInit = {}) {
 
   // targetAddressSpace is a Chromium Local Network Access hint. It is only
   // needed when a deployed HTTPS frontend reaches into the viewer's private
-  // network. WKWebView and loopback-to-loopback requests fail if it is set.
-  if (!isSameOrigin && !isDesktopRuntime() && !pageIsLoopback) {
+  // network. Loopback-to-loopback requests fail if it is set.
+  if (!isSameOrigin && !pageIsLoopback) {
     options.targetAddressSpace = isLoopback ? 'loopback' : 'local';
   }
 
@@ -153,20 +156,6 @@ function coreFetch(url: string, init: RequestInit = {}) {
 export function currentOriginCoreEndpoint(): string {
   if (typeof window === 'undefined') return '';
   return window.location.port === String(CORE_PORT) ? window.location.origin : '';
-}
-
-export function isDesktopRuntime(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-}
-
-export function embeddedCoreEndpoint(): string {
-  // Prefer the live page when it is already Core-hosted (port 8765), so the
-  // browser-served UI stays same-origin. The bundled desktop webview
-  // (tauri://localhost) uses localhost — macOS ATS allows that hostname from
-  // WKWebView, but blocks 127.0.0.1.
-  const hosted = currentOriginCoreEndpoint();
-  if (hosted) return hosted;
-  return `http://localhost:${CORE_PORT}`;
 }
 
 async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {
@@ -279,9 +268,9 @@ export async function discoverLocalEngine(
 ): Promise<LocalEngineConnection> {
   if (configuredEndpoint) return connectCoreEndpoint(configuredEndpoint);
 
-  // The page and Core almost always share a host — dev server on :3000,
+  // The page and Core almost always share a host — dev server on :4200,
   // Core on :8765 of the same machine. Probe the page's own hostname first
-  // so http://kenobi:3000 finds http://kenobi:8765 (works for Tailscale
+  // so http://kenobi:4200 finds http://kenobi:8765 (works for Tailscale
   // names, bare LAN names, and raw IPs alike), then fall back to loopback.
   const hosts: string[] = [];
   if (typeof window !== 'undefined' && window.location.hostname) {

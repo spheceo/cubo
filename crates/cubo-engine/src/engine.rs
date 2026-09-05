@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+use crate::cache;
 use crate::pairing::{PairAttempt, PairingManager};
 use crate::paths::home_dir;
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
@@ -41,18 +42,15 @@ const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Canonical web deployment. Release builds proxy browser visitors here and
 /// trust its origin. Set to "" to disable the browser gateway entirely.
 const WEB_DEPLOYMENT_URL: &str = "https://app.cubo.spheceo.com";
-// The bundled desktop webview reaches Core from tauri://localhost (macOS) or
-// http://tauri.localhost (Windows); the Vite dev server uses the loopback pair.
-const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
+// The Vite dev server uses the loopback pair.
+const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = [
     "http://localhost:4200",
     "http://127.0.0.1:4200",
-    "tauri://localhost",
-    "http://tauri.localhost",
 ];
 /// Ports a loopback or own-hostname origin may use: Core itself (pages it
-/// proxies), the web dev server, and the Tauri dev server. Any other local
-/// port is some unrelated app and gets no CORS access.
-const ALLOWED_ORIGIN_PORTS: [u16; 3] = [CORE_PORT, 4200, 1420];
+/// proxies) and the web dev server. Any other local port is some unrelated
+/// app and gets no CORS access.
+const ALLOWED_ORIGIN_PORTS: [u16; 2] = [CORE_PORT, 4200];
 
 pub struct Engine {
     bridge_port: u16,
@@ -78,6 +76,10 @@ struct BridgeState {
     /// remux segment). Playlist polls do not count — those continue while paused.
     playback_last_ms: Arc<AtomicU64>,
     cache_swap: Arc<Mutex<()>>,
+    /// True while the cache volume has no more than 10 GB free. The web UI
+    /// reads this from /v1/cache and shows a banner; maintenance pauses
+    /// background torrents for as long as it stays set.
+    disk_pressure: Arc<AtomicBool>,
     store: CoreStore,
     transcode: Arc<TranscodeManager>,
     /// Computed OpenSubtitles release matches, keyed by `{torrent}:{file}`.
@@ -138,10 +140,9 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 .join("cubo-state.json");
             let store = CoreStore::load(state_path.clone()).await?;
             // Pairing state lives in the SHARED Cubo data dir, not next to
-            // this embedder's store: the desktop app passes its Tauri
-            // app-data folder here, while `cubo pair` (a separate process)
-            // reads paths::data_dir() — both must see one secret, or codes
-            // printed in the terminal would never match a desktop Core.
+            // this process's store: `cubo pair` (a separate process) reads
+            // paths::data_dir() — both must see one secret, or codes printed
+            // in the terminal would never match a running Core.
             let pairing = Arc::new(PairingManager::load(&crate::paths::data_dir())?);
             let download_dir = resolve_startup_download_dir(&store, download_dir).await;
             let session = Session::new(download_dir.clone())
@@ -194,6 +195,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 download_dir: download_dir.clone(),
                 playback_last_ms: Arc::new(AtomicU64::new(0)),
                 cache_swap: Arc::new(Mutex::new(())),
+                disk_pressure: Arc::new(AtomicBool::new(false)),
                 store,
                 transcode: Arc::new(TranscodeManager::new(transcode_dir)),
                 subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
@@ -361,7 +363,7 @@ fn origin_host_port(origin: &HeaderValue) -> Option<(String, Option<u16>)> {
 }
 
 /// Which browser origins may call the /v1 API. Exact allowlisted origins
-/// (dev servers, the Tauri webview, the web deployment) pass as-is; loopback
+/// (dev servers and the web deployment) pass as-is; loopback
 /// and own-hostname/Tailscale origins pass only on Cubo's own ports, so an
 /// unrelated local app on some other port is not silently trusted.
 struct OriginPolicy {
@@ -490,8 +492,7 @@ fn allowed_origins(web_origin: Option<&str>) -> Arc<Vec<HeaderValue>> {
 }
 
 /// The deployment Core proxies browser-hosted pages to. Debug builds use the
-/// local Vite server; release builds use WEB_DEPLOYMENT_URL. The desktop app
-/// itself bundles the UI, so only the "open Core in a browser" flow needs this.
+/// local Vite server; release builds use WEB_DEPLOYMENT_URL.
 fn resolve_web_origin() -> Result<Option<Arc<str>>, String> {
     let origin = if cfg!(debug_assertions) {
         "http://127.0.0.1:4200"
@@ -751,7 +752,15 @@ async fn record_playback(
     // Ticks arrive every ~10 s; echoing the whole library back each time
     // serialized hundreds of items for a response nobody reads.
     match state.store.record_playback(update).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            let maintenance = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = apply_download_window(&maintenance).await {
+                    tracing::warn!(target: "engine", error = %error, "download window failed");
+                }
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
@@ -877,13 +886,20 @@ async fn cache_status(State(state): State<BridgeState>, headers: HeaderMap) -> R
     }
     let snapshot = state.store.snapshot().await;
     let download_dir = state.current_download_dir().await;
-    match cache_size(download_dir.clone()).await {
+    let transcode_dir = state.transcode.dir().to_path_buf();
+    let free_bytes = system::volume_free_bytes(&download_dir);
+    let tight = cache::disk_is_tight(free_bytes);
+    state.disk_pressure.store(tight, Ordering::Release);
+    match cache_size(download_dir.clone(), transcode_dir).await {
         Ok(used_bytes) => Json(json!({
             "usedBytes": used_bytes,
             "maxBytes": snapshot.cache.max_bytes,
             "directory": download_dir.to_string_lossy(),
             "itemCount": snapshot.cache_entries.len(),
             "entries": snapshot.cache_entries,
+            "diskFreeBytes": free_bytes,
+            "diskReserveBytes": cache::DISK_RESERVE_BYTES,
+            "diskPressure": tight,
         }))
         .into_response(),
         Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -1027,9 +1043,12 @@ fn wipe_dir_contents(dir: &std::path::Path) -> Result<(), String> {
 
 async fn cache_maintenance_loop(state: BridgeState) {
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         if let Err(error) = enforce_cache_limit(&state).await {
             tracing::warn!(target: "engine", error = %error, "cache maintenance failed");
+        }
+        if let Err(error) = apply_download_window(&state).await {
+            tracing::warn!(target: "engine", error = %error, "download window failed");
         }
     }
 }
@@ -1037,26 +1056,49 @@ async fn cache_maintenance_loop(state: BridgeState) {
 async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     let snapshot = state.store.snapshot().await;
     let download_dir = state.current_download_dir().await;
-    let mut used_bytes = cache_size(download_dir.clone()).await?;
-    if used_bytes <= snapshot.cache.max_bytes {
+    let transcode_dir = state.transcode.dir().to_path_buf();
+    let free_bytes = system::volume_free_bytes(&download_dir);
+    let tight = cache::disk_is_tight(free_bytes);
+    state.disk_pressure.store(tight, Ordering::Release);
+
+    let mut used_bytes = cache_size(download_dir.clone(), transcode_dir).await?;
+    let over_budget = used_bytes > snapshot.cache.max_bytes;
+    if !over_budget && !tight {
         return Ok(());
     }
+
+    let playing = state.is_playback_active();
+    let active_id = playing
+        .then(|| {
+            snapshot
+                .cache_entries
+                .iter()
+                .max_by_key(|entry| entry.last_accessed_at)
+                .map(|entry| {
+                    entry
+                        .torrent_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| entry.info_hash.clone())
+                })
+        })
+        .flatten();
 
     let mut entries = snapshot.cache_entries;
     entries.sort_by_key(|entry| entry.last_accessed_at);
     for entry in entries {
-        if used_bytes <= snapshot.cache.max_bytes {
-            return Ok(());
+        if used_bytes <= snapshot.cache.max_bytes && !tight {
+            break;
         }
         let id = entry
             .torrent_id
             .map(|value| value.to_string())
             .unwrap_or_else(|| entry.info_hash.clone());
+        if active_id.as_deref() == Some(id.as_str()) {
+            continue;
+        }
         // Delete through rqbit when it still knows the torrent, and always
         // remove the recorded files — after a restart only the files exist.
         if rqbit_delete(state, &id).await.is_ok() {
-            // Charge the entry's own files against the running total instead
-            // of re-walking the whole tree after every deletion.
             let freed = entry_files_size(&entry.files).await;
             remove_entry_files(&download_dir, &entry.files).await;
             state.store.remove_cache_entry(&id).await?;
@@ -1064,18 +1106,92 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         }
     }
 
-    // Still over the limit: whatever remains is untracked (downloaded before
-    // file paths were recorded). Reclaim the oldest items, sparing anything
-    // touched in the last 10 minutes — that could be an active stream.
+    // Playback finished (or never started): the last title can go too if it
+    // still blows the budget. While watching we keep that one file.
+    if !playing && used_bytes > snapshot.cache.max_bytes {
+        let leftover = state.store.snapshot().await.cache_entries;
+        for entry in leftover {
+            if used_bytes <= snapshot.cache.max_bytes {
+                break;
+            }
+            let id = entry
+                .torrent_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| entry.info_hash.clone());
+            if rqbit_delete(state, &id).await.is_ok() {
+                let freed = entry_files_size(&entry.files).await;
+                remove_entry_files(&download_dir, &entry.files).await;
+                state.store.remove_cache_entry(&id).await?;
+                used_bytes = used_bytes.saturating_sub(freed);
+            }
+        }
+    }
+
+    if used_bytes <= snapshot.cache.max_bytes {
+        return Ok(());
+    }
+    if playing {
+        return Ok(());
+    }
+
+    // Still over: untracked leftovers (downloaded before file paths were
+    // recorded). Playback is idle, so recently-written files can go.
     let max_bytes = snapshot.cache.max_bytes;
     tokio::task::spawn_blocking(move || reclaim_untracked(&download_dir, max_bytes))
         .await
         .map_err(|error| error.to_string())?
 }
 
-fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String> {
-    const ACTIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Pause background torrents. The title being watched (or just added) keeps
+/// peers unless the disk is already at the 10 GB floor *and* we have a
+/// starter buffer — rqbit is not sequential, so total progress cannot be
+/// used as a happy-path "window is full" signal.
+async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
+    let torrents = rqbit_list_torrents(state).await?;
+    if torrents.is_empty() {
+        return Ok(());
+    }
 
+    let tight = state.disk_pressure.load(Ordering::Acquire);
+    let playing = state.is_playback_active();
+    let snapshot = state.store.snapshot().await;
+    let now = store::now_millis();
+    let active = snapshot
+        .cache_entries
+        .iter()
+        .max_by_key(|entry| entry.last_accessed_at)
+        .filter(|entry| {
+            playing || now.saturating_sub(entry.last_accessed_at) < PLAYBACK_GUARD_MS
+        });
+
+    for torrent in torrents {
+        let is_active = active.is_some_and(|entry| {
+            entry.info_hash == torrent
+                || entry.torrent_id.map(|id| id.to_string()).as_deref() == Some(torrent.as_str())
+        });
+        if !is_active {
+            let _ = rqbit_pause(state, &torrent).await;
+            continue;
+        }
+
+        if tight {
+            let Some(stats) = rqbit_stats(state, &torrent).await else {
+                continue;
+            };
+            if cache::has_emergency_buffer(stats.progress_bytes) {
+                let _ = rqbit_pause(state, &torrent).await;
+            } else {
+                let _ = rqbit_start(state, &torrent).await;
+            }
+            continue;
+        }
+
+        let _ = rqbit_start(state, &torrent).await;
+    }
+    Ok(())
+}
+
+fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String> {
     let mut used_bytes = directory_size(dir).map_err(|error| error.to_string())?;
     let mut items: Vec<(std::path::PathBuf, std::time::SystemTime)> = std::fs::read_dir(dir)
         .map_err(|error| error.to_string())?
@@ -1087,15 +1203,10 @@ fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String
         .collect();
     items.sort_by_key(|(_, modified)| *modified);
 
-    for (path, modified) in items {
+    for (path, _) in items {
         if used_bytes <= max_bytes {
             return Ok(());
         }
-        if modified.elapsed().unwrap_or_default() < ACTIVE_GRACE {
-            continue;
-        }
-        // Track what each removal frees so the tree is walked once, not once
-        // per deletion.
         let freed = if path.is_dir() {
             directory_size(&path).unwrap_or(0)
         } else {
@@ -1155,11 +1266,84 @@ async fn delete_all_torrents(state: &BridgeState) -> Result<(), String> {
     Ok(())
 }
 
-async fn cache_size(download_dir: PathBuf) -> Result<u64, String> {
-    tokio::task::spawn_blocking(move || directory_size(&download_dir))
+async fn cache_size(download_dir: PathBuf, transcode_dir: PathBuf) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || {
+        Ok::<u64, std::io::Error>(
+            directory_size(&download_dir)? + directory_size(&transcode_dir)?,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+struct TorrentStatsSnapshot {
+    #[serde(default)]
+    progress_bytes: u64,
+}
+
+async fn rqbit_list_torrents(state: &BridgeState) -> Result<Vec<String>, String> {
+    let response = state
+        .client
+        .get(format!("http://127.0.0.1:{}/torrents", state.rqbit_port))
+        .send()
         .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let list = response
+        .json::<TorrentListResponse>()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(list
+        .torrents
+        .into_iter()
+        .map(|torrent| {
+            torrent
+                .id
+                .map(|value| value.to_string())
+                .unwrap_or(torrent.info_hash)
+        })
+        .collect())
+}
+
+async fn rqbit_stats(state: &BridgeState, id: &str) -> Option<TorrentStatsSnapshot> {
+    let response = state
+        .client
+        .get(format!(
+            "http://127.0.0.1:{}/torrents/{id}/stats/v1",
+            state.rqbit_port
+        ))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+async fn rqbit_pause(state: &BridgeState, id: &str) -> Result<(), String> {
+    rqbit_action(state, id, "pause").await
+}
+
+async fn rqbit_start(state: &BridgeState, id: &str) -> Result<(), String> {
+    rqbit_action(state, id, "start").await
+}
+
+async fn rqbit_action(state: &BridgeState, id: &str, action: &str) -> Result<(), String> {
+    let response = state
+        .client
+        .post(format!(
+            "http://127.0.0.1:{}/torrents/{id}/{action}",
+            state.rqbit_port
+        ))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() || response.status().as_u16() == 404 {
+        return Ok(());
+    }
+    Err(format!("rqbit {action} failed ({})", response.status()))
 }
 
 fn directory_size(path: &std::path::Path) -> std::io::Result<u64> {
@@ -1369,6 +1553,9 @@ async fn add_torrent(
             };
 
             if status.is_success() {
+                // Cover the gap before the first segment marks playback, so
+                // the 5s maintainer does not pause this torrent on add.
+                state.mark_playback();
                 let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
                 let torrent_id = parsed
                     .as_ref()
@@ -2094,6 +2281,7 @@ mod tests {
             download_dir: Arc::new(RwLock::new(test_dir)),
             playback_last_ms: Arc::new(AtomicU64::new(0)),
             cache_swap: Arc::new(Mutex::new(())),
+            disk_pressure: Arc::new(AtomicBool::new(false)),
             store,
             transcode: Arc::new(TranscodeManager::new(transcode_dir)),
             subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
@@ -2152,16 +2340,6 @@ mod tests {
             .await
             .expect("health response");
         assert_eq!(health.status(), StatusCode::OK);
-        let desktop_dev = client
-            .get(format!("{base_url}/v1/health"))
-            .header(ORIGIN, "http://localhost:1420")
-            .send()
-            .await
-            .expect("desktop loopback origin response");
-        assert_eq!(
-            desktop_dev.headers().get("access-control-allow-origin"),
-            Some(&HeaderValue::from_static("http://localhost:1420"))
-        );
         // Loopback origins on unrelated ports (some other local app) are NOT
         // trusted — "it runs on my machine" is not an identity.
         let stranger_local = client

@@ -19,8 +19,7 @@ export function SiteHeader() {
       <header className="relative z-10">
         <nav
           aria-label="Primary"
-          data-tauri-drag-region
-          className="desktop-header-shell relative z-10 flex h-16 items-center gap-5 px-6 sm:gap-8 sm:px-10"
+          className="relative z-10 flex h-16 items-center gap-5 px-6 sm:gap-8 sm:px-10"
         >
           <Link
             href="/"
