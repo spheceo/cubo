@@ -127,16 +127,58 @@ export interface PlaybackCapabilities {
   hevc: boolean;
 }
 
+/** Season + episode being requested, so season packs can be ranked below
+ *  single-episode releases of the same quality. */
+export interface EpisodeHint {
+  season: number;
+  episode: number;
+}
+
+/** A complete-season dump is almost never under 8 GB; a single 1080p
+ *  episode rarely is. Used only when the name does not already say. */
+const SEASON_PACK_SIZE_BYTES = 8 * 1024 * 1024 * 1024;
+
+function streamHint(stream: Stream): string {
+  return `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
+}
+
+function episodeToken(season: number, episode: number): RegExp {
+  return new RegExp(
+    `(?:s0*${season}[ ._-]?e0*${episode}|${season}x0*${episode})(?:\\D|$)`,
+    'i',
+  );
+}
+
+function seasonPackToken(season: number): RegExp {
+  return new RegExp(
+    `(?:\\bcomplete\\b|\\bseason[ ._-]*0*${season}\\b|\\bs0*${season}\\b(?![ ._-]?e\\d))`,
+    'i',
+  );
+}
+
+/** 0 = this episode, 1 = unknown, 2 = season pack / complete dump.
+ *  Size used to prefer a 2 GB S02E01 over a 26 GB "S02 COMPLETE". */
+export function seasonPackRank(stream: Stream, episode?: EpisodeHint | null): number {
+  if (!episode) return 0;
+  const hint = streamHint(stream);
+  if (episodeToken(episode.season, episode.episode).test(hint)) return 0;
+  if (seasonPackToken(episode.season).test(hint)) return 2;
+  if ((stream.sizeBytes ?? 0) >= SEASON_PACK_SIZE_BYTES) return 2;
+  return 1;
+}
+
 /** Playable streams, best first: original-language audio (a dubbed release
  *  should never win the auto-pick), then real releases over cinema captures,
  *  then preferred quality, then direct-play
- *  files (fully seekable, no converter), then a healthy swarm, then the
- *  larger file (higher bitrate). When the connected Core can transcode, MKV
- *  and exotic-audio sources join the pool as the fallback within each tier. */
+ *  files (fully seekable, no converter), then a single episode over a
+ *  season pack, then a healthy swarm, then the larger file (higher bitrate).
+ *  When the connected Core can transcode, MKV and exotic-audio sources join
+ *  the pool as the fallback within each tier. */
 export function rankStreams(
   streams: Stream[],
   capabilities: PlaybackCapabilities,
   nativeLanguage: string | null = null,
+  episode?: EpisodeHint | null,
 ): Stream[] {
   return streams
     .filter((stream) => isPlayableStream(stream, capabilities.transcode, capabilities.hevc))
@@ -151,6 +193,8 @@ export function rankStreams(
       const byDirect =
         Number(isBrowserPlayableStream(b)) - Number(isBrowserPlayableStream(a));
       if (byDirect !== 0) return byDirect;
+      const byPack = seasonPackRank(a, episode) - seasonPackRank(b, episode);
+      if (byPack !== 0) return byPack;
       const byBucket = seederBucket(b.seeders) - seederBucket(a.seeders);
       if (byBucket !== 0) return byBucket;
       const bySize = (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0);
@@ -165,6 +209,7 @@ export function rankStreams(
 export function rankPreviewStreams(
   streams: Stream[],
   nativeLanguage: string | null = null,
+  episode?: EpisodeHint | null,
 ): Stream[] {
   const direct = streams.filter(isBrowserPlayableStream);
   const goodQuality = direct.filter((stream) =>
@@ -178,6 +223,8 @@ export function rankPreviewStreams(
     if (byLanguage !== 0) return byLanguage;
     const byCapture = capturedReleaseRank(a) - capturedReleaseRank(b);
     if (byCapture !== 0) return byCapture;
+    const byPack = seasonPackRank(a, episode) - seasonPackRank(b, episode);
+    if (byPack !== 0) return byPack;
     const byBucket = seederBucket(b.seeders) - seederBucket(a.seeders);
     if (byBucket !== 0) return byBucket;
     const bySeeders = (b.seeders ?? 0) - (a.seeders ?? 0);
