@@ -400,7 +400,7 @@ export async function waitUntilLive(
   engine: LocalEngineConnection,
   idOrHash: number | string,
   {
-    timeoutMs = 60_000,
+    timeoutMs = 90_000,
     onProgress,
     signal,
   }: {
@@ -421,7 +421,10 @@ export async function waitUntilLive(
     if (!response.ok) throw new Error(`Cubo core status failed (${response.status})`);
     const stats = (await response.json()) as TorrentStatsRaw;
     onProgress?.(toProgress(stats));
-    if (stats.state === 'live' || stats.state === 'paused') return;
+    // `paused` is not ready — the cache maintainer pauses background
+    // torrents, and treating that as success sent remux/ffprobe at a
+    // torrent that would never fetch more pieces.
+    if (stats.state === 'live') return;
     if (stats.state === 'error') throw new Error(stats.error ?? 'The stream failed');
     if (Date.now() > deadline) throw new Error('The stream took too long to start');
     await new Promise((resolve) => window.setTimeout(resolve, 500));

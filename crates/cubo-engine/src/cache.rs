@@ -7,6 +7,10 @@
 
 /// Bytes Cubo always leaves free on the cache volume.
 pub const DISK_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Pause even the title being watched only when the volume is about to
+/// hit ENOSPC. The 10 GB reserve drives eviction of *other* titles — it
+/// must not starve remux of peers.
+pub const DISK_CRITICAL_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Seconds of video to keep ahead of the playhead before pausing peers.
 pub const PLAYBACK_LOOKAHEAD_SECS: f64 = 120.0;
@@ -21,6 +25,14 @@ const WINDOW_MAX_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub fn disk_is_tight(free_bytes: Option<u64>) -> bool {
     match free_bytes {
         Some(free) => free <= DISK_RESERVE_BYTES,
+        None => false,
+    }
+}
+
+/// True when the next write is likely to fail. Unknown volume is not this.
+pub fn disk_is_critical(free_bytes: Option<u64>) -> bool {
+    match free_bytes {
+        Some(free) => free <= DISK_CRITICAL_BYTES,
         None => false,
     }
 }
@@ -72,6 +84,15 @@ mod tests {
         assert!(disk_is_tight(Some(0)));
         assert!(!disk_is_tight(Some(DISK_RESERVE_BYTES + 1)));
         assert!(!disk_is_tight(None));
+    }
+
+    #[test]
+    fn critical_is_much_tighter_than_the_reserve() {
+        assert!(!disk_is_critical(Some(DISK_RESERVE_BYTES)));
+        assert!(!disk_is_critical(Some(DISK_CRITICAL_BYTES + 1)));
+        assert!(disk_is_critical(Some(DISK_CRITICAL_BYTES)));
+        assert!(disk_is_critical(Some(0)));
+        assert!(!disk_is_critical(None));
     }
 
     #[test]

@@ -130,10 +130,10 @@ struct HlsQuery {
 /// Progress ticks every 10s while playing; this window covers a missed tick
 /// plus the pause report so a swap is refused until the viewer actually stops.
 const PLAYBACK_GUARD_MS: u64 = 20_000;
-/// Keep a just-added title on disk (and unpaused) until ffmpeg has had time
-/// to pull the first segments. The 20 s playback guard expires before that
-/// on a cold swarm, and the 10 GB cap then deleted the torrent.
-const CACHE_STARTUP_GRACE_MS: u64 = 180_000;
+/// Keep a just-added title on disk (and unpaused) through metadata, remux
+/// probe, and the first segments. The 20 s playback guard expires in the
+/// middle of ffprobe; 3 minutes was still shorter than a cold seek-remux.
+const CACHE_STARTUP_GRACE_MS: u64 = 600_000;
 
 static ENGINE: OnceCell<Engine> = OnceCell::const_new();
 
@@ -1232,17 +1232,20 @@ fn cache_entry_is_protected(
     playing && active_id == Some(id.as_str())
 }
 
-/// Pause background torrents. The title being watched (or just added) keeps
-/// peers unless the disk is already at the 10 GB floor *and* we have a
-/// starter buffer — rqbit is not sequential, so total progress cannot be
-/// used as a happy-path "window is full" signal.
+/// Pause background torrents only. The title being watched (or just added)
+/// keeps peers so remux/ffprobe can read the header. rqbit is not
+/// sequential — a 512 MB "window" is random pieces, not a playable prefix,
+/// and pausing on it is what made starts hang. The 10 GB reserve evicts
+/// *other* titles; we only pause the active one when the volume is about
+/// to hit ENOSPC.
 async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     let torrents = rqbit_list_torrents(state).await?;
     if torrents.is_empty() {
         return Ok(());
     }
 
-    let tight = state.disk_pressure.load(Ordering::Acquire);
+    let download_dir = state.current_download_dir().await;
+    let critical = cache::disk_is_critical(system::volume_free_bytes(&download_dir));
     let playing = state.is_playback_active();
     let snapshot = state.store.snapshot().await;
     let now = store::now_millis();
@@ -1262,19 +1265,11 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
             continue;
         }
 
-        if tight {
-            let Some(stats) = rqbit_stats(state, &torrent).await else {
-                continue;
-            };
-            if cache::has_emergency_buffer(stats.progress_bytes) {
-                let _ = rqbit_pause(state, &torrent).await;
-            } else {
-                let _ = rqbit_start(state, &torrent).await;
-            }
-            continue;
+        if critical {
+            let _ = rqbit_pause(state, &torrent).await;
+        } else {
+            let _ = rqbit_start(state, &torrent).await;
         }
-
-        let _ = rqbit_start(state, &torrent).await;
     }
     Ok(())
 }
@@ -1371,12 +1366,6 @@ async fn cache_size(download_dir: PathBuf, transcode_dir: PathBuf) -> Result<u64
     .map_err(|error| error.to_string())
 }
 
-#[derive(Deserialize)]
-struct TorrentStatsSnapshot {
-    #[serde(default)]
-    progress_bytes: u64,
-}
-
 async fn rqbit_list_torrents(state: &BridgeState) -> Result<Vec<String>, String> {
     let response = state
         .client
@@ -1400,28 +1389,22 @@ async fn rqbit_list_torrents(state: &BridgeState) -> Result<Vec<String>, String>
         .collect())
 }
 
-async fn rqbit_stats(state: &BridgeState, id: &str) -> Option<TorrentStatsSnapshot> {
-    let response = state
-        .client
-        .get(format!(
-            "http://127.0.0.1:{}/torrents/{id}/stats/v1",
-            state.rqbit_port
-        ))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response.json().await.ok()
-}
-
 async fn rqbit_pause(state: &BridgeState, id: &str) -> Result<(), String> {
     rqbit_action(state, id, "pause").await
 }
 
 async fn rqbit_start(state: &BridgeState, id: &str) -> Result<(), String> {
     rqbit_action(state, id, "start").await
+}
+
+/// Playback and remux read through rqbit's stream endpoint. If the
+/// maintainer paused this torrent, ffmpeg sits on a socket that never
+/// receives pieces — unpause and refresh the playback guard first.
+async fn ensure_torrent_running(state: &BridgeState, id: &str) {
+    state.mark_playback();
+    if let Err(error) = rqbit_start(state, id).await {
+        tracing::debug!(target: "engine", error = %error, id, "could not start torrent");
+    }
 }
 
 async fn rqbit_action(state: &BridgeState, id: &str, action: &str) -> Result<(), String> {
@@ -1853,8 +1836,9 @@ async fn torrent_stats(
         return unauthorized();
     }
     // Buffering polls this until the torrent is live — treat that as watching
-    // so a directory swap cannot yank the files out from under a start.
-    state.mark_playback();
+    // so a directory swap cannot yank the files out from under a start,
+    // and unpause if the maintainer already stopped peers.
+    ensure_torrent_running(&state, &id).await;
 
     match state
         .client
@@ -1879,6 +1863,7 @@ async fn stream_torrent(
     if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
+    ensure_torrent_running(&state, &id).await;
 
     let mut request = state.client.get(format!(
         "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
@@ -2049,6 +2034,7 @@ async fn hls_file(
     if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
+    ensure_torrent_running(&state, &id).await;
     if !state.transcode.available() {
         return bridge_error(
             StatusCode::NOT_IMPLEMENTED,
