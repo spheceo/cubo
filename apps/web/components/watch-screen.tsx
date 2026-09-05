@@ -272,6 +272,7 @@ export function WatchScreen({
         const added = await addMagnet(connection, buildMagnet(stream), {
           mediaKey: itemKey,
           title,
+          fileIndex: stream.fileIdx,
         });
         if (stale()) return;
 
@@ -418,6 +419,7 @@ export function WatchScreen({
           found,
           { transcode: connection?.transcode ?? false, hevc: supportsHevcRemux() },
           originalLanguage,
+          season != null && episode != null ? { season, episode } : null,
         );
         setSources(ranked);
         if (connection) {

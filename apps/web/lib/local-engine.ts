@@ -84,7 +84,7 @@ export interface LocalEngineConnection {
 export interface AddedTorrent {
   id: number | null;
   infoHash: string;
-  files: { name: string; length: number }[];
+  files: { name: string; length: number; included?: boolean }[];
 }
 
 export interface PlaybackUpdate {
@@ -319,11 +319,14 @@ export function buildMagnet(stream: Stream): string {
 export async function addMagnet(
   engine: LocalEngineConnection,
   magnet: string,
-  metadata?: { mediaKey?: string; title?: string },
+  metadata?: { mediaKey?: string; title?: string; fileIndex?: number | null },
 ): Promise<AddedTorrent> {
   const headers = new Headers({ 'Content-Type': 'text/plain' });
   if (metadata?.mediaKey) headers.set('X-Cubo-Media-Key', metadata.mediaKey);
   if (metadata?.title) headers.set('X-Cubo-Title', encodeURIComponent(metadata.title));
+  if (metadata?.fileIndex != null && Number.isFinite(metadata.fileIndex)) {
+    headers.set('X-Cubo-File-Index', String(metadata.fileIndex));
+  }
   const response = await engineFetch(engine, '/v1/torrents', {
     method: 'POST',
     headers,
@@ -352,7 +355,10 @@ export async function addMagnet(
   const data = (await response.json()) as {
     id?: number | null;
     info_hash?: string;
-    details?: { info_hash?: string; files?: { name: string; length: number }[] };
+    details?: {
+      info_hash?: string;
+      files?: { name: string; length: number; included?: boolean }[];
+    };
   };
   return {
     id: data.id ?? null,
@@ -526,12 +532,21 @@ export async function startRemux(
   };
 }
 
-export function largestFileIndex(files: { length: number }[]): number {
-  let largest = 0;
-  for (let index = 1; index < files.length; index += 1) {
-    if (files[index].length > files[largest].length) largest = index;
+/** Index of the file Cubo should play. When rqbit marked a subset
+ *  `included` (season-pack `only_files`), pick among those so a 26 GB pack
+ *  does not resolve to a different episode's file. */
+export function largestFileIndex(
+  files: { length: number; included?: boolean }[],
+): number {
+  const preferIncluded = files.some((file) => file.included === true);
+  let largest = -1;
+  for (let index = 0; index < files.length; index += 1) {
+    if (preferIncluded && files[index].included !== true) continue;
+    if (largest < 0 || files[index].length > files[largest].length) {
+      largest = index;
+    }
   }
-  return largest;
+  return largest < 0 ? 0 : largest;
 }
 
 export async function getLibrary(

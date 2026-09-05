@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Command;
@@ -39,6 +39,10 @@ use crate::transcode::TranscodeManager;
 
 const CORE_PORT: u16 = 8765;
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// Catalog pages and static assets. Fail before the old 45 s hang when the
+/// deployed web origin is unreachable. `/api/*` (Torrentio) gets longer.
+const WEB_PROXY_TIMEOUT: Duration = Duration::from_secs(8);
+const WEB_PROXY_API_TIMEOUT: Duration = Duration::from_secs(20);
 /// Canonical web deployment. Release builds proxy browser visitors here and
 /// trust its origin. Set to "" to disable the browser gateway entirely.
 const WEB_DEPLOYMENT_URL: &str = "https://app.cubo.spheceo.com";
@@ -126,6 +130,10 @@ struct HlsQuery {
 /// Progress ticks every 10s while playing; this window covers a missed tick
 /// plus the pause report so a swap is refused until the viewer actually stops.
 const PLAYBACK_GUARD_MS: u64 = 20_000;
+/// Keep a just-added title on disk (and unpaused) until ffmpeg has had time
+/// to pull the first segments. The 20 s playback guard expires before that
+/// on a cold swarm, and the 10 GB cap then deleted the torrent.
+const CACHE_STARTUP_GRACE_MS: u64 = 180_000;
 
 static ENGINE: OnceCell<Engine> = OnceCell::const_new();
 
@@ -934,10 +942,11 @@ async fn delete_cache_item(
         .unwrap_or_default();
     let download_dir = state.current_download_dir().await;
     remove_entry_files(&download_dir, &entry_files).await;
-
     if let Err(error) = state.store.remove_cache_entry(&id).await {
         return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
+    let remaining = state.store.snapshot().await.cache_entries;
+    remove_deleted_torrent_trees(&download_dir, &entry_files, &remaining).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1022,6 +1031,58 @@ async fn remove_entry_files(download_dir: &std::path::Path, files: &[String]) {
     .await;
 }
 
+/// After a torrent drop, wipe that title's top-level folder (or file) if
+/// nothing still in the index lives there. rqbit delete can leave sparse
+/// siblings that `metadata.len()` still counts against the 10 GB cap.
+async fn remove_deleted_torrent_trees(
+    download_dir: &std::path::Path,
+    deleted_files: &[String],
+    remaining: &[store::CacheEntry],
+) {
+    let download_dir = download_dir.to_path_buf();
+    let deleted = deleted_files.to_vec();
+    let remaining_files: Vec<String> = remaining
+        .iter()
+        .flat_map(|entry| entry.files.iter().cloned())
+        .collect();
+    let _ = tokio::task::spawn_blocking(move || {
+        wipe_unclaimed_roots(&download_dir, &deleted, &remaining_files);
+    })
+    .await;
+}
+
+fn wipe_unclaimed_roots(
+    download_dir: &std::path::Path,
+    deleted_files: &[String],
+    remaining_files: &[String],
+) {
+    let mut roots = HashSet::new();
+    for file in deleted_files {
+        if let Some(root) = cache_root_of(download_dir, std::path::Path::new(file)) {
+            roots.insert(root);
+        }
+    }
+    for root in roots {
+        let claimed = remaining_files
+            .iter()
+            .any(|path| std::path::Path::new(path).starts_with(&root));
+        if claimed {
+            continue;
+        }
+        if root.is_dir() {
+            let _ = std::fs::remove_dir_all(&root);
+        } else {
+            let _ = std::fs::remove_file(&root);
+        }
+    }
+}
+
+fn cache_root_of(download_dir: &std::path::Path, file: &std::path::Path) -> Option<std::path::PathBuf> {
+    let relative = file.strip_prefix(download_dir).ok()?;
+    let first = relative.components().next()?;
+    Some(download_dir.join(first))
+}
+
 fn wipe_dir_contents(dir: &std::path::Path) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -1068,32 +1129,26 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     }
 
     let playing = state.is_playback_active();
+    let now = store::now_millis();
     let active_id = playing
         .then(|| {
             snapshot
                 .cache_entries
                 .iter()
                 .max_by_key(|entry| entry.last_accessed_at)
-                .map(|entry| {
-                    entry
-                        .torrent_id
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| entry.info_hash.clone())
-                })
+                .map(cache_entry_id)
         })
         .flatten();
 
+    let mut deleted_files: Vec<String> = Vec::new();
     let mut entries = snapshot.cache_entries;
     entries.sort_by_key(|entry| entry.last_accessed_at);
     for entry in entries {
         if used_bytes <= snapshot.cache.max_bytes && !tight {
             break;
         }
-        let id = entry
-            .torrent_id
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| entry.info_hash.clone());
-        if active_id.as_deref() == Some(id.as_str()) {
+        let id = cache_entry_id(&entry);
+        if cache_entry_is_protected(&entry, now, playing, active_id.as_deref()) {
             continue;
         }
         // Delete through rqbit when it still knows the torrent, and always
@@ -1101,45 +1156,80 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         if rqbit_delete(state, &id).await.is_ok() {
             let freed = entry_files_size(&entry.files).await;
             remove_entry_files(&download_dir, &entry.files).await;
+            deleted_files.extend(entry.files.iter().cloned());
             state.store.remove_cache_entry(&id).await?;
             used_bytes = used_bytes.saturating_sub(freed);
         }
     }
 
     // Playback finished (or never started): the last title can go too if it
-    // still blows the budget. While watching we keep that one file.
+    // still blows the budget — except a title still inside the startup
+    // grace, which has not had time to produce segments yet.
     if !playing && used_bytes > snapshot.cache.max_bytes {
         let leftover = state.store.snapshot().await.cache_entries;
         for entry in leftover {
             if used_bytes <= snapshot.cache.max_bytes {
                 break;
             }
-            let id = entry
-                .torrent_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| entry.info_hash.clone());
+            if entry_in_startup_grace(&entry, now) {
+                continue;
+            }
+            let id = cache_entry_id(&entry);
             if rqbit_delete(state, &id).await.is_ok() {
                 let freed = entry_files_size(&entry.files).await;
                 remove_entry_files(&download_dir, &entry.files).await;
+                deleted_files.extend(entry.files.iter().cloned());
                 state.store.remove_cache_entry(&id).await?;
                 used_bytes = used_bytes.saturating_sub(freed);
             }
         }
     }
 
+    if !deleted_files.is_empty() {
+        let remaining = state.store.snapshot().await.cache_entries;
+        remove_deleted_torrent_trees(&download_dir, &deleted_files, &remaining).await;
+    }
+
     if used_bytes <= snapshot.cache.max_bytes {
         return Ok(());
     }
-    if playing {
+    if playing || state.store.snapshot().await.cache_entries.iter().any(|entry| {
+        entry_in_startup_grace(entry, now)
+    }) {
         return Ok(());
     }
 
     // Still over: untracked leftovers (downloaded before file paths were
-    // recorded). Playback is idle, so recently-written files can go.
+    // recorded). Skip files written during the startup grace so a just-
+    // started title is not reclaimed out from under ffmpeg.
     let max_bytes = snapshot.cache.max_bytes;
     tokio::task::spawn_blocking(move || reclaim_untracked(&download_dir, max_bytes))
         .await
         .map_err(|error| error.to_string())?
+}
+
+fn cache_entry_id(entry: &store::CacheEntry) -> String {
+    entry
+        .torrent_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| entry.info_hash.clone())
+}
+
+fn entry_in_startup_grace(entry: &store::CacheEntry, now: u64) -> bool {
+    now.saturating_sub(entry.last_accessed_at) < CACHE_STARTUP_GRACE_MS
+}
+
+fn cache_entry_is_protected(
+    entry: &store::CacheEntry,
+    now: u64,
+    playing: bool,
+    active_id: Option<&str>,
+) -> bool {
+    if entry_in_startup_grace(entry, now) {
+        return true;
+    }
+    let id = cache_entry_id(entry);
+    playing && active_id == Some(id.as_str())
 }
 
 /// Pause background torrents. The title being watched (or just added) keeps
@@ -1160,9 +1250,7 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
         .cache_entries
         .iter()
         .max_by_key(|entry| entry.last_accessed_at)
-        .filter(|entry| {
-            playing || now.saturating_sub(entry.last_accessed_at) < PLAYBACK_GUARD_MS
-        });
+        .filter(|entry| playing || entry_in_startup_grace(entry, now));
 
     for torrent in torrents {
         let is_active = active.is_some_and(|entry| {
@@ -1202,10 +1290,16 @@ fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String
         })
         .collect();
     items.sort_by_key(|(_, modified)| *modified);
+    let grace_floor = std::time::SystemTime::now()
+        .checked_sub(Duration::from_millis(CACHE_STARTUP_GRACE_MS))
+        .unwrap_or(std::time::UNIX_EPOCH);
 
-    for (path, _) in items {
+    for (path, modified) in items {
         if used_bytes <= max_bytes {
             return Ok(());
+        }
+        if modified > grace_floor {
+            continue;
         }
         let freed = if path.is_dir() {
             directory_size(&path).unwrap_or(0)
@@ -1435,7 +1529,12 @@ async fn proxy_web_app(
         upstream = upstream.body(body);
     }
 
-    match upstream.send().await {
+    let timeout = if path.starts_with("/api/") {
+        WEB_PROXY_API_TIMEOUT
+    } else {
+        WEB_PROXY_TIMEOUT
+    };
+    match upstream.timeout(timeout).send().await {
         Ok(response) => proxy_web_response(response),
         Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
     }
@@ -1514,6 +1613,50 @@ fn to_client_message(message: TungsteniteMessage) -> Option<AxumMessage> {
     }
 }
 
+/// `only_files` and `only_files_regex` are mutually exclusive in rqbit.
+/// Prefer a Torrentio file index; otherwise match SxxEyy inside a pack.
+fn rqbit_add_url(
+    rqbit_port: u16,
+    download_dir: &std::path::Path,
+    file_index: Option<usize>,
+    episode_regex: Option<String>,
+) -> String {
+    let mut url = format!(
+        "http://127.0.0.1:{}/torrents?overwrite=true&output_folder={}",
+        rqbit_port,
+        urlencoding::encode(&download_dir.to_string_lossy())
+    );
+    if let Some(index) = file_index {
+        url.push_str(&format!("&only_files={index}"));
+    } else if let Some(regex) = episode_regex {
+        url.push_str(&format!(
+            "&only_files_regex={}",
+            urlencoding::encode(&regex)
+        ));
+    }
+    url
+}
+
+/// `tv:236235:2:1` → filename regex for S02E01 / 2x01. Movies and
+/// incomplete keys (`tv:123:-:-`) produce nothing.
+fn episode_file_regex(media_key: Option<&str>) -> Option<String> {
+    let key = media_key?;
+    let mut parts = key.split(':');
+    let kind = parts.next()?;
+    if !kind.eq_ignore_ascii_case("tv") {
+        return None;
+    }
+    let _id = parts.next()?;
+    let season: u32 = parts.next()?.parse().ok()?;
+    let episode: u32 = parts.next()?.parse().ok()?;
+    if season == 0 || episode == 0 {
+        return None;
+    }
+    Some(format!(
+        r"(?i)(?:s0*{season}[ ._\-]?e0*{episode}|{season}x0*{episode})(?:\D|$)"
+    ))
+}
+
 async fn add_torrent(
     State(state): State<BridgeState>,
     headers: HeaderMap,
@@ -1532,13 +1675,18 @@ async fn add_torrent(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| urlencoding::decode(value).ok())
         .map(|value| value.into_owned());
+    let file_index = headers
+        .get("x-cubo-file-index")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
 
     match state
         .client
-        .post(format!(
-            "http://127.0.0.1:{}/torrents?overwrite=true&output_folder={}",
+        .post(rqbit_add_url(
             state.rqbit_port,
-            urlencoding::encode(&state.current_download_dir().await.to_string_lossy())
+            &state.current_download_dir().await,
+            file_index,
+            episode_file_regex(media_key.as_deref()),
         ))
         .body(body)
         .send()
@@ -1599,7 +1747,16 @@ async fn add_torrent(
                             .map(|files| {
                                 files
                                     .iter()
-                                    .filter_map(|file| {
+                                    .enumerate()
+                                    .filter(|(index, file)| {
+                                        if let Some(wanted) = file_index {
+                                            return *index == wanted;
+                                        }
+                                        file.get("included")
+                                            .and_then(serde_json::Value::as_bool)
+                                            .unwrap_or(true)
+                                    })
+                                    .filter_map(|(_, file)| {
                                         file.get("name").and_then(serde_json::Value::as_str)
                                     })
                                     .map(|name| {
@@ -1635,18 +1792,29 @@ async fn add_torrent(
                         .and_then(|value| value.pointer("/details/files"))
                         .and_then(serde_json::Value::as_array)
                         .and_then(|files| {
+                            let is_mkv = |file: &serde_json::Value| {
+                                file.get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|name| {
+                                        name.to_ascii_lowercase().ends_with(".mkv")
+                                    })
+                            };
+                            if let Some(index) = file_index.filter(|&index| {
+                                files.get(index).is_some_and(is_mkv)
+                            }) {
+                                return Some(index);
+                            }
                             files
                                 .iter()
                                 .enumerate()
+                                .filter(|(_, file)| {
+                                    file.get("included")
+                                        .and_then(serde_json::Value::as_bool)
+                                        .unwrap_or(true)
+                                        && is_mkv(file)
+                                })
                                 .max_by_key(|(_, file)| {
                                     file.get("length").and_then(serde_json::Value::as_u64)
-                                })
-                                .filter(|(_, file)| {
-                                    file.get("name")
-                                        .and_then(serde_json::Value::as_str)
-                                        .is_some_and(|name| {
-                                            name.to_ascii_lowercase().ends_with(".mkv")
-                                        })
                                 })
                                 .map(|(index, _)| index)
                         });
@@ -2204,6 +2372,48 @@ fn is_hop_by_hop(header: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::header::ORIGIN;
+
+    #[test]
+    fn episode_regex_matches_tv_keys_only() {
+        assert!(episode_file_regex(None).is_none());
+        assert!(episode_file_regex(Some("movie:550:-:-")).is_none());
+        assert!(episode_file_regex(Some("tv:236235:-:-")).is_none());
+        let regex = episode_file_regex(Some("tv:236235:2:1")).expect("tv episode");
+        assert!(regex.contains("s0*2"));
+        assert!(regex.contains("e0*1"));
+        assert!(regex.contains("2x0*1"));
+        let url = rqbit_add_url(1, std::path::Path::new("/tmp/cache"), Some(4), Some(regex));
+        assert!(url.contains("only_files=4"));
+        assert!(!url.contains("only_files_regex"));
+        let url = rqbit_add_url(
+            1,
+            std::path::Path::new("/tmp/cache"),
+            None,
+            episode_file_regex(Some("tv:1:3:9")),
+        );
+        assert!(url.contains("only_files_regex="));
+        assert!(!url.contains("only_files="));
+    }
+
+    #[test]
+    fn unclaimed_cache_roots_are_wiped() {
+        let root = std::env::temp_dir().join(format!("cubo-orphan-{}", Uuid::new_v4()));
+        let pack = root.join("season-pack");
+        std::fs::create_dir_all(&pack).expect("pack dir");
+        std::fs::write(pack.join("s02e01.mkv"), b"keep-me-not").expect("episode");
+        std::fs::write(pack.join("s02e02.mkv"), b"sparse-leftover").expect("sibling");
+        let other = root.join("other-title.mp4");
+        std::fs::write(&other, b"keep").expect("other");
+
+        wipe_unclaimed_roots(
+            &root,
+            &[pack.join("s02e01.mkv").to_string_lossy().into_owned()],
+            &[other.to_string_lossy().into_owned()],
+        );
+        assert!(!pack.exists());
+        assert!(other.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn default_origins_are_restricted() {

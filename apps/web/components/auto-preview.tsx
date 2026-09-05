@@ -151,7 +151,11 @@ export function AutoPreview({
             target?.episode,
           ),
         );
-        const source = rankPreviewStreams(streams, item.originalLanguage)[0];
+        const source = rankPreviewStreams(
+          streams,
+          item.originalLanguage,
+          target ? { season: target.season, episode: target.episode } : null,
+        )[0];
         if (!source || cancelled) return;
 
         const added = await addMagnet(connection, buildMagnet(source), {
@@ -159,6 +163,7 @@ export function AutoPreview({
             target ? `:${target.season}:${target.episode}` : ''
           }`,
           title: item.title,
+          fileIndex: source.fileIdx,
         });
         if (cancelled) return;
 
