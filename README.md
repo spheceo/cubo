@@ -58,21 +58,23 @@ machine's Tailscale IP) in Core settings.
 
 ## Setup
 
-1. Install [bun](https://bun.sh), then run `bun install`.
+1. Install [just](https://just.systems) and [bun](https://bun.sh), then run `bun install`.
 2. Add `TMDB_API_KEY` to `apps/web/.env.local`.
-3. Run `bun dev` to start the Vite app and marketing site.
+3. Run `just dev` to start Cubo Core (the CLI) on port 8765.
 
 The Vite dev server also serves the `api/` functions locally, so the Vercel
 CLI is not needed for development.
 
 Useful commands:
 
-- `bun dev` runs the app (4200) and the marketing site (4300).
-- `bun dev:web` starts only the app at `http://localhost:4200`.
-- `bun dev:site` starts the marketing site at `http://localhost:4300`.
-- `bun dev:core` runs the engine via the CLI.
-- `bun typecheck` checks the TypeScript packages and Rust core.
-- `bun build` builds the web app and marketing site.
+- `just` lists recipes.
+- `just dev` runs Cubo Core on port 8765 (stops a background `cubo persist` first).
+- `just web` starts the app at `http://localhost:4200`.
+- `just site` starts the marketing site at `http://localhost:4300`.
+- `just apps` runs the app and marketing site together.
+- `just typecheck` checks the TypeScript packages.
+- `just build` builds the web app and marketing site.
+- `just check` / `just test` compile and test the Rust workspace.
 
 ## Deploying to Vercel
 

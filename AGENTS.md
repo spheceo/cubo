@@ -145,10 +145,16 @@ repo, built by `.github/workflows/release.yml`.
   aligned across seek restarts. Remaining validation: compare cue timings
   against audio on real remuxed sources with unusual keyframe intervals.
 
+## Task runner
+
+Use [just](https://just.systems) from the repo root (`Justfile`). `just`
+lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
+--no-open`). Bun stays for installs and per-package Vite/tsc scripts.
+
 ## Verification commands
 
-- `bun --filter @cubo/web typecheck` and `bun --filter @cubo/web build`
-- `cargo check` and `cargo test` in the workspace root
+- `just typecheck` and `just build` (or `bun --filter @cubo/web typecheck` / `build`)
+- `just check` and `just test` in the workspace root
 
 ## Conventions
 

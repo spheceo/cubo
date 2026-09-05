@@ -4,13 +4,5 @@
   "workspaces": [
     "apps/*",
     "packages/*"
-  ],
-  "scripts": {
-    "dev": "bun --filter '@cubo/web' --filter '@cubo/site' dev",
-    "dev:web": "bun --filter '@cubo/web' dev",
-    "dev:site": "bun --filter '@cubo/site' dev",
-    "dev:core": "cargo run -p cubo-cli -- serve --no-open",
-    "build": "bun run --recursive build",
-    "typecheck": "bun run --recursive typecheck"
-  }
+  ]
 }

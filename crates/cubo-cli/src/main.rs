@@ -149,8 +149,9 @@ async fn serve(no_open: bool) {
             // Common cause worth explaining plainly: another Cubo already runs.
             eprintln!("Cubo failed to start: {error}");
             eprintln!(
-                "If another copy of Cubo is already running, stop it first — \
-                 only one engine can own port {port_hint}.",
+                "If another copy of Cubo is already running — including \
+                 `cubo persist` — stop it first (`cubo unpersist` or \
+                 `just stop-persist`). Only one engine can own port {port_hint}.",
                 port_hint = 8765
             );
             std::process::exit(1);
