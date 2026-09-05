@@ -35,6 +35,8 @@ import {
   saveFramingPref,
   type FramingMode,
 } from '@/lib/framing-prefs';
+import { playInBackground } from '@/lib/background-playback';
+import { logoUrl } from '@cubo/core';
 import { findActiveCue, loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
@@ -134,6 +136,11 @@ export function VideoPlayer({
   const sessionReported = useRef(false);
   /** One-shot local seek (seek-restart catch-up), applied per source. */
   const localSeekApplied = useRef<string | null>(null);
+  /** False only when the viewer hit pause — browsers pausing a hidden tab
+   *  must not stick. */
+  const userPaused = useRef(false);
+  /** Bumps to cancel an in-flight hidden-tab play() retry loop. */
+  const playGeneration = useRef(0);
 
   // Framing preference is player-global (like a TV picture-size setting):
   // it follows the viewer across titles, so the player owns it directly.
@@ -423,6 +430,20 @@ export function VideoPlayer({
     [durationHint, hls],
   );
 
+  const requestPlay = useCallback((video: HTMLVideoElement) => {
+    if (userPaused.current || video.ended) return;
+    const generation = ++playGeneration.current;
+    void playInBackground(
+      video,
+      () => userPaused.current || playGeneration.current !== generation,
+      setBlocked,
+    );
+  }, []);
+
+  const stopPlayLoop = useCallback(() => {
+    playGeneration.current += 1;
+  }, []);
+
   useEffect(() => {
     setDuration(hls && durationHint && Number.isFinite(durationHint) ? durationHint : 0);
     setCurrentTime(0);
@@ -434,10 +455,18 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
 
+    let cancelled = false;
+    const start = () => {
+      if (cancelled || userPaused.current) return;
+      requestPlay(video);
+    };
+
     if (!hls) {
       video.src = src;
-      void video.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
+      start();
       return () => {
+        cancelled = true;
+        stopPlayLoop();
         video.removeAttribute('src');
       };
     }
@@ -448,7 +477,6 @@ export function VideoPlayer({
     // broadcast: play() snaps to the live edge and seeking is confined to a
     // sliding window. hls.js with an explicit startPosition keeps normal
     // video-on-demand behaviour.
-    let cancelled = false;
     let instance: import('hls.js').default | null = null;
     void import('hls.js').then(({ default: Hls }) => {
       if (cancelled) return;
@@ -459,9 +487,7 @@ export function VideoPlayer({
       instance = new Hls({ startPosition: 0 });
       instance.loadSource(src);
       instance.attachMedia(video);
-      instance.on(Hls.Events.MANIFEST_PARSED, () => {
-        void video.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
-      });
+      instance.on(Hls.Events.MANIFEST_PARSED, start);
       instance.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) onErrorRef.current();
       });
@@ -469,9 +495,25 @@ export function VideoPlayer({
 
     return () => {
       cancelled = true;
+      stopPlayLoop();
       instance?.destroy();
     };
-  }, [src, hls]);
+  }, [src, hls, requestPlay, stopPlayLoop]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const resumeIfNeeded = () => {
+      if (userPaused.current || !video.paused || video.ended) return;
+      requestPlay(video);
+    };
+    document.addEventListener('visibilitychange', resumeIfNeeded);
+    window.addEventListener('pageshow', resumeIfNeeded);
+    return () => {
+      document.removeEventListener('visibilitychange', resumeIfNeeded);
+      window.removeEventListener('pageshow', resumeIfNeeded);
+    };
+  }, [src, requestPlay]);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -551,11 +593,41 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      void video.play().then(() => setBlocked(false)).catch(() => setBlocked(true));
+      userPaused.current = false;
+      requestPlay(video);
     } else {
+      userPaused.current = true;
+      stopPlayLoop();
       video.pause();
     }
-  }, []);
+  }, [requestPlay, stopPlayLoop]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+    const artwork = logoPath
+      ? [{ src: logoUrl(logoPath, 'w300'), sizes: '300x300', type: 'image/png' }]
+      : [];
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title,
+      artist: subtitle ?? 'Cubo',
+      artwork,
+    });
+    navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
+    navigator.mediaSession.setActionHandler('play', () => {
+      userPaused.current = false;
+      const video = videoRef.current;
+      if (video) requestPlay(video);
+    });
+    navigator.mediaSession.setActionHandler('pause', () => {
+      userPaused.current = true;
+      stopPlayLoop();
+      videoRef.current?.pause();
+    });
+    return () => {
+      navigator.mediaSession.setActionHandler('play', null);
+      navigator.mediaSession.setActionHandler('pause', null);
+    };
+  }, [title, subtitle, logoPath, playing, requestPlay, stopPlayLoop]);
 
   /** Seeks to an absolute source position. Inside the converted window it is
    *  an ordinary seek; outside it (with slack near the frontier, where waiting
@@ -749,6 +821,7 @@ export function VideoPlayer({
         ref={videoRef}
         autoPlay
         playsInline
+        preload="auto"
         crossOrigin="anonymous"
         className="h-full w-full bg-black"
         onClick={togglePlay}
@@ -766,6 +839,8 @@ export function VideoPlayer({
         onPause={() => {
           setPlaying(false);
           reportPlayback(false);
+          const video = videoRef.current;
+          if (video?.isConnected && !userPaused.current && !video.ended) requestPlay(video);
         }}
         onWaiting={() => setWaiting(true)}
         onPlaying={() => setWaiting(false)}
