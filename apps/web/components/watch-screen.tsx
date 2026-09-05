@@ -48,6 +48,7 @@ import {
   type CaptionPrefs,
   type CaptionSize,
 } from '@/lib/caption-prefs';
+import { releaseWatchKeepalive } from '@/lib/background-playback';
 import { playbackKey } from '@/lib/library';
 import { rankStreams, streamKey } from '@/lib/stream-select';
 import type { SubtitleReleaseHint } from '@cubo/core';
@@ -194,6 +195,8 @@ export function WatchScreen({
    *  flushes from overwriting `lastPositionRef` with the pre-seek time. */
   const seekTargetRef = useRef<number | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
+
+  useEffect(() => () => releaseWatchKeepalive(), []);
 
   // The fill eases toward whatever ceiling the current stage set, so it keeps
   // creeping while a stage takes its time and never jumps backwards. The timer
@@ -360,8 +363,7 @@ export function WatchScreen({
 
         setStage(STAGE.ready);
         setProgress(1);
-        // Let the logo finish filling before the picture takes over.
-        window.setTimeout(() => {
+        const reveal = () => {
           if (stale()) return;
           setVideoUrl(url);
           setVideoIsHls(usesHls);
@@ -369,7 +371,11 @@ export function WatchScreen({
           setVideoTimeOffset(timeOffset);
           setVideoStartLocal(localJump);
           setStatus('ready');
-        }, 480);
+        };
+        // Hidden tabs clamp setTimeout — attach immediately so play() can
+        // start (and be heard) without waiting on a frozen 480ms timer.
+        if (document.hidden) reveal();
+        else window.setTimeout(reveal, 480);
         return;
       } catch (reason) {
         if (stale() || abort.signal.aborted) return;

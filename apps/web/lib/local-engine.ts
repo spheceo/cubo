@@ -6,6 +6,7 @@ import type {
   SubtitleReleaseHint,
   WatchLaterItem,
 } from '@cubo/core';
+import { delayUnthrottled } from '@/lib/background-playback';
 
 export const CORE_PORT = 8765;
 const DISCOVERY_TIMEOUT_MS = 4_000;
@@ -427,7 +428,7 @@ export async function waitUntilLive(
     if (stats.state === 'live') return;
     if (stats.state === 'error') throw new Error(stats.error ?? 'The stream failed');
     if (Date.now() > deadline) throw new Error('The stream took too long to start');
-    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    await delayUnthrottled(500, signal);
   }
 }
 
