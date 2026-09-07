@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ContinueWatching } from '@/components/continue-watching';
 import { Link } from '@/components/link';
 import { asMediaSummary } from '@/lib/format';
+import { watchHistoryItems } from '@/lib/library';
 import { getCacheStatus, type CacheStatus } from '@/lib/local-engine';
 import { useCore } from './core-provider';
 
@@ -75,7 +76,7 @@ export function LibraryScreen() {
 
       <ContinueWatching className="" />
       <SavedGrid title="Watch Later" items={watchLater} />
-      <HistoryGrid items={history.slice(0, 16)} />
+      <HistoryGrid items={watchHistoryItems(history)} />
 
       <section className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-8">
         <p className="text-sm text-faint">

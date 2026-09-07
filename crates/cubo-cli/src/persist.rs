@@ -239,7 +239,7 @@ fn unload_service() -> Result<(), String> {
 
 fn restart_service() -> Result<(), String> {
     if cfg!(target_os = "macos") {
-        macos_reload()
+        macos_restart()
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "restart", "cubo.service"]).map(|_| ())
@@ -248,16 +248,57 @@ fn restart_service() -> Result<(), String> {
     }
 }
 
+/// After a binary swap the plist path is unchanged. `kickstart -k` kills the
+/// old image and execs the new one. bootout+bootstrap is what failed on
+/// update: launchd still had the job, so bootstrap returned I/O error and
+/// the bounce never happened.
+fn macos_restart() -> Result<(), String> {
+    if macos_kickstart().is_ok() {
+        return Ok(());
+    }
+    macos_reload()
+}
+
+fn macos_kickstart() -> Result<(), String> {
+    let service = format!("gui/{}/{LABEL}", user_id());
+    run("launchctl", &["kickstart", "-k", &service])
+}
+
 fn macos_reload() -> Result<(), String> {
     let uid = user_id();
     let domain = format!("gui/{uid}");
     let service = format!("{domain}/{LABEL}");
     let plist = service_file();
-    // bootout is fine when the service is not loaded yet.
+    if macos_kickstart().is_ok() {
+        return Ok(());
+    }
     let _ = run("launchctl", &["bootout", &service]);
-    run("launchctl", &["bootstrap", &domain, &plist.to_string_lossy()])?;
+    bootstrap_with_retry(&domain, &plist)?;
     let _ = run("launchctl", &["enable", &service]);
-    run("launchctl", &["kickstart", "-k", &service]).map(|_| ())
+    macos_kickstart()
+}
+
+fn bootstrap_with_retry(domain: &str, plist: &std::path::Path) -> Result<(), String> {
+    let path = plist.to_string_lossy();
+    let mut last = String::new();
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150 * attempt as u64));
+        }
+        match run("launchctl", &["bootstrap", domain, &path]) {
+            Ok(()) => return Ok(()),
+            Err(error) if bootstrap_already_loaded(&error) => return Ok(()),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn bootstrap_already_loaded(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("already")
+        || lower.contains("file exists")
+        || lower.contains("input/output")
 }
 
 fn macos_bootout() -> Result<(), String> {
@@ -361,5 +402,16 @@ mod tests {
     #[test]
     fn xml_escape_handles_ampersands() {
         assert_eq!(xml_escape("a&b<c>"), "a&amp;b&lt;c&gt;");
+    }
+
+    #[test]
+    fn bootstrap_treats_already_loaded_as_success() {
+        use super::bootstrap_already_loaded;
+        assert!(bootstrap_already_loaded(
+            "`launchctl bootstrap gui/501/com.spheceo.cubo` failed: Bootstrap failed: 5: Input/output error"
+        ));
+        assert!(bootstrap_already_loaded("service already loaded"));
+        assert!(bootstrap_already_loaded("Bootstrap failed: 17: File exists"));
+        assert!(!bootstrap_already_loaded("Bootstrap failed: 125: Could not find specified service"));
     }
 }

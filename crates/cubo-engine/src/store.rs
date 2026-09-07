@@ -260,7 +260,19 @@ impl CoreStore {
 
     pub async fn remove_history_item(&self, key: &str) -> Result<CoreData, String> {
         let mut data = self.data.lock().await;
-        data.history.retain(|item| item.key != key);
+        let title = data
+            .history
+            .iter()
+            .find(|item| item.key == key)
+            .map(|item| (item.media_type.clone(), item.media_id));
+        match title {
+            Some((media_type, media_id)) => {
+                data.history.retain(|item| {
+                    item.media_type != media_type || item.media_id != media_id
+                });
+            }
+            None => data.history.retain(|item| item.key != key),
+        }
         self.persist_locked(&data).await?;
         Ok(data.clone())
     }

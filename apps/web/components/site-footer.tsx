@@ -25,6 +25,9 @@ export function SiteFooter() {
           className={`size-1.5 rounded-full ${connection ? 'bg-accent' : 'bg-faint'}`}
         />
       </button>
+      {connection?.version ? (
+        <span className="ml-auto tabular-nums">v{connection.version.replace(/^v/, '')}</span>
+      ) : null}
     </footer>
   );
 }
