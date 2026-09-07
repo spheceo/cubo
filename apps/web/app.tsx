@@ -4,6 +4,7 @@ import { ConnectionBanner } from '@/components/connection-banner';
 import { UpdateOverlay, UpdateProvider } from '@/components/core-update';
 import { StorageWarningBanner } from '@/components/storage-warning-banner';
 import { CoreProvider } from '@/components/core-provider';
+import { ScrollbarReveal } from '@/components/scrollbar-reveal';
 import { ScrollToTop } from '@/components/scroll-to-top';
 import { SiteFooter } from '@/components/site-footer';
 import { SiteHeader } from '@/components/site-header';
@@ -44,6 +45,7 @@ export function App() {
       <CoreProvider>
         <UpdateProvider>
           <ScrollToTop />
+          <ScrollbarReveal />
           <StorageWarningBanner />
           <UpdateOverlay />
           <ConnectionBanner />

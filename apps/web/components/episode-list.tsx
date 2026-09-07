@@ -5,7 +5,9 @@ import { useRef, useState } from 'react';
 import { IoCalendarOutline, IoClose, IoList } from 'react-icons/io5';
 import { Dropdown } from '@/components/dropdown';
 import { Link } from '@/components/link';
+import { useCore } from '@/components/core-provider';
 import { formatNextEpisodeLabel } from '@/lib/air-date';
+import { historyForEpisode } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
 
 export function EpisodeList({
@@ -24,6 +26,7 @@ export function EpisodeList({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const [season, setSeason] = useState(initialSeason);
+  const { library } = useCore();
 
   const seasonQuery = useQuery({
     ...tmdbQueries.season(showId, season),
@@ -148,6 +151,15 @@ export function EpisodeList({
               {episodes.map((episode) => {
                 const still = stillUrl(episode.stillPath, 'w300');
                 const airs = formatNextEpisodeLabel(episode);
+                const watched = historyForEpisode(
+                  library?.history,
+                  showId,
+                  episode.seasonNumber,
+                  episode.episodeNumber,
+                );
+                const progress = watched
+                  ? Math.min(1, watched.completed ? 1 : watched.progress)
+                  : 0;
                 return (
                   <li key={episode.id}>
                     <Link
@@ -171,6 +183,17 @@ export function EpisodeList({
                             />
                           </div>
                         )}
+                        {progress > 0 ? (
+                          <div
+                            className="absolute inset-x-0 bottom-0 h-1 bg-black/45"
+                            aria-hidden
+                          >
+                            <div
+                              className="h-full bg-star"
+                              style={{ width: `${Math.max(4, Math.round(progress * 100))}%` }}
+                            />
+                          </div>
+                        ) : null}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
