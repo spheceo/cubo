@@ -161,8 +161,11 @@ function seasonPackToken(season: number): RegExp {
 export function seasonPackRank(stream: Stream, episode?: EpisodeHint | null): number {
   if (!episode) return 0;
   const hint = streamHint(stream);
-  if (episodeToken(episode.season, episode.episode).test(hint)) return 0;
+  // Torrentio can name the pack in its title and the selected episode in
+  // filename. The filename does not turn the surrounding torrent into a
+  // single-episode release; explicit pack metadata must win.
   if (seasonPackToken(episode.season).test(hint)) return 2;
+  if (episodeToken(episode.season, episode.episode).test(hint)) return 0;
   if ((stream.sizeBytes ?? 0) >= SEASON_PACK_SIZE_BYTES) return 2;
   return 1;
 }

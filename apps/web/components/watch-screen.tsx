@@ -24,6 +24,7 @@ import { resetWindowScroll } from './scroll-to-top';
 import { VideoPlayer, type PlayerSubtitle } from './video-player';
 import {
   addMagnet,
+  InsufficientStorageError,
   buildMagnet,
   getLibrary,
   getSubtitleMatch,
@@ -383,6 +384,7 @@ export function WatchScreen({
       } catch (reason) {
         if (stale() || abort.signal.aborted) return;
         lastError = reason instanceof Error ? reason.message : lastError;
+        if (reason instanceof InsufficientStorageError) break;
       }
     }
 

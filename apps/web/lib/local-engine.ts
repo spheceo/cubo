@@ -317,6 +317,9 @@ export function buildMagnet(stream: Stream): string {
   return `magnet:?xt=urn:btih:${stream.infoHash}${trackers}`;
 }
 
+/** Local storage pressure affects every source; trying another torrent cannot fix it. */
+export class InsufficientStorageError extends Error {}
+
 export async function addMagnet(
   engine: LocalEngineConnection,
   magnet: string,
@@ -346,7 +349,8 @@ export async function addMagnet(
     } catch {
       // Non-JSON body; fall back to the status code.
     }
-    throw new Error(
+    const ErrorType = response.status === 507 ? InsufficientStorageError : Error;
+    throw new ErrorType(
       detail
         ? `Cubo core rejected the stream: ${detail}`
         : `Cubo core rejected the stream (${response.status})`,
@@ -419,6 +423,11 @@ export async function waitUntilLive(
   for (;;) {
     signal?.throwIfAborted();
     const response = await engineFetch(engine, `/v1/torrents/${id}/stats`, { signal });
+    if (response.status === 507) {
+      throw new InsufficientStorageError(
+        await readEngineError(response, 'Free disk space before trying playback again.'),
+      );
+    }
     if (!response.ok) throw new Error(`Cubo core status failed (${response.status})`);
     const stats = (await response.json()) as TorrentStatsRaw;
     onProgress?.(toProgress(stats));
@@ -515,7 +524,8 @@ export async function startRemux(
     } catch {
       // Keep the generic message for non-JSON error bodies.
     }
-    throw new Error(detail);
+    const ErrorType = response.status === 507 ? InsufficientStorageError : Error;
+    throw new ErrorType(detail);
   }
   const duration = Number(response.headers.get('X-Cubo-Duration'));
   const actualStart = Number(response.headers.get('X-Cubo-Start'));
