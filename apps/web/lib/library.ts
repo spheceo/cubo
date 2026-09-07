@@ -44,8 +44,8 @@ export function latestHistoryForTitle(
   return latest;
 }
 
-/** One card per title — always the last season/episode touched. */
-export function continueWatchingItems(
+/** One row per title, always the last season/episode the viewer touched. */
+export function latestItemsByTitle(
   history: LibraryItem[] | undefined,
   mediaType?: MediaType,
 ): LibraryItem[] {
@@ -58,10 +58,23 @@ export function continueWatchingItems(
       latestByTitle.set(id, item);
     }
   }
-  return [...latestByTitle.values()]
+  return [...latestByTitle.values()].sort((a, b) => b.lastWatchedAt - a.lastWatchedAt);
+}
+
+/** One card per title — always the last season/episode touched. */
+export function continueWatchingItems(
+  history: LibraryItem[] | undefined,
+  mediaType?: MediaType,
+): LibraryItem[] {
+  return latestItemsByTitle(history, mediaType)
     .filter((item) => item.positionSeconds >= 30 && item.progress < 0.9)
-    .sort((a, b) => b.lastWatchedAt - a.lastWatchedAt)
     .slice(0, 8);
+}
+
+export function watchHistoryItems(
+  history: LibraryItem[] | undefined,
+): LibraryItem[] {
+  return latestItemsByTitle(history).slice(0, 16);
 }
 
 export function watchLaterItem(details: MediaDetails): WatchLaterItem {
