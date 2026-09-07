@@ -1401,11 +1401,17 @@ async fn rqbit_start(state: &BridgeState, id: &str) -> Result<(), String> {
 /// Playback and remux read through rqbit's stream endpoint. If the
 /// maintainer paused this torrent, ffmpeg sits on a socket that never
 /// receives pieces — unpause and refresh the playback guard first.
-async fn ensure_torrent_running(state: &BridgeState, id: &str) {
+async fn ensure_torrent_running(state: &BridgeState, id: &str) -> Result<(), String> {
+    let download_dir = state.current_download_dir().await;
+    if cache::disk_is_critical(system::volume_free_bytes(&download_dir)) {
+        let _ = rqbit_pause(state, id).await;
+        return Err("Cubo's cache disk is almost full. Free disk space before trying playback again.".into());
+    }
     state.mark_playback();
     if let Err(error) = rqbit_start(state, id).await {
         tracing::debug!(target: "engine", error = %error, id, "could not start torrent");
     }
+    Ok(())
 }
 
 async fn rqbit_action(state: &BridgeState, id: &str, action: &str) -> Result<(), String> {
@@ -1650,6 +1656,14 @@ async fn add_torrent(
         return unauthorized();
     }
 
+    let download_dir = state.current_download_dir().await;
+    if cache::disk_is_critical(system::volume_free_bytes(&download_dir)) {
+        return bridge_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Cubo's cache disk is almost full. Free disk space before trying playback again.".into(),
+        );
+    }
+
     let media_key = headers
         .get("x-cubo-media-key")
         .and_then(|value| value.to_str().ok())
@@ -1668,7 +1682,7 @@ async fn add_torrent(
         .client
         .post(rqbit_add_url(
             state.rqbit_port,
-            &state.current_download_dir().await,
+            &download_dir,
             file_index,
             episode_file_regex(media_key.as_deref()),
         ))
@@ -1763,6 +1777,16 @@ async fn add_torrent(
                     }
                 }
 
+                // Apply the existing one-active-download policy now; a
+                // fallback should not leave the previous swarm writing until
+                // the next maintenance tick.
+                let download_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = apply_download_window(&download_state).await {
+                        tracing::warn!(target: "engine", error = %error, "could not pause background downloads after add");
+                    }
+                });
+
                 // MKV files can only play through the remux pipeline, which
                 // needs an ffprobe first. Warm it now, in parallel with the
                 // torrent buffering, so the playlist request doesn't pay for
@@ -1839,7 +1863,9 @@ async fn torrent_stats(
     // Buffering polls this until the torrent is live — treat that as watching
     // so a directory swap cannot yank the files out from under a start,
     // and unpause if the maintainer already stopped peers.
-    ensure_torrent_running(&state, &id).await;
+    if let Err(error) = ensure_torrent_running(&state, &id).await {
+        return bridge_error(StatusCode::INSUFFICIENT_STORAGE, error);
+    }
 
     match state
         .client
@@ -1864,7 +1890,9 @@ async fn stream_torrent(
     if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
-    ensure_torrent_running(&state, &id).await;
+    if let Err(error) = ensure_torrent_running(&state, &id).await {
+        return bridge_error(StatusCode::INSUFFICIENT_STORAGE, error);
+    }
 
     let mut request = state.client.get(format!(
         "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
@@ -2035,7 +2063,9 @@ async fn hls_file(
     if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
-    ensure_torrent_running(&state, &id).await;
+    if let Err(error) = ensure_torrent_running(&state, &id).await {
+        return bridge_error(StatusCode::INSUFFICIENT_STORAGE, error);
+    }
     if !state.transcode.available() {
         return bridge_error(
             StatusCode::NOT_IMPLEMENTED,

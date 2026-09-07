@@ -205,6 +205,7 @@ impl TranscodeManager {
                 .arg(input_url)
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
+                .kill_on_drop(true)
                 .output(),
         )
         .await
@@ -277,24 +278,45 @@ impl TranscodeManager {
                 // job; only restart when it died before producing anything.
                 let finished = matches!(job.child.try_wait(), Ok(Some(_)));
                 if !finished || job.dir.join(PLAYLIST_NAME).exists() {
+                    job.generation = job.generation.max(generation);
                     return Ok(job.dir.clone());
                 }
             }
         }
 
-        // An input seek lands on the keyframe AT/BEFORE the target; measure
-        // that spot so the client can map playlist time to absolute movie
-        // time truthfully (subtitle alignment + reported positions).
+        // Torrent range reads can stall. Keep playlist/segment metadata and
+        // newer seeks accessible while measuring this request's landing point.
+        drop(active);
         let actual_start = if start_seconds > 0.1 {
-            match self.ffprobe.as_ref() {
-                Some(ffprobe) => find_keyframe_before(ffprobe, input_url, start_seconds)
-                    .await
-                    .unwrap_or(start_seconds),
-                None => start_seconds,
-            }
+            let ffprobe = self.ffprobe.as_ref().ok_or("ffprobe is not available")?;
+            find_keyframe_before(ffprobe, input_url, start_seconds).await
         } else {
-            start_seconds
+            Ok(start_seconds)
         };
+
+        // Another request may have installed a job while this scan ran.
+        // In particular, a stale scan must never evict a newer generation.
+        let mut active = self.active.lock().await;
+        if let Some(job) = active.as_mut() {
+            if job_covers_request(
+                &job.key,
+                job.start_seconds,
+                job.generation,
+                key,
+                start_seconds,
+                nonzero_generation(generation),
+            ) {
+                let finished = matches!(job.child.try_wait(), Ok(Some(_)));
+                if !finished || job.dir.join(PLAYLIST_NAME).exists() {
+                    job.generation = job.generation.max(generation);
+                    return Ok(job.dir.clone());
+                }
+            }
+        }
+
+        // Even a failed/expired stale scan should reuse the newer job above.
+        // A current request must have a measured landing before replacing it.
+        let actual_start = actual_start?;
 
         if let Some(mut previous) = active.take() {
             let _ = previous.child.kill().await;
@@ -515,7 +537,11 @@ impl TranscodeManager {
             return false;
         }
         let finished = matches!(job.child.try_wait(), Ok(Some(_)));
-        !finished || job.dir.join(PLAYLIST_NAME).exists()
+        let usable = !finished || job.dir.join(PLAYLIST_NAME).exists();
+        if usable {
+            job.generation = job.generation.max(generation.unwrap_or(0));
+        }
+        usable
     }
 
     /// Waits until ffmpeg has written a playlist with at least one segment.
@@ -575,31 +601,54 @@ fn job_covers_request(
 /// Finds the timestamp of the last video keyframe at/before `target` — the
 /// spot an input seek (`-ss`) with `-noaccurate_seek` actually lands on.
 /// Packet-level scan of a narrow read interval, so this is fast (no decoding).
-/// Returns None when ffprobe fails or finds nothing; callers fall back to the
-/// requested target (the pre-measurement behaviour).
-async fn find_keyframe_before(ffprobe: &Path, input_url: &str, target: f64) -> Option<f64> {
+/// Fail when the landing cannot be measured: using the requested target as
+/// playlist time zero would corrupt subtitle alignment and saved progress.
+async fn find_keyframe_before(ffprobe: &Path, input_url: &str, target: f64) -> Result<f64, String> {
+    find_keyframe_before_with_timeout(ffprobe, input_url, target, PROBE_TIMEOUT).await
+}
+
+async fn find_keyframe_before_with_timeout(
+    ffprobe: &Path,
+    input_url: &str,
+    target: f64,
+    timeout: Duration,
+) -> Result<f64, String> {
     let from = (target - 20.0).max(0.0);
     let to = target + 0.25;
-    let output = Command::new(ffprobe)
-        .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-read_intervals", &format!("{from:.3}%{to:.3}")])
-        .args(["-show_packets", "-show_entries", "packet=pts_time,flags"])
-        .args(["-of", "csv=p=0"])
-        .arg(input_url)
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        timeout,
+        Command::new(ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-read_intervals", &format!("{from:.3}%{to:.3}")])
+            .args(["-show_packets", "-show_entries", "packet=pts_time,flags"])
+            .args(["-of", "csv=p=0"])
+            .arg(input_url)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "probing the seek position timed out; torrent bytes are unavailable".to_string())?
+    .map_err(|error| format!("could not run seek ffprobe: {error}"))?;
     if !output.status.success() {
-        return None;
+        return Err("ffprobe could not read the seek position".into());
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut best: Option<f64> = None;
     for line in text.lines() {
         let mut fields = line.split(',');
-        let pts = fields.next()?.trim().parse::<f64>().ok();
+        let pts = fields
+            .next()
+            .and_then(|field| field.trim().parse::<f64>().ok());
         let flags = fields.next().unwrap_or("");
         if let Some(pts) = pts {
-            if flags.contains('K') && pts <= target + 0.001 && best.is_none_or(|b| pts > b) {
+            if pts.is_finite()
+                && pts >= 0.0
+                && flags.contains('K')
+                && pts <= target + 0.001
+                && best.is_none_or(|b| pts > b)
+            {
                 best = Some(pts);
             }
         }
@@ -615,10 +664,10 @@ async fn find_keyframe_before(ffprobe: &Path, input_url: &str, target: f64) -> O
         tracing::debug!(
             target: "probe",
             requested_start_seconds = target,
-            "keyframe scan found nothing; falling back to requested start"
+            "keyframe scan found no usable landing point"
         );
     }
-    best
+    best.ok_or_else(|| "could not measure the keyframe at the seek position".into())
 }
 
 fn sanitize_key(key: &str) -> String {
@@ -688,5 +737,167 @@ mod tests {
     #[test]
     fn a_different_file_never_reuses_the_job() {
         assert!(!job_covers_request("2:0", 0.0, 1, "4:0", 0.0, Some(1)));
+    }
+
+    #[cfg(unix)]
+    mod subprocess {
+        use super::super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        struct Fixture(PathBuf);
+
+        impl Fixture {
+            fn new() -> Self {
+                let dir = std::env::temp_dir().join(format!("cubo-probe-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&dir).unwrap();
+                Self(dir)
+            }
+
+            fn script(&self, name: &str, body: &str) -> PathBuf {
+                let path = self.0.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                path
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        async fn wait_for_file(path: &Path) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("probe did not start");
+        }
+
+        async fn assert_process_exits(pid_file: &Path) {
+            let pid: i32 = std::fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                // Signal zero checks existence without sending a signal.
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled ffprobe was left running");
+        }
+
+        #[tokio::test]
+        async fn seek_probe_timeout_kills_the_subprocess() {
+            let fixture = Fixture::new();
+            let probe = fixture.script(
+                "ffprobe",
+                r#"for input do :; done
+printf '%s' "$$" > "$input"
+exec sleep 30"#,
+            );
+            let pid_file = fixture.0.join("pid");
+            let error = find_keyframe_before_with_timeout(
+                &probe,
+                pid_file.to_str().unwrap(),
+                2584.0,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("seek position timed out"));
+            assert_process_exits(&pid_file).await;
+        }
+
+        #[tokio::test]
+        async fn cancelling_source_probe_kills_the_subprocess() {
+            let fixture = Fixture::new();
+            let mut manager = TranscodeManager::new(fixture.0.join("remux"));
+            manager.ffprobe = Some(fixture.script(
+                "ffprobe",
+                r#"for input do :; done
+printf '%s' "$$" > "$input"
+exec sleep 30"#,
+            ));
+            let pid_file = fixture.0.join("pid");
+            assert!(tokio::time::timeout(
+                Duration::from_secs(2),
+                manager.probe(pid_file.to_str().unwrap()),
+            )
+            .await
+            .is_err());
+            assert_process_exits(&pid_file).await;
+        }
+
+        #[tokio::test]
+        async fn stalled_seek_leaves_lock_free_and_cannot_evict_newer_generation() {
+            let fixture = Fixture::new();
+            let mut manager = TranscodeManager::new(fixture.0.join("remux"));
+            manager.ffprobe = Some(fixture.script(
+                "ffprobe",
+                r#"for input do :; done
+printf started > "$input.started"
+while [ ! -f "$input.release" ]; do sleep 0.01; done
+printf '99.0,K_\n'"#,
+            ));
+            manager.ffmpeg = Some(fixture.script("ffmpeg", "exec sleep 30"));
+            let manager = Arc::new(manager);
+            let probe = MediaProbe {
+                video_codec: Some("h264".into()),
+                audio_codec: Some("aac".into()),
+                audio_stream_index: Some(1),
+                duration_seconds: Some(3000.0),
+            };
+            let input = fixture.0.join("input").to_str().unwrap().to_owned();
+            let slow = tokio::spawn({
+                let manager = manager.clone();
+                let probe = probe.clone();
+                let input = input.clone();
+                async move { manager.ensure_job("1:0", &input, &probe, 100.0, 2).await }
+            });
+            wait_for_file(&fixture.0.join("input.started")).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), manager.job_dir("1:0"))
+                    .await
+                    .expect("scan held active mutex")
+                    .is_none()
+            );
+            let new_dir = tokio::time::timeout(
+                Duration::from_secs(2),
+                manager.ensure_job("1:0", &input, &probe, 0.0, 3),
+            )
+            .await
+            .expect("new seek blocked by old probe")
+            .unwrap();
+            let nonce = manager.job_nonce("1:0").await;
+            std::fs::write(fixture.0.join("input.release"), "").unwrap();
+            assert_eq!(slow.await.unwrap().unwrap(), new_dir);
+            assert_eq!(manager.job_actual_start("1:0").await, Some(0.0));
+            assert_eq!(manager.job_nonce("1:0").await, nonce);
+            // A newer generation reusing this offset also advances the fence.
+            assert!(manager.job_usable("1:0", 0.0, Some(5)).await);
+            assert!(manager.job_usable("1:0", 100.0, Some(4)).await);
+            let mut active = manager.active.lock().await;
+            active.as_mut().unwrap().child.kill().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn keyframe_measurement_rejects_missing_and_invalid_timestamps() {
+            let fixture = Fixture::new();
+            let empty = fixture.script("empty", "printf 'NaN,K_\\n101,K_\\n'");
+            assert!(find_keyframe_before(&empty, "unused", 100.0).await.is_err());
+            let valid = fixture.script("valid", "printf '98.5,K_\\n99.75,K_\\n100.1,__\\n'");
+            assert_eq!(
+                find_keyframe_before(&valid, "unused", 100.0).await.unwrap(),
+                99.75
+            );
+        }
     }
 }
