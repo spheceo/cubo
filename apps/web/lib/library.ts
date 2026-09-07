@@ -30,6 +30,22 @@ export function playButtonLabel(
   return current ? `Continue ${current}` : `Watch ${episodeLabel(firstSeason, 1)}`;
 }
 
+/** Progress row for one season/episode, if the viewer has started it. */
+export function historyForEpisode(
+  history: LibraryItem[] | undefined,
+  showId: number,
+  season: number,
+  episode: number,
+): LibraryItem | undefined {
+  return history?.find(
+    (item) =>
+      item.mediaType === 'tv' &&
+      item.mediaId === showId &&
+      item.season === season &&
+      item.episode === episode,
+  );
+}
+
 /** Most recently touched history row for a title. Earlier episodes stay stored. */
 export function latestHistoryForTitle(
   history: LibraryItem[] | undefined,

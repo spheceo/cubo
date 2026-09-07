@@ -1,7 +1,12 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import type { LibraryItem } from '@cubo/core';
-import { continueWatchingItems, latestHistoryForTitle, watchHistoryItems } from './library';
+import {
+  continueWatchingItems,
+  historyForEpisode,
+  latestHistoryForTitle,
+  watchHistoryItems,
+} from './library';
 
 function item(partial: Partial<LibraryItem> & Pick<LibraryItem, 'key' | 'mediaId' | 'lastWatchedAt'>): LibraryItem {
   return {
@@ -39,6 +44,13 @@ test('watch history shows one card per title — the last episode touched, not t
   const history = watchHistoryItems([olderHigher, movie, lastTouched]);
   assert.deepEqual(history.map((entry) => entry.key), ['tv:1:1:2', 'movie:9:-:-']);
   assert.equal(latestHistoryForTitle([olderHigher, lastTouched], 'tv', 1)?.key, 'tv:1:1:2');
+});
+
+test('episode list progress is the row for that season and episode', () => {
+  const e1 = item({ key: 'tv:1:1:1', mediaId: 1, season: 1, episode: 1, lastWatchedAt: 1, progress: 0.4 });
+  const e2 = item({ key: 'tv:1:1:2', mediaId: 1, season: 1, episode: 2, lastWatchedAt: 9, progress: 0.7 });
+  assert.equal(historyForEpisode([e1, e2], 1, 1, 2)?.progress, 0.7);
+  assert.equal(historyForEpisode([e1, e2], 1, 1, 3), undefined);
 });
 
 test('continue watching also keeps the last-touched episode of a series', () => {

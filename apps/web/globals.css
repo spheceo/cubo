@@ -66,6 +66,36 @@
     cursor: default;
     opacity: 0.5;
   }
+
+  /* YouTube-style overlay scrollbar: thin, hidden until the pane is
+     actively scrolling. `.no-scrollbar` still wins for carousels. */
+  *:not(.no-scrollbar) {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+  }
+
+  *:not(.no-scrollbar).is-scrolling {
+    scrollbar-color: rgb(255 255 255 / 0.38) transparent;
+  }
+
+  *:not(.no-scrollbar)::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+    background: transparent;
+  }
+
+  *:not(.no-scrollbar)::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *:not(.no-scrollbar)::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 999px;
+  }
+
+  *:not(.no-scrollbar).is-scrolling::-webkit-scrollbar-thumb {
+    background: rgb(255 255 255 / 0.35);
+  }
 }
 
 /* Registered so the title mark can reveal smoothly from left to right. */
