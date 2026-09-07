@@ -1,6 +1,7 @@
 import { useLocation } from 'react-router';
 import { Link } from '@/components/link';
 import { CuboWordmark } from './cubo-logo';
+import { UpdatePill } from './core-update';
 import { NavSearch } from './nav-search';
 
 const LINKS = [
@@ -45,6 +46,7 @@ export function SiteHeader() {
           ))}
 
           <div className="ml-auto flex items-center gap-2 sm:gap-3">
+            <UpdatePill />
             <NavSearch />
           </div>
         </nav>

@@ -734,6 +734,39 @@ function engineFetch(
   return coreFetch(`${engine.baseUrl}${path}`, { ...init, headers });
 }
 
+export type UpdatePhase = 'idle' | 'downloading' | 'ready' | 'applying';
+
+export interface CoreUpdateStatus {
+  current: string;
+  latest: string | null;
+  state: UpdatePhase;
+  error?: string | null;
+}
+
+export async function getUpdateStatus(
+  engine: LocalEngineConnection,
+): Promise<CoreUpdateStatus> {
+  const response = await engineFetch(engine, '/v1/update');
+  if (!response.ok) throw new Error(await readEngineError(response, 'Could not check for updates'));
+  return (await response.json()) as CoreUpdateStatus;
+}
+
+export async function downloadUpdate(
+  engine: LocalEngineConnection,
+): Promise<CoreUpdateStatus> {
+  const response = await engineFetch(engine, '/v1/update', { method: 'POST' });
+  if (!response.ok) throw new Error(await readEngineError(response, 'Could not download the update'));
+  return (await response.json()) as CoreUpdateStatus;
+}
+
+export async function applyUpdate(
+  engine: LocalEngineConnection,
+): Promise<CoreUpdateStatus> {
+  const response = await engineFetch(engine, '/v1/update/apply', { method: 'POST' });
+  if (!response.ok) throw new Error(await readEngineError(response, 'Could not install the update'));
+  return (await response.json()) as CoreUpdateStatus;
+}
+
 export type ClientLogLevel = 'info' | 'warn' | 'error';
 
 /** Ships a diagnostic event to Core's structured log (same cubo.log the

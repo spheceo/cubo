@@ -111,7 +111,7 @@ async fn maybe_prompt_update(skip: bool) {
     if skip {
         return;
     }
-    if let Some(latest) = update::check_for_latest_cached().await {
+    if let Ok(Some(latest)) = update::check_for_latest_cached().await {
         println!(
             "A new Cubo version is available: {} (you have {})",
             latest.tag,
@@ -123,7 +123,7 @@ async fn maybe_prompt_update(skip: bool) {
         let mut answer = String::new();
         if std::io::stdin().read_line(&mut answer).is_ok()
             && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
-            && update::perform(&latest.asset_name).await
+            && update::perform(&latest.tag, &latest.asset_url).await
         {
             println!("Updated. Starting with your command anyway — the new binary is used next run.");
         }

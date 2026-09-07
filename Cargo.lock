@@ -636,17 +636,13 @@ dependencies = [
 
 [[package]]
 name = "cubo-cli"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "clap",
  "cubo-engine",
- "flate2",
- "hex 0.4.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2",
- "tar",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -654,10 +650,11 @@ dependencies = [
 
 [[package]]
 name = "cubo-engine"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "axum",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "hex 0.4.3",
@@ -670,6 +667,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sysinfo",
+ "tar",
  "tokio",
  "tokio-tungstenite",
  "tower-http 0.6.11",

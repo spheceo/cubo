@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react';
 import { Outlet, Route, Routes, useLocation } from 'react-router';
 import { ConnectionBanner } from '@/components/connection-banner';
+import { UpdateOverlay, UpdateProvider } from '@/components/core-update';
 import { StorageWarningBanner } from '@/components/storage-warning-banner';
 import { CoreProvider } from '@/components/core-provider';
 import { ScrollToTop } from '@/components/scroll-to-top';
@@ -41,25 +42,28 @@ export function App() {
   return (
     <>
       <CoreProvider>
-        <ScrollToTop />
-        <StorageWarningBanner />
-        <ConnectionBanner />
-        <Suspense fallback={<PageFallback />}>
-          <Routes>
-            <Route element={<SiteLayout />}>
-              <Route index element={<HomePage />} />
-              <Route path="movies" element={<CatalogPage mediaType="movie" />} />
-              <Route path="tv-shows" element={<CatalogPage mediaType="tv" />} />
-              <Route path="search" element={<SearchPage />} />
-              <Route path="library" element={<LibraryPage />} />
-              <Route path="legal" element={<LegalPage />} />
-              <Route path="movie/:id" element={<TitlePage mediaType="movie" />} />
-              <Route path="tv/:id" element={<TitlePage mediaType="tv" />} />
-            </Route>
-            <Route path="watch/:mediaType/:id" element={<WatchPage />} />
-            <Route path="*" element={<NotFoundPage />} />
-          </Routes>
-        </Suspense>
+        <UpdateProvider>
+          <ScrollToTop />
+          <StorageWarningBanner />
+          <UpdateOverlay />
+          <ConnectionBanner />
+          <Suspense fallback={<PageFallback />}>
+            <Routes>
+              <Route element={<SiteLayout />}>
+                <Route index element={<HomePage />} />
+                <Route path="movies" element={<CatalogPage mediaType="movie" />} />
+                <Route path="tv-shows" element={<CatalogPage mediaType="tv" />} />
+                <Route path="search" element={<SearchPage />} />
+                <Route path="library" element={<LibraryPage />} />
+                <Route path="legal" element={<LegalPage />} />
+                <Route path="movie/:id" element={<TitlePage mediaType="movie" />} />
+                <Route path="tv/:id" element={<TitlePage mediaType="tv" />} />
+              </Route>
+              <Route path="watch/:mediaType/:id" element={<WatchPage />} />
+              <Route path="*" element={<NotFoundPage />} />
+            </Routes>
+          </Suspense>
+        </UpdateProvider>
       </CoreProvider>
     </>
   );
