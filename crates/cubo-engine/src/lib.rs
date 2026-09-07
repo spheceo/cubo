@@ -9,6 +9,7 @@ pub mod paths;
 pub mod store;
 pub mod system;
 pub mod transcode;
+pub mod update;
 
 #[cfg(unix)]
 /// macOS launches apps with a soft limit of ~256 open file descriptors.

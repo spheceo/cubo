@@ -148,6 +148,8 @@ fn macos_plist(exe: &Path, home: &Path, log_dir: &Path) -> String {
 		<string>{home}</string>
 		<key>PATH</key>
 		<string>{path}</string>
+		<key>CUBO_PERSIST</key>
+		<string>1</string>
 	</dict>
 	<key>KeepAlive</key>
 	<true/>
@@ -191,6 +193,7 @@ fn linux_unit(exe: &Path, home: &Path) -> String {
          RestartSec=5\n\
          Environment=HOME={home}\n\
          Environment=PATH={path}\n\
+         Environment=CUBO_PERSIST=1\n\
          WorkingDirectory={home}\n\
          \n\
          [Install]\n\
@@ -338,6 +341,7 @@ mod tests {
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<string>--no-open</string>"));
         assert!(plist.contains("<string>--no-update-check</string>"));
+        assert!(plist.contains("<key>CUBO_PERSIST</key>"));
         assert!(plist.contains("/Users/sphe/.local/bin/cubo"));
         assert!(plist.contains("boot-service.log"));
     }
@@ -350,6 +354,7 @@ mod tests {
         );
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("serve --no-open --no-update-check"));
+        assert!(unit.contains("CUBO_PERSIST=1"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 

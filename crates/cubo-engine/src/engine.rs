@@ -36,6 +36,7 @@ use crate::paths::home_dir;
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
 use crate::system;
 use crate::transcode::TranscodeManager;
+use crate::update::UpdateManager;
 
 const CORE_PORT: u16 = 8765;
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
@@ -93,6 +94,7 @@ struct BridgeState {
     /// Authenticator-style pairing: verifies offline codes and remembers
     /// device tokens issued to remote (non-loopback) clients.
     pairing: Arc<PairingManager>,
+    updater: Arc<UpdateManager>,
 }
 
 impl BridgeState {
@@ -208,6 +210,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 transcode: Arc::new(TranscodeManager::new(transcode_dir)),
                 subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
                 pairing,
+                updater: Arc::new(UpdateManager::new()),
             };
             let router = bridge_router(state.clone());
 
@@ -481,6 +484,8 @@ fn bridge_router(state: BridgeState) -> Router {
         .route("/v1/cache/directory", put(update_cache_directory))
         .route("/v1/cache/{id}", axum::routing::delete(delete_cache_item))
         .route("/v1/client-log", post(client_log))
+        .route("/v1/update", get(update_status).post(download_update))
+        .route("/v1/update/apply", post(apply_update))
         .fallback(web_fallback)
         .with_state(state)
         .layer(cors)
@@ -589,6 +594,33 @@ async fn client_log(
     }
 
     StatusCode::OK.into_response()
+}
+
+async fn update_status(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    Json(state.updater.status().await).into_response()
+}
+
+async fn download_update(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    match state.updater.download().await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error),
+    }
+}
+
+async fn apply_update(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    match state.updater.apply().await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => bridge_error(StatusCode::CONFLICT, error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -2547,6 +2579,7 @@ mod tests {
             transcode: Arc::new(TranscodeManager::new(transcode_dir)),
             subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
             pairing,
+            updater: Arc::new(UpdateManager::new()),
         };
         tokio::spawn(async move {
             let service = bridge_router(state).into_make_service_with_connect_info::<SocketAddr>();
