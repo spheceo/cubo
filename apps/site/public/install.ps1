@@ -55,7 +55,7 @@ Write-Host "that is the standard firewall prompt; allow access on private networ
 Write-Host ""
 Write-Host "Cubo installed. To start streaming:"
 Write-Host "  1. Run:            cubo serve"
-Write-Host "  2. A browser tab opens app.cubo.spheceo.com automatically."
+Write-Host "  2. A browser tab opens http://127.0.0.1:8765 automatically."
 Write-Host "     (Or open it yourself any time.)"
 Write-Host "  3. Search titles:  cubo search `"avengers`""
 Write-Host "  4. Update later:   cubo update"

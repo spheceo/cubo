@@ -131,8 +131,15 @@ export function App() {
           >
             Download
           </a>
-          <a className="nav-cta" href="https://app.cubo.spheceo.com" rel="noreferrer">
-            Open web app
+          <a
+            className="nav-cta"
+            href="/downloads"
+            onClick={(event) => {
+              event.preventDefault();
+              navigate('/downloads');
+            }}
+          >
+            Download
           </a>
         </div>
       </nav>
@@ -197,7 +204,7 @@ function HomePage({
           <Step
             num="02"
             title="Open any device"
-            body="The web app finds Core automatically — phone, tablet, laptop, anything with a browser."
+            body="Open http://that-machine:8765 on any phone, tablet, or laptop. The UI is served by Core."
           />
           <Step
             num="03"

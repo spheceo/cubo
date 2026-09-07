@@ -1,9 +1,7 @@
-//! `cubo search` — queries the same catalog the web app uses (the deployed
-//! site's TMDB proxy), so no API key lives in the binary.
+//! `cubo search` — queries the same catalog Worker the web app uses. The
+//! TMDB key stays on Cloudflare; this binary never sees it.
 
 use serde::Deserialize;
-
-const CATALOG_BASE: &str = "https://app.cubo.spheceo.com/api/tmdb";
 
 #[derive(Deserialize)]
 struct SearchResponse {
@@ -37,7 +35,7 @@ pub async fn run(query: &str) {
 
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("{CATALOG_BASE}/search/multi"))
+        .get(format!("{}/search/multi", cubo_engine::catalog::catalog_base()))
         .query(&[("query", query), ("include_adult", "false")])
         .send()
         .await;
@@ -101,7 +99,7 @@ pub async fn run(query: &str) {
             "  {kind}  {year}  ★{rating:>4}  {title}",
         );
         println!(
-            "         watch at app.cubo.spheceo.com/watch/{}/{}",
+            "         watch at http://127.0.0.1:8765/watch/{}/{}",
             result.media_type, result.id
         );
         shown += 1;

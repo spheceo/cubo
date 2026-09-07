@@ -1,7 +1,6 @@
 //! Cubo CLI — `cubo persist`, `cubo serve`, `cubo search`, `cubo update`.
 //!
-//! Headless Cubo Core. The web app at the canonical deployment auto-detects
-//! it on localhost:8765.
+//! Headless Cubo Core. `cubo serve` hosts the web app on localhost:8765.
 
 mod paths;
 mod persist;
@@ -14,8 +13,7 @@ use clap::{Parser, Subcommand};
 use cubo_engine::engine;
 use std::path::PathBuf;
 
-/// Cubo's torrent engine, headless. Pair it with the web app at
-/// app.cubo.spheceo.com and leave the machine alone.
+/// Cubo's torrent engine. Serves the web app on port 8765.
 #[derive(Parser)]
 #[command(
     name = "cubo",
@@ -36,7 +34,7 @@ struct Cli {
 enum Command {
     /// Start the Cubo engine on this machine and open the web app.
     Serve {
-        /// Do not open app.cubo.spheceo.com in a browser tab.
+        /// Do not open the local web app in a browser tab.
         #[arg(long)]
         no_open: bool,
     },
@@ -93,8 +91,8 @@ fn pair() {
             println!();
             println!("  Pairing code:  {code}");
             println!();
-            println!("  On your other device, open https://app.cubo.spheceo.com,");
-            println!("  point it at this machine, and enter the code when asked.");
+            println!("  On your other device, open this machine's Cubo URL");
+            println!("  (http://<host>:8765), and enter the code when asked.");
             println!("  It stays valid for about {remaining} more seconds — run");
             println!("  `cubo pair` again any time for a fresh one. Each code you");
             println!("  redeem pairs one more device; they all keep working.");
@@ -162,9 +160,7 @@ async fn serve(no_open: bool) {
     println!();
     println!("  Cubo is running.");
     println!();
-    println!("  Web app      https://app.cubo.spheceo.com  (opens automatically)");
-    println!("                It finds this machine on its own; nothing to configure.");
-    println!("  Engine       http://localhost:{port}  (local only)");
+    println!("  Web app      http://localhost:{port}  (opens automatically)");
     if cubo_engine::pairing::PAIRING_ENABLED {
         println!("  Pairing      run `cubo pair` in another terminal to get a code");
         println!("                that connects your other devices to this Cubo.");
@@ -181,7 +177,7 @@ async fn serve(no_open: bool) {
     println!();
 
     if !no_open {
-        open_browser("https://app.cubo.spheceo.com");
+        open_browser(&format!("http://127.0.0.1:{port}"));
     }
 
     tokio::signal::ctrl_c()

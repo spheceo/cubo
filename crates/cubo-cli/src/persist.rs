@@ -62,8 +62,7 @@ fn install_inner() -> Result<(), String> {
     println!("  Cubo will keep running in the background.");
     println!();
     println!("  Starts on login, and restarts on its own if it exits.");
-    println!("  Web app      https://app.cubo.spheceo.com");
-    println!("  Engine       http://localhost:{ENGINE_PORT}  (local only)");
+    println!("  Web app      http://localhost:{ENGINE_PORT}");
     println!("  Logs         {}", log_dir.join("boot-service.log").display());
     println!("  Stop later   cubo unpersist");
     println!();
