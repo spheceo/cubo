@@ -90,9 +90,11 @@ connections.
  header is only granted to origins passing the allowlist.
 4. **Cache deletion refuses `..` components** in recorded file paths (they
  come from untrusted torrent metadata).
-5. **The deployed API proxies are allowlisted** (`apps/web/api/*.ts`): each
- route only forwards the exact request shapes the app makes. Add a pattern
- when the client grows a new endpoint, or it 404s.
+5. **Catalog and stream proxies are allowlisted** (`crates/cubo-engine/src/catalog.rs`
+ and the Cloudflare Worker in `apps/catalog`): each route only forwards the
+ exact request shapes the app makes. Add a pattern when the client grows a
+ new endpoint, or it 404s. The TMDB key lives on the Worker, never in the
+ CLI. Vite still uses `apps/web/api/*.ts` for `just web`.
 6. **ffmpeg sidecars are pinned + checksum-verified**
  (`scripts/fetch-ffmpeg.mjs`): exact upstream build URLs with
  recorded SHA-256 per file. To bump ffmpeg, update URL and hash together.
@@ -104,10 +106,12 @@ library snapshot) — progress ticks are hot-path.
 
 - `apps/web` — Vite + React 19 frontend (TanStack Query cache, lazy routes,
   native scrolling — Lenis was removed on purpose, do not reintroduce
-  scroll-hijacking).
+  scroll-hijacking). Release Core embeds `dist`.
+- `apps/catalog` — Cloudflare Worker that holds `TMDB_API_KEY` and returns
+  allowlisted TMDB JSON. Workers.dev is fine; no custom domain required.
 - `crates/cubo-engine` / `crates/cubo-cli` — Cubo Core: axum bridge on port
   8765, rqbit torrent engine, ffmpeg remux pipeline (`transcode.rs`),
-  exposed as the `cubo` CLI.
+  embedded UI, catalog/stream proxies, exposed as the `cubo` CLI.
 - `apps/site` — standalone marketing site (cubo.spheceo.com, Vercel project
   `cubo-site`). Deliberately has NO workspace dependencies so it deploys in
   isolation.
@@ -121,9 +125,10 @@ repo, built by `.github/workflows/release.yml`.
 
 - **Release ritual:** bump `version` in the workspace `Cargo.toml`
   (`[workspace.package]`), commit, then
-  `git tag vX.Y.Z && git push origin vX.Y.Z`. CI builds the CLI for macOS
-  (Apple Silicon + Intel), Windows x64, Linux x64, and Linux arm64, and
-  uploads `cubo-cli-<target>.tar.gz` archives with ffmpeg sidecars.
+  `git tag vX.Y.Z && git push origin HEAD && git push origin vX.Y.Z`. CI
+  builds the web app, embeds it in the CLI for macOS (Apple Silicon + Intel),
+  Windows x64, Linux x64, and Linux arm64, and uploads
+  `cubo-cli-<target>.tar.gz` archives with ffmpeg sidecars.
 - **ffmpeg sidecars:** `node scripts/fetch-ffmpeg.mjs` downloads static
   ffmpeg/ffprobe into `scripts/binaries/` (gitignored) with target-triple
   names. CI packs them next to the CLI binary, where

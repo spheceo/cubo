@@ -12,6 +12,8 @@ use tokio::sync::Mutex;
 const REPO: &str = "spheceo/cubo";
 const USER_AGENT: &str = concat!("cubo-cli/", env!("CARGO_PKG_VERSION"));
 const CHECK_CACHE_SECONDS: u64 = 24 * 60 * 60;
+/// "You're current" must not hide a release that lands later the same day.
+const NEGATIVE_CHECK_CACHE_SECONDS: u64 = 10 * 60;
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,13 +358,21 @@ fn read_fresh_cache() -> Option<Option<LatestRelease>> {
     if cache.current_version != env!("CARGO_PKG_VERSION") {
         return None;
     }
-    if unix_seconds().saturating_sub(cache.checked_at) >= CHECK_CACHE_SECONDS {
+    if unix_seconds().saturating_sub(cache.checked_at) >= cache_ttl(&cache) {
         return None;
     }
     match (cache.latest, cache.asset_url) {
         (Some(tag), Some(asset_url)) => Some(Some(LatestRelease { tag, asset_url })),
         (None, _) => Some(None),
         _ => None,
+    }
+}
+
+fn cache_ttl(cache: &CheckCache) -> u64 {
+    if cache.latest.is_none() {
+        NEGATIVE_CHECK_CACHE_SECONDS
+    } else {
+        CHECK_CACHE_SECONDS
     }
 }
 
@@ -635,5 +645,23 @@ mod tests {
         let manager = UpdateManager::new();
         assert!(!manager.applying.load(Ordering::Acquire));
         assert_eq!(current_version_string(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn up_to_date_checks_expire_faster_than_known_updates() {
+        let negative = CheckCache {
+            checked_at: 0,
+            current_version: "0.0.10".into(),
+            latest: None,
+            asset_url: None,
+        };
+        let positive = CheckCache {
+            checked_at: 0,
+            current_version: "0.0.10".into(),
+            latest: Some("v0.0.11".into()),
+            asset_url: Some("https://example.invalid/cubo.tar.gz".into()),
+        };
+        assert_eq!(cache_ttl(&negative), 10 * 60);
+        assert_eq!(cache_ttl(&positive), 24 * 60 * 60);
     }
 }

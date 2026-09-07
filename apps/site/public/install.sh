@@ -67,7 +67,7 @@ echo "Cubo installed. To start streaming:"
 echo "  1. Keep it running: cubo persist"
 echo "     (Starts on login, restarts if it exits — like a background service.)"
 echo "  2. Or this terminal: cubo serve"
-echo "     A browser tab opens app.cubo.spheceo.com automatically."
+echo "     A browser tab opens http://127.0.0.1:8765 automatically."
 echo "  3. Search titles:   cubo search \"avengers\""
 echo "  4. Update later:    cubo update"
 echo

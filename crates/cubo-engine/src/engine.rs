@@ -41,12 +41,8 @@ use crate::update::UpdateManager;
 const CORE_PORT: u16 = 8765;
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Catalog pages and static assets. Fail before the old 45 s hang when the
-/// deployed web origin is unreachable. `/api/*` (Torrentio) gets longer.
+/// Vite origin is unreachable. `/api/*` is handled by Core itself.
 const WEB_PROXY_TIMEOUT: Duration = Duration::from_secs(8);
-const WEB_PROXY_API_TIMEOUT: Duration = Duration::from_secs(20);
-/// Canonical web deployment. Release builds proxy browser visitors here and
-/// trust its origin. Set to "" to disable the browser gateway entirely.
-const WEB_DEPLOYMENT_URL: &str = "https://app.cubo.spheceo.com";
 // The Vite dev server uses the loopback pair.
 const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = [
     "http://localhost:4200",
@@ -505,26 +501,14 @@ fn allowed_origins(web_origin: Option<&str>) -> Arc<Vec<HeaderValue>> {
     Arc::new(origins)
 }
 
-/// The deployment Core proxies browser-hosted pages to. Debug builds use the
-/// local Vite server; release builds use WEB_DEPLOYMENT_URL.
+/// Debug builds proxy the local Vite server. Release builds serve the
+/// embedded Vite `dist` and leave this unset.
 fn resolve_web_origin() -> Result<Option<Arc<str>>, String> {
-    let origin = if cfg!(debug_assertions) {
-        "http://127.0.0.1:4200"
+    if cfg!(debug_assertions) {
+        Ok(Some("http://127.0.0.1:4200".into()))
     } else {
-        WEB_DEPLOYMENT_URL
-    };
-    let origin = origin.trim().trim_end_matches('/');
-    if origin.is_empty() {
-        return Ok(None);
+        Ok(None)
     }
-
-    let parsed = reqwest::Url::parse(origin)
-        .map_err(|error| format!("invalid WEB_DEPLOYMENT_URL: {error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("WEB_DEPLOYMENT_URL must use HTTP or HTTPS".into());
-    }
-
-    Ok(Some(origin.to_owned().into()))
 }
 
 /// Browsers gate public-site requests to local servers behind a preflight
@@ -1479,15 +1463,19 @@ fn directory_size(path: &std::path::Path) -> std::io::Result<u64> {
     Ok(size)
 }
 
-/// Everything outside /v1/* lands here: websocket upgrades (Vite HMR in dev)
-/// go to the socket proxy, normal requests to the web proxy, and when no web
-/// deployment is configured Core serves a small status page instead.
+/// `/api/*` is Core's catalog/stream/subtitle proxies. Everything else is
+/// the Vite app: debug proxies the local dev server (including HMR sockets);
+/// release serves the embedded `dist`.
 async fn web_fallback(
     State(state): State<BridgeState>,
     request: axum::extract::Request,
 ) -> Response {
+    if request.uri().path().starts_with("/api/") {
+        return crate::catalog::proxy(&state.client, request).await;
+    }
+
     let Some(web_origin) = state.web_origin.clone() else {
-        return core_status_page();
+        return crate::web_static::serve(request.uri().path());
     };
 
     let is_socket_upgrade = request
@@ -1507,20 +1495,6 @@ async fn web_fallback(
     }
 
     proxy_web_app(state, web_origin, request).await
-}
-
-fn core_status_page() -> Response {
-    let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>cubo core</title>\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>\
-         <body style=\"margin:0;min-height:100vh;display:grid;place-items:center;background:#08080a;color:#f5f5f3;\
-         font-family:ui-sans-serif,system-ui,sans-serif;text-align:center\">\
-         <p><strong>cubo core</strong> v{} is running on this device.<br>\
-         <span style=\"color:#a3a3ab;font-size:0.9em\">This build has no web deployment configured.</span></p>\
-         </body></html>",
-        env!("CARGO_PKG_VERSION"),
-    );
-    ([(CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
 }
 
 async fn proxy_web_app(
@@ -1551,12 +1525,7 @@ async fn proxy_web_app(
         upstream = upstream.body(body);
     }
 
-    let timeout = if path.starts_with("/api/") {
-        WEB_PROXY_API_TIMEOUT
-    } else {
-        WEB_PROXY_TIMEOUT
-    };
-    match upstream.timeout(timeout).send().await {
+    match upstream.timeout(WEB_PROXY_TIMEOUT).send().await {
         Ok(response) => proxy_web_response(response),
         Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
     }

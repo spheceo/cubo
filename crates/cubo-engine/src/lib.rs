@@ -2,6 +2,7 @@
 //! The `cubo` CLI exposes the /v1 API the web app talks to.
 
 pub mod cache;
+pub mod catalog;
 pub mod engine;
 pub mod logging;
 pub mod pairing;
@@ -10,6 +11,7 @@ pub mod store;
 pub mod system;
 pub mod transcode;
 pub mod update;
+pub mod web_static;
 
 #[cfg(unix)]
 /// macOS launches apps with a soft limit of ~256 open file descriptors.

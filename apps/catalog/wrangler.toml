@@ -1,0 +1,13 @@
+name = "cubo-catalog"
+main = "src/index.ts"
+compatibility_date = "2026-09-07"
+workers_dev = true
+preview_urls = false
+
+[[ratelimits]]
+name = "LIMIT"
+namespace_id = "8765"
+
+[ratelimits.simple]
+limit = 60
+period = 60

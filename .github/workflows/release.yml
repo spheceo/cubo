@@ -21,11 +21,25 @@ jobs:
           gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
             gh release create "$TAG" --repo "$REPO" --title "Cubo $TAG" --generate-notes
 
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build the embedded web app
+        run: bun install && bun --filter @cubo/web build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cubo-web-dist
+          path: apps/web/dist
+
   # Headless CLI (`cubo serve`). Ships as a plain tarball with the ffmpeg
   # sidecars bundled next to the binary — curl-installed files never carry a
   # browser quarantine marker, so unsigned distribution just works.
   cli:
-    needs: prepare
+    needs: [prepare, web]
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +74,11 @@ jobs:
 
       - name: Fetch ffmpeg sidecar binaries
         run: node scripts/fetch-ffmpeg.mjs --target ${{ matrix.target }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cubo-web-dist
+          path: apps/web/dist
 
       - name: Build CLI
         run: cargo build --release -p cubo-cli --target ${{ matrix.target }}

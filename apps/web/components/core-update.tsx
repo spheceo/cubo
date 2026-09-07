@@ -14,6 +14,7 @@ import {
   type CoreUpdateStatus,
   type UpdatePhase,
 } from '@/lib/local-engine';
+import { coalesceLatest, fetchGithubLatestTag } from '@/lib/update-check';
 import { useCore } from './core-provider';
 
 const APPLYING_KEY = 'cubo.updatingTo';
@@ -81,6 +82,13 @@ function useCoreUpdateState() {
     const read = async () => {
       try {
         const next = await getUpdateStatus(connection);
+        if (!next.latest) {
+          next.latest = coalesceLatest(
+            next.latest,
+            await fetchGithubLatestTag(),
+            connection.version,
+          );
+        }
         if (!cancelled) setStatus(next);
       } catch {
         if (!cancelled && !sessionStorage.getItem(APPLYING_KEY)) setStatus(null);
