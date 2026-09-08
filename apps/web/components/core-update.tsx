@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import { useSearchParams } from 'react-router';
@@ -12,22 +13,27 @@ import {
   downloadUpdate,
   getUpdateStatus,
   type CoreUpdateStatus,
-  type UpdatePhase,
 } from '@/lib/local-engine';
 import { coalesceLatest, fetchGithubLatestTag } from '@/lib/update-check';
+import {
+  mergeUpdateStatus,
+  updateButtonLabel,
+  updateInProgress,
+  updateProgressPercent,
+} from '@/lib/update-ui';
 import { useCore } from './core-provider';
 
 const APPLYING_KEY = 'cubo.updatingTo';
 
 function previewStatus(kind: string | null): CoreUpdateStatus | null {
-  if (kind === 'download') {
-    return { current: '0.0.9', latest: 'v0.1.0', state: 'idle' };
+  if (kind === 'download' || kind === 'updating') {
+    return { current: '0.0.9', latest: 'v0.1.0', state: 'downloading', progress: 0.12 };
   }
   if (kind === 'ready') {
-    return { current: '0.0.9', latest: 'v0.1.0', state: 'ready' };
+    return { current: '0.0.9', latest: 'v0.1.0', state: 'idle' };
   }
   if (kind === 'applying') {
-    return { current: '0.0.9', latest: 'v0.1.0', state: 'applying' };
+    return { current: '0.0.9', latest: 'v0.1.0', state: 'applying', progress: 1 };
   }
   return null;
 }
@@ -44,8 +50,8 @@ interface UpdateContextValue {
   status: CoreUpdateStatus | null;
   busy: boolean;
   applying: boolean;
-  download: () => Promise<void>;
-  apply: () => Promise<void>;
+  inProgress: boolean;
+  start: () => Promise<void>;
 }
 
 const UpdateContext = createContext<UpdateContextValue | null>(null);
@@ -64,15 +70,20 @@ export function useCoreUpdate() {
 function useCoreUpdateState() {
   const { connection } = useCore();
   const [searchParams] = useSearchParams();
-  const preview = import.meta.env.DEV ? previewStatus(searchParams.get('updatePreview')) : null;
-  const [status, setStatus] = useState<CoreUpdateStatus | null>(preview);
+  const previewKind = import.meta.env.DEV ? searchParams.get('updatePreview') : null;
+  const [status, setStatus] = useState<CoreUpdateStatus | null>(() => previewStatus(previewKind));
   const [busy, setBusy] = useState(false);
+  const inFlightRef = useRef(false);
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   useEffect(() => {
-    if (preview) {
-      setStatus(preview);
-      return;
-    }
+    const next = previewStatus(previewKind);
+    if (next) setStatus(next);
+  }, [previewKind]);
+
+  useEffect(() => {
+    if (previewKind) return;
     if (!connection) {
       setStatus(null);
       return;
@@ -89,20 +100,37 @@ function useCoreUpdateState() {
             connection.version,
           );
         }
-        if (!cancelled) setStatus(next);
+        if (!cancelled) {
+          setStatus((current) => mergeUpdateStatus(current, next, inFlightRef.current));
+        }
       } catch {
-        if (!cancelled && !sessionStorage.getItem(APPLYING_KEY)) setStatus(null);
+        if (!cancelled && !sessionStorage.getItem(APPLYING_KEY) && !inFlightRef.current) {
+          setStatus(null);
+        }
       }
     };
 
     void read();
     const applying = status?.state === 'applying' || Boolean(sessionStorage.getItem(APPLYING_KEY));
-    const timer = window.setInterval(() => void read(), applying || status?.state === 'downloading' ? 1_000 : 30_000);
+    const live = applying || status?.state === 'downloading' || busy;
+    const timer = window.setInterval(() => void read(), live ? 400 : 30_000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [connection, preview, status?.state]);
+  }, [busy, connection, previewKind, status?.state]);
+
+  useEffect(() => {
+    if (previewKind !== 'download' && previewKind !== 'updating') return;
+    const seed = previewStatus(previewKind);
+    if (!seed) return;
+    let progress = seed.progress ?? 0.08;
+    const timer = window.setInterval(() => {
+      progress = Math.min(0.92, progress + 0.05);
+      setStatus({ ...seed, state: 'downloading', progress });
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [previewKind]);
 
   useEffect(() => {
     const expected = sessionStorage.getItem(APPLYING_KEY);
@@ -132,96 +160,140 @@ function useCoreUpdateState() {
     };
   }, [connection, status?.state]);
 
-  const download = useCallback(async () => {
-    if (!connection || busy) return;
-    setBusy(true);
-    setStatus((current) =>
-      current ? { ...current, state: 'downloading' as UpdatePhase, error: null } : current,
-    );
-    try {
-      setStatus(await downloadUpdate(connection));
-    } catch (reason) {
-      setStatus((current) => ({
-        current: current?.current ?? connection.version,
-        latest: current?.latest ?? null,
-        state: 'idle',
-        error: reason instanceof Error ? reason.message : 'Could not download the update',
-      }));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, connection]);
-
-  const apply = useCallback(async () => {
-    if (!connection || busy) return;
-    const latest = status?.latest;
+  const start = useCallback(async () => {
+    if (!connection || busy || previewKind) return;
+    const latest = statusRef.current?.latest;
     if (!latest) return;
+    const alreadyReady = statusRef.current?.state === 'ready';
+    inFlightRef.current = true;
     setBusy(true);
-    sessionStorage.setItem(APPLYING_KEY, latest);
     setStatus((current) =>
-      current ? { ...current, state: 'applying' as UpdatePhase, error: null } : current,
+      current
+        ? {
+            ...current,
+            state: alreadyReady ? 'applying' : 'downloading',
+            error: null,
+            progress: alreadyReady ? 1 : (current.progress ?? 0),
+          }
+        : current,
     );
     try {
+      if (!alreadyReady) {
+        const downloaded = await downloadUpdate(connection);
+        setStatus(downloaded);
+        if (downloaded.state !== 'ready') {
+          throw new Error(downloaded.error || 'Could not download the update');
+        }
+      }
+      sessionStorage.setItem(APPLYING_KEY, latest);
+      setStatus((current) =>
+        current ? { ...current, state: 'applying', progress: 1, error: null } : current,
+      );
       setStatus(await applyUpdate(connection));
     } catch (reason) {
       sessionStorage.removeItem(APPLYING_KEY);
       setStatus((current) => ({
         current: current?.current ?? connection.version,
         latest: current?.latest ?? latest,
-        state: 'ready',
+        state: 'idle',
+        progress: 0,
         error: reason instanceof Error ? reason.message : 'Could not install the update',
       }));
     } finally {
+      inFlightRef.current = false;
       setBusy(false);
     }
-  }, [busy, connection, status?.latest]);
+  }, [busy, connection, previewKind]);
 
   const applying = status?.state === 'applying' || Boolean(sessionStorage.getItem(APPLYING_KEY));
+  const inProgress = updateInProgress(status?.state, busy) || applying;
   return useMemo(
-    () => ({ status, busy, applying, download, apply }),
-    [apply, applying, busy, download, status],
+    () => ({ status, busy, applying, inProgress, start }),
+    [applying, busy, inProgress, start, status],
   );
 }
 
-export function UpdatePill() {
-  const { status, busy, applying, download, apply } = useCoreUpdate();
-  if (!status?.latest || applying) return null;
-
-  const label =
-    status.state === 'ready' || status.state === 'downloading'
-      ? status.state === 'downloading'
-        ? `Downloading ${displayTag(status.latest)}`
-        : `Update to ${displayTag(status.latest)}`
-      : `Download ${displayTag(status.latest)}`;
+function UpdateActionButton({
+  status,
+  busy,
+  disabled,
+  onClick,
+}: {
+  status: CoreUpdateStatus;
+  busy: boolean;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  const live = updateInProgress(status.state, busy);
+  const percent = updateProgressPercent(status.progress);
+  const indeterminate = live && status.state === 'downloading' && percent == null;
+  const fill = status.state === 'applying' || (busy && status.state === 'ready') ? 100 : percent;
+  const label = updateButtonLabel(status, busy);
 
   return (
     <button
       type="button"
-      disabled={busy || status.state === 'downloading'}
-      onClick={() => {
-        if (status.state === 'ready') void apply();
-        else void download();
-      }}
-      title={status.error ?? undefined}
-      className="h-10 shrink-0 cursor-pointer rounded-full bg-fg px-5 text-sm font-semibold text-ink transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-70"
+      disabled={disabled}
+      onClick={onClick}
+      title={status.error ?? (status.latest ? `Update to ${displayTag(status.latest)}` : undefined)}
+      aria-label={status.latest ? `Update to ${displayTag(status.latest)}` : 'Update'}
+      aria-busy={live}
+      className="relative isolate h-10 min-w-[9.5rem] shrink-0 overflow-hidden rounded-full bg-fg px-5 text-sm font-semibold text-ink transition-opacity hover:opacity-90 disabled:cursor-wait"
     >
-      {label}
+      {live ? (
+        <span
+          aria-hidden
+          className={`absolute inset-y-0 left-0 bg-black/25 ${
+            indeterminate ? 'update-fill-loop' : 'transition-[width] duration-300 ease-out'
+          }`}
+          style={indeterminate ? undefined : { width: `${fill ?? 0}%` }}
+        />
+      ) : null}
+      <span className="relative">{label}</span>
     </button>
   );
 }
 
-export function UpdateOverlay() {
-  const { status, applying } = useCoreUpdate();
-  if (!applying) return null;
-  const latest = status?.latest ? displayTag(status.latest) : 'the new version';
+export function UpdatePill() {
+  const { status, busy, inProgress, start } = useCoreUpdate();
+  if (!status?.latest || inProgress) return null;
 
   return (
-    <div className="fixed inset-0 z-[100]">
-      <div className="bg-fg px-6 py-3 text-center text-sm font-semibold text-ink">
-        Update in progress — Cubo will refresh when {latest} is ready. You can&rsquo;t watch or change
-        settings until then.
+    <UpdateActionButton
+      status={status}
+      busy={busy}
+      disabled={busy}
+      onClick={() => void start()}
+    />
+  );
+}
+
+export function UpdateOverlay() {
+  const { status, busy, applying, inProgress, start } = useCoreUpdate();
+  if (!status?.latest || !inProgress) return null;
+  const latest = displayTag(status.latest);
+
+  return (
+    <div className="pointer-events-none fixed inset-0 z-[100]">
+      {applying ? (
+        <div
+          className="pointer-events-auto absolute inset-0 cursor-wait bg-background/70"
+          aria-hidden="true"
+        />
+      ) : null}
+      <div className="pointer-events-auto relative flex items-center justify-center gap-3 border-b border-line bg-panel px-4 py-2.5">
+        <p className="m-0 hidden text-sm text-muted sm:block">
+          {applying
+            ? `Installing ${latest} — Cubo will refresh when it is ready.`
+            : `Downloading ${latest} — Cubo will install it when this finishes.`}
+        </p>
+        <UpdateActionButton
+          status={status}
+          busy={busy}
+          disabled
+          onClick={() => void start()}
+        />
       </div>
-      <div className="absolute inset-0 top-11 cursor-wait bg-background/70" aria-hidden="true" />
     </div>
   );
 }

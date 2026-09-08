@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "cubo-cli"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "clap",
  "cubo-engine",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "cubo-engine"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "axum",

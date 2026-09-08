@@ -748,6 +748,8 @@ export interface CoreUpdateStatus {
   latest: string | null;
   state: UpdatePhase;
   error?: string | null;
+  /** 0–1 while Core is streaming the release. Absent on older Cores. */
+  progress?: number | null;
 }
 
 export async function getUpdateStatus(

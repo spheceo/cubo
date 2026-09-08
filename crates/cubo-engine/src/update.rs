@@ -1,11 +1,12 @@
 //! In-process CLI updater: check GitHub, stage a release, then swap the
-//! running binary. The web UI drives download and apply as two steps so the
-//! page can stay up while Core restarts into the new image.
+//! running binary. The web UI starts download then apply as one action;
+//! GET /v1/update reports byte progress while the archive streams in.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -32,6 +33,9 @@ pub struct UpdateStatus {
     pub latest: Option<String>,
     pub state: UpdatePhase,
     pub error: Option<String>,
+    /// 0–1 while a release is streaming in. 1 once staged or applying.
+    #[serde(default)]
+    pub progress: f64,
 }
 
 #[derive(Clone)]
@@ -80,6 +84,9 @@ struct Inner {
 pub struct UpdateManager {
     inner: Mutex<Inner>,
     applying: AtomicBool,
+    /// Thousandths of completion so status() can read progress without
+    /// waiting on the download lock.
+    progress_millis: AtomicU32,
 }
 
 impl Default for UpdateManager {
@@ -101,7 +108,13 @@ impl UpdateManager {
                 error: None,
             }),
             applying: AtomicBool::new(false),
+            progress_millis: AtomicU32::new(0),
         }
+    }
+
+    fn set_progress(&self, progress: f64) {
+        let millis = (progress.clamp(0.0, 1.0) * 1000.0).round() as u32;
+        self.progress_millis.store(millis, Ordering::Release);
     }
 
     pub async fn status(&self) -> UpdateStatus {
@@ -116,7 +129,15 @@ impl UpdateManager {
                     .or_else(read_staged_tag),
                 state: UpdatePhase::Applying,
                 error: None,
+                progress: 1.0,
             };
+        }
+
+        {
+            let inner = self.inner.lock().await;
+            if inner.state == UpdatePhase::Downloading {
+                return self.snapshot(&inner);
+            }
         }
 
         let latest = match check_for_latest_cached().await {
@@ -141,26 +162,52 @@ impl UpdateManager {
         if inner.state == UpdatePhase::Idle && staged_matches(inner.latest.as_ref()) {
             inner.state = UpdatePhase::Ready;
         }
-        UpdateStatus {
-            current: current_version_string(),
-            latest: inner.latest.as_ref().map(|release| release.tag.clone()),
-            state: inner.state,
-            error: inner.error.clone(),
-        }
+        self.snapshot(&inner)
     }
 
     pub async fn download(&self) -> Result<UpdateStatus, String> {
         if self.applying.load(Ordering::Acquire) {
             return Ok(self.status().await);
         }
-        let latest = match check_for_latest().await? {
-            Some(latest) => latest,
-            None => {
+
+        loop {
+            let state = self.inner.lock().await.state;
+            if state != UpdatePhase::Downloading {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        {
+            let inner = self.inner.lock().await;
+            if inner.state == UpdatePhase::Ready && staged_binary().is_some() {
+                self.set_progress(1.0);
+                return Ok(self.snapshot(&inner));
+            }
+        }
+
+        {
+            let mut inner = self.inner.lock().await;
+            inner.state = UpdatePhase::Downloading;
+            inner.error = None;
+        }
+        self.set_progress(0.0);
+
+        let latest = match check_for_latest().await {
+            Ok(Some(latest)) => latest,
+            Ok(None) => {
                 let mut inner = self.inner.lock().await;
                 inner.latest = None;
                 inner.state = UpdatePhase::Idle;
                 inner.error = None;
+                self.set_progress(0.0);
                 return Ok(self.snapshot(&inner));
+            }
+            Err(error) => {
+                let mut inner = self.inner.lock().await;
+                inner.state = UpdatePhase::Idle;
+                inner.error = Some(error.clone());
+                self.set_progress(0.0);
+                return Err(error);
             }
         };
         {
@@ -169,20 +216,28 @@ impl UpdateManager {
                 tag: latest.tag.clone(),
                 asset_url: latest.asset_url.clone(),
             });
+            if staged_matches(Some(&latest)) {
+                inner.state = UpdatePhase::Ready;
+                inner.error = None;
+                self.set_progress(1.0);
+                return Ok(self.snapshot(&inner));
+            }
             inner.state = UpdatePhase::Downloading;
             inner.error = None;
         }
-        match stage_release(&latest).await {
+        match stage_release(&latest, |fraction| self.set_progress(fraction)).await {
             Ok(()) => {
                 let mut inner = self.inner.lock().await;
                 inner.state = UpdatePhase::Ready;
                 inner.error = None;
+                self.set_progress(1.0);
                 Ok(self.snapshot(&inner))
             }
             Err(error) => {
                 let mut inner = self.inner.lock().await;
                 inner.state = UpdatePhase::Idle;
                 inner.error = Some(error.clone());
+                self.set_progress(0.0);
                 Err(error)
             }
         }
@@ -217,11 +272,13 @@ impl UpdateManager {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             relaunch_or_exit();
         });
+        self.set_progress(1.0);
         Ok(UpdateStatus {
             current: current_version_string(),
             latest: Some(latest.tag),
             state: UpdatePhase::Applying,
             error: None,
+            progress: 1.0,
         })
     }
 
@@ -231,6 +288,7 @@ impl UpdateManager {
             latest: inner.latest.as_ref().map(|release| release.tag.clone()),
             state: inner.state,
             error: inner.error.clone(),
+            progress: self.progress_millis.load(Ordering::Acquire) as f64 / 1000.0,
         }
     }
 }
@@ -295,7 +353,7 @@ pub async fn perform(tag: &str, asset_url: &str) -> bool {
         tag: tag.to_owned(),
         asset_url: asset_url.to_owned(),
     };
-    if let Err(error) = stage_release(&release).await {
+    if let Err(error) = stage_release(&release, |_| {}).await {
         eprintln!("Update failed: {error}");
         return false;
     }
@@ -430,11 +488,13 @@ fn staged_binary() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-async fn stage_release(release: &LatestRelease) -> Result<(), String> {
+async fn stage_release(release: &LatestRelease, report: impl Fn(f64)) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let archive = download(&client, &release.asset_url).await?;
+    report(0.0);
+    let archive = download_body(&client, &release.asset_url, |fraction| report(fraction * 0.9)).await?;
+    report(0.9);
     let checksum_url = format!("{}.sha256", release.asset_url);
-    let expected = download(&client, &checksum_url)
+    let expected = download_body(&client, &checksum_url, |_| {})
         .await
         .ok()
         .and_then(|bytes| {
@@ -447,6 +507,7 @@ async fn stage_release(release: &LatestRelease) -> Result<(), String> {
     if expected.is_empty() {
         return Err("release has no checksum file; refusing to install".into());
     }
+    report(0.94);
     use sha2::{Digest, Sha256};
     let digest = hex::encode(Sha256::digest(&archive));
     if digest != expected {
@@ -454,6 +515,7 @@ async fn stage_release(release: &LatestRelease) -> Result<(), String> {
             "checksum mismatch (expected {expected}, got {digest})"
         ));
     }
+    report(0.96);
 
     let dir = stage_dir();
     let _ = std::fs::remove_dir_all(&dir);
@@ -473,6 +535,7 @@ async fn stage_release(release: &LatestRelease) -> Result<(), String> {
         serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("could not write update manifest ({error})"))?;
+    report(1.0);
     Ok(())
 }
 
@@ -610,10 +673,15 @@ fn spawn_delayed_relaunch(exe: &Path, args: &[std::ffi::OsString]) {
     }
 }
 
-async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+async fn download_body(
+    client: &reqwest::Client,
+    url: &str,
+    mut report: impl FnMut(f64),
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await
@@ -621,11 +689,26 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    response
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| error.to_string())
+    let total = response.content_length();
+    let mut body = Vec::new();
+    if let Some(total) = total {
+        body.reserve(usize::try_from(total.min(80 * 1024 * 1024)).unwrap_or(0));
+    }
+    let mut stream = response.bytes_stream();
+    let mut last_report = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        body.extend_from_slice(&chunk);
+        let downloaded = body.len() as u64;
+        if let Some(total) = total.filter(|total| *total > 0) {
+            if downloaded == total || downloaded.saturating_sub(last_report) >= 256 * 1024 {
+                last_report = downloaded;
+                report((downloaded as f64 / total as f64).min(1.0));
+            }
+        }
+    }
+    report(1.0);
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -645,6 +728,16 @@ mod tests {
         let manager = UpdateManager::new();
         assert!(!manager.applying.load(Ordering::Acquire));
         assert_eq!(current_version_string(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(manager.progress_millis.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn progress_stores_thousandths() {
+        let manager = UpdateManager::new();
+        manager.set_progress(0.42);
+        assert_eq!(manager.progress_millis.load(Ordering::Acquire), 420);
+        manager.set_progress(1.5);
+        assert_eq!(manager.progress_millis.load(Ordering::Acquire), 1000);
     }
 
     #[test]
