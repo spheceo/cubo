@@ -1,10 +1,10 @@
 # Cubo task runner. `just` lists recipes.
 
-# Run Cubo Core (the CLI) on :8765
-dev: stop-persist
+# Run Cubo Core. Uses :8765, or the next free port if persist already owns it.
+dev:
     cargo run -p cubo-cli -- serve --no-open
 
-# Stop a background `cubo persist` so this build can bind the engine ports
+# Stop a background `cubo persist` (does not run as part of `just dev`)
 stop-persist:
     #!/usr/bin/env sh
     set -eu

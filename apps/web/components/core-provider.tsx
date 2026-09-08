@@ -29,7 +29,7 @@ interface CoreContextValue {
   /** True once the startup connection attempt has finished (either way). */
   connectionChecked: boolean;
   endpoint: string;
-  /** True when this page is served by Cubo Core itself (port 8765). */
+  /** True when this page is served by Cubo Core itself. */
   isHosted: boolean;
   library: CoreLibrarySnapshot | null;
   openSettings: () => void;
@@ -93,7 +93,7 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const connect = useCallback(async () => {
-    // Resolve port 8765 from the live page URL at call time. This avoids a
+    // Resolve Core from the live page URL at call time. This avoids a
     // mount-effect race where a fast click on a Core-hosted page would probe
     // 127.0.0.1 on the viewing device instead of the Core serving the page.
     const pageCoreEndpoint = currentOriginCoreEndpoint();

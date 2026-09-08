@@ -39,6 +39,9 @@ use crate::transcode::TranscodeManager;
 use crate::update::UpdateManager;
 
 const CORE_PORT: u16 = 8765;
+/// How many ports after `CORE_PORT` to try when the preferred one is taken
+/// (e.g. `cubo persist` already owns :8765 and `just dev` should not kill it).
+const CORE_PORT_SCAN: u16 = 20;
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Catalog pages and static assets. Fail before the old 45 s hang when the
 /// Vite origin is unreachable. `/api/*` is handled by Core itself.
@@ -48,10 +51,9 @@ const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = [
     "http://localhost:4200",
     "http://127.0.0.1:4200",
 ];
-/// Ports a loopback or own-hostname origin may use: Core itself (pages it
-/// proxies) and the web dev server. Any other local port is some unrelated
-/// app and gets no CORS access.
-const ALLOWED_ORIGIN_PORTS: [u16; 2] = [CORE_PORT, 4200];
+/// Ports a loopback or own-hostname origin may always use, plus the port
+/// this process actually bound (see `OriginPolicy::allowed_ports`).
+const BASE_ALLOWED_ORIGIN_PORTS: [u16; 2] = [CORE_PORT, 4200];
 
 pub struct Engine {
     bridge_port: u16,
@@ -70,8 +72,9 @@ struct BridgeState {
     /// Hostnames/IPs this machine answers to (hostname, Tailscale IP). Pages
     /// served from e.g. http://kenobi:4200 on another tailnet device carry
     /// that origin, so the CORS layer accepts host matches — but only on
-    /// Cubo's own ports (see ALLOWED_ORIGIN_PORTS).
+    /// Cubo's own ports (see `allowed_origin_ports`).
     allowed_hosts: Arc<Vec<String>>,
+    bridge_port: u16,
     download_dir: Arc<RwLock<PathBuf>>,
     /// Last time a viewer was clearly pulling video (progress, buffer poll,
     /// remux segment). Playlist polls do not count — those continue while paused.
@@ -180,7 +183,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
 
             // Probed once here; binding and the CORS host allowlist both use it.
             let tailscale_address = detect_tailscale_ipv4();
-            let bridge_listeners = bind_bridges(tailscale_address).await?;
+            let (bridge_port, bridge_listeners) = bind_bridges(tailscale_address).await?;
             let bridge_addresses = bridge_listeners
                 .iter()
                 .filter_map(|listener| listener.local_addr().ok())
@@ -198,6 +201,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 client: reqwest::Client::new(),
                 web_origin: resolve_web_origin()?,
                 allowed_hosts: Arc::new(local_machine_hosts(tailscale_address)),
+                bridge_port,
                 download_dir: download_dir.clone(),
                 playback_last_ms: Arc::new(AtomicU64::new(0)),
                 cache_swap: Arc::new(Mutex::new(())),
@@ -217,7 +221,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
 
             tracing::info!(
                 target: "engine",
-                bridge_port = CORE_PORT,
+                bridge_port,
                 rqbit_port,
                 addresses = ?bridge_addresses,
                 "Cubo engine started"
@@ -237,7 +241,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             }
 
             Ok::<Engine, String>(Engine {
-                bridge_port: CORE_PORT,
+                bridge_port,
                 bridge_addresses,
                 download_dir,
                 _session: session,
@@ -296,7 +300,15 @@ pub fn status() -> serde_json::Value {
     }
 }
 
-async fn bind_bridges(tailscale_address: Option<IpAddr>) -> Result<Vec<TcpListener>, String> {
+enum BindAttempt {
+    Ready(Vec<TcpListener>),
+    Busy,
+    Failed(String),
+}
+
+async fn bind_bridges(
+    tailscale_address: Option<IpAddr>,
+) -> Result<(u16, Vec<TcpListener>), String> {
     let mut addresses = vec![
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -307,26 +319,58 @@ async fn bind_bridges(tailscale_address: Option<IpAddr>) -> Result<Vec<TcpListen
         }
     }
 
+    let last = CORE_PORT.saturating_add(CORE_PORT_SCAN - 1);
+    for port in CORE_PORT..=last {
+        match try_bind_port(&addresses, port).await {
+            BindAttempt::Ready(listeners) => {
+                if port != CORE_PORT {
+                    tracing::info!(
+                        target: "engine",
+                        preferred = CORE_PORT,
+                        port,
+                        "preferred port in use; bound the next free port"
+                    );
+                }
+                return Ok((port, listeners));
+            }
+            BindAttempt::Busy => continue,
+            BindAttempt::Failed(error) => return Err(error),
+        }
+    }
+
+    Err(format!(
+        "Cubo Core could not bind {CORE_PORT}-{last}: every port is in use"
+    ))
+}
+
+async fn try_bind_port(addresses: &[IpAddr], port: u16) -> BindAttempt {
     let mut listeners = Vec::new();
     for address in addresses {
-        match TcpListener::bind((address, CORE_PORT)).await {
+        match TcpListener::bind((*address, port)).await {
             Ok(listener) => listeners.push(listener),
-            Err(error) if address == IpAddr::V4(Ipv4Addr::LOCALHOST) => {
-                return Err(format!(
-                    "Cubo Core could not bind {address}:{CORE_PORT}: {error}"
-                ));
+            Err(error) if *address == IpAddr::V4(Ipv4Addr::LOCALHOST) => {
+                return if error.kind() == std::io::ErrorKind::AddrInUse {
+                    BindAttempt::Busy
+                } else {
+                    BindAttempt::Failed(format!(
+                        "Cubo Core could not bind {address}:{port}: {error}"
+                    ))
+                };
             }
             Err(error) => {
                 tracing::warn!(
                     target: "engine",
-                    %address, %error,
+                    %address, port, %error,
                     "Cubo Core could not bind optional address"
                 );
             }
         }
     }
-
-    Ok(listeners)
+    if listeners.is_empty() {
+        BindAttempt::Failed(format!("Cubo Core could not bind any address on port {port}"))
+    } else {
+        BindAttempt::Ready(listeners)
+    }
 }
 
 fn detect_tailscale_ipv4() -> Option<IpAddr> {
@@ -376,6 +420,7 @@ fn origin_host_port(origin: &HeaderValue) -> Option<(String, Option<u16>)> {
 struct OriginPolicy {
     allowed_origins: Arc<Vec<HeaderValue>>,
     allowed_hosts: Arc<Vec<String>>,
+    allowed_ports: Arc<Vec<u16>>,
 }
 
 impl OriginPolicy {
@@ -386,11 +431,19 @@ impl OriginPolicy {
         let Some((host, port)) = origin_host_port(origin) else {
             return false;
         };
-        if !port.is_some_and(|port| ALLOWED_ORIGIN_PORTS.contains(&port)) {
+        if !port.is_some_and(|port| self.allowed_ports.contains(&port)) {
             return false;
         }
         is_loopback_host(&host) || self.allowed_hosts.contains(&host)
     }
+}
+
+fn allowed_origin_ports(bridge_port: u16) -> Arc<Vec<u16>> {
+    let mut ports = BASE_ALLOWED_ORIGIN_PORTS.to_vec();
+    if !ports.contains(&bridge_port) {
+        ports.push(bridge_port);
+    }
+    Arc::new(ports)
 }
 
 /// Hostnames and addresses pages can use to reach this machine over the
@@ -425,6 +478,7 @@ fn bridge_router(state: BridgeState) -> Router {
     let policy = Arc::new(OriginPolicy {
         allowed_origins: allowed_origins(state.web_origin.as_deref()),
         allowed_hosts: state.allowed_hosts.clone(),
+        allowed_ports: allowed_origin_ports(state.bridge_port),
     });
     let cors_policy = policy.clone();
     let allow_origin =
@@ -2468,6 +2522,29 @@ mod tests {
     }
 
     #[test]
+    fn fallback_core_port_is_trusted_for_cors() {
+        let ports = allowed_origin_ports(8766);
+        assert!(ports.contains(&8765));
+        assert!(ports.contains(&4200));
+        assert!(ports.contains(&8766));
+    }
+
+    #[tokio::test]
+    async fn bind_bridges_moves_off_a_busy_preferred_port() {
+        let _occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, CORE_PORT))
+            .await
+            .ok();
+        let (port, listeners) = bind_bridges(None).await.expect("fallback bind");
+        if _occupied.is_some() || TcpListener::bind((Ipv4Addr::LOCALHOST, CORE_PORT)).await.is_err()
+        {
+            assert_ne!(port, CORE_PORT);
+        }
+        assert!(listeners
+            .iter()
+            .any(|listener| listener.local_addr().is_ok_and(|addr| addr.port() == port)));
+    }
+
+    #[test]
     fn default_origins_are_restricted() {
         assert_eq!(CORE_PORT, 8765);
         let origins = allowed_origins(Some("https://cubo.example.com"));
@@ -2540,6 +2617,7 @@ mod tests {
             client: reqwest::Client::new(),
             web_origin: Some(format!("http://127.0.0.1:{web_port}").into()),
             allowed_hosts: Arc::new(vec!["kenobi.test".into()]),
+            bridge_port: port,
             download_dir: Arc::new(RwLock::new(test_dir)),
             playback_last_ms: Arc::new(AtomicU64::new(0)),
             cache_swap: Arc::new(Mutex::new(())),

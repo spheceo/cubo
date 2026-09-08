@@ -90,6 +90,8 @@ export interface LibraryItem {
   lastWatchedAt: number;
   watchHref: string;
   detailHref: string;
+  /** Absolute seconds where end credits began, mapped while watching. */
+  creditsStartSeconds?: number | null;
 }
 
 export interface WatchLaterItem {

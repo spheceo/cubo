@@ -5,6 +5,8 @@ import {
   continueWatchingItems,
   historyForEpisode,
   latestHistoryForTitle,
+  nextEpisodeTarget,
+  playButtonLabel,
   watchHistoryItems,
 } from './library';
 
@@ -51,6 +53,22 @@ test('episode list progress is the row for that season and episode', () => {
   const e2 = item({ key: 'tv:1:1:2', mediaId: 1, season: 1, episode: 2, lastWatchedAt: 9, progress: 0.7 });
   assert.equal(historyForEpisode([e1, e2], 1, 1, 2)?.progress, 0.7);
   assert.equal(historyForEpisode([e1, e2], 1, 1, 3), undefined);
+});
+
+test('title play button names the last-touched episode', () => {
+  assert.equal(playButtonLabel('movie'), 'Watch Now');
+  assert.equal(playButtonLabel('tv', null, 2), 'Watch S2 E1');
+  assert.equal(playButtonLabel('tv', { season: 2, episode: 1 }), 'Continue S2 E1');
+});
+
+test('next episode walks the current season then the next season', () => {
+  const seasons = [
+    { seasonNumber: 1, episodeCount: 8 },
+    { seasonNumber: 2, episodeCount: 8 },
+  ];
+  assert.deepEqual(nextEpisodeTarget(seasons, 1, 7), { season: 1, episode: 8 });
+  assert.deepEqual(nextEpisodeTarget(seasons, 1, 8), { season: 2, episode: 1 });
+  assert.equal(nextEpisodeTarget(seasons, 2, 8), null);
 });
 
 test('continue watching also keeps the last-touched episode of a series', () => {

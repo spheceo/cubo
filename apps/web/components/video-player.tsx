@@ -16,6 +16,7 @@ import {
   IoPlay,
   IoPlayBack,
   IoPlayForward,
+  IoPlaySkipForward,
   IoSettingsSharp,
   IoVolumeHigh,
   IoVolumeLow,
@@ -27,7 +28,7 @@ import {
   MdPictureInPictureAlt,
 } from 'react-icons/md';
 import { IoIosArrowBack } from 'react-icons/io';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react';
 import type { CaptionColor, CaptionSize } from '@/lib/caption-prefs';
 import { CAPTION_COLORS } from '@/lib/caption-prefs';
 import {
@@ -41,9 +42,11 @@ import { findActiveCue, loadSubtitleCues, type SubtitleCue } from '@/lib/subtitl
 import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { formatTime } from '@/lib/format';
+import { nextEpisodeDue, normalizeCreditsStart, startCreditsMapper, creditsOverlayActive } from '@/lib/credits-detect';
 
 const HIDE_DELAY_MS = 2600;
 const SKIP_SECONDS = 10;
+const AUTO_NEXT_MS = 5_000;
 
 type BufferedRange = {
   start: number;
@@ -113,6 +116,12 @@ export function VideoPlayer({
   onPlaybackProgress,
   onSeekOutside,
   onError,
+  flushRef,
+  onNextEpisode,
+  playbackKey,
+  creditsStartSeconds = null,
+  onCreditsMapped,
+  onCreditsLog,
 }: {
   src: string;
   /** True when `src` is an HLS playlist from Core's remux pipeline. */
@@ -149,11 +158,21 @@ export function VideoPlayer({
     durationSeconds: number,
     watchedDeltaSeconds: number,
     sessionStarted: boolean,
+    persistNow?: boolean,
   ) => void;
   /** Called with an absolute target when a seek lands outside the converted
    *  window, so the owner can restart the converter at that position. */
   onSeekOutside?: (absoluteSeconds: number) => void;
   onError: () => void;
+  /** Parent calls this before leaving so progress is snapshotted while the
+   *  video element still has a real currentTime. */
+  flushRef?: MutableRefObject<(() => void) | null>;
+  /** Shown only after end credits were mapped for this episode. */
+  onNextEpisode?: () => void;
+  playbackKey?: string;
+  creditsStartSeconds?: number | null;
+  onCreditsMapped?: (seconds: number | null) => void;
+  onCreditsLog?: (event: string, data?: Record<string, unknown>) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -217,6 +236,10 @@ export function VideoPlayer({
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
   const [pipSupported, setPipSupported] = useState(false);
   const [activeCueText, setActiveCueText] = useState<string | null>(null);
+  const [creditsStart, setCreditsStart] = useState<number | null>(
+    normalizeCreditsStart(creditsStartSeconds),
+  );
+  const [watchingCredits, setWatchingCredits] = useState(false);
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
 
@@ -228,6 +251,14 @@ export function VideoPlayer({
   onSeekOutsideRef.current = onSeekOutside;
   const timeOffsetRef = useRef(timeOffset);
   timeOffsetRef.current = timeOffset;
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+  const creditsStartRef = useRef(creditsStart);
+  creditsStartRef.current = creditsStart;
+  const onCreditsMappedRef = useRef(onCreditsMapped);
+  onCreditsMappedRef.current = onCreditsMapped;
+  const onCreditsLogRef = useRef(onCreditsLog);
+  onCreditsLogRef.current = onCreditsLog;
 
   // Subtitles are rendered by Cubo, not the browser's native track layer:
   // cues are timed against the original file, so they are looked up against
@@ -635,20 +666,61 @@ export function VideoPlayer({
     };
   }, [settingsOpen]);
 
-  const keepControls = settingsOpen || heldPaused || blocked || reloadHold;
+  const shownTime = scrubTime ?? pendingSeek ?? timeOffset + currentTime;
+  const showNextEpisode = Boolean(onNextEpisode) && nextEpisodeDue(shownTime, duration, creditsStart);
+  const creditsOverlay = creditsOverlayActive(showNextEpisode, watchingCredits);
+  const keepControls = !creditsOverlay && (settingsOpen || heldPaused || blocked || reloadHold);
+  const creditsOverlayRef = useRef(creditsOverlay);
+  creditsOverlayRef.current = creditsOverlay;
+
+  useEffect(() => {
+    setCreditsStart(normalizeCreditsStart(creditsStartSeconds));
+    setWatchingCredits(false);
+  }, [creditsStartSeconds, src]);
+
+  useEffect(() => {
+    if (!playbackKey || (!onNextEpisode && !onCreditsMappedRef.current)) return;
+    const video = videoRef.current;
+    if (!video) return;
+    return startCreditsMapper({
+      video,
+      timeOffset: () => timeOffsetRef.current,
+      duration: () => durationRef.current,
+      knownStart: creditsStartRef.current,
+      playbackKey,
+      onMapped: (seconds) => {
+        creditsStartRef.current = seconds;
+        setCreditsStart(seconds);
+        onCreditsMappedRef.current?.(seconds);
+      },
+      onLog: (event, data) => onCreditsLogRef.current?.(event, data),
+    });
+  }, [src, playbackKey, onNextEpisode, creditsStartSeconds]);
 
   const revealControls = useCallback(() => {
+    if (creditsOverlayRef.current) return;
     setControlsVisible(true);
     if (hideTimer.current) window.clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => setControlsVisible(false), HIDE_DELAY_MS);
   }, []);
 
   useEffect(() => {
+    if (creditsOverlay) {
+      if (hideTimer.current) window.clearTimeout(hideTimer.current);
+      setControlsVisible(false);
+      return;
+    }
     if (keepControls) {
       if (hideTimer.current) window.clearTimeout(hideTimer.current);
       setControlsVisible(true);
     }
-  }, [keepControls]);
+  }, [creditsOverlay, keepControls]);
+
+  useEffect(() => {
+    if (!creditsOverlay) return;
+    const timer = window.setTimeout(() => onNextEpisode?.(), AUTO_NEXT_MS);
+    return () => window.clearTimeout(timer);
+  }, [creditsOverlay, onNextEpisode]);
 
   useEffect(
     () => () => {
@@ -660,7 +732,7 @@ export function VideoPlayer({
 
 
   const reportPlayback = useCallback(
-    (sessionStarted = false) => {
+    (sessionStarted = false, persistNow = false) => {
       const video = videoRef.current;
       if (!video) return;
       const fullDuration = resolveDuration(video);
@@ -676,16 +748,32 @@ export function VideoPlayer({
         fullDuration,
         watchedDelta,
         sessionStarted,
+        persistNow,
       );
     },
     [onPlaybackProgress, resolveDuration],
   );
 
   useEffect(() => {
-    const flush = () => reportPlayback(false);
-    window.addEventListener('beforeunload', flush);
+    if (!flushRef) return;
+    flushRef.current = () => reportPlayback(false, true);
     return () => {
+      flushRef.current = null;
+    };
+  }, [flushRef, reportPlayback]);
+
+  useEffect(() => {
+    const flush = () => reportPlayback(false, true);
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', onHidden);
+    return () => {
+      window.removeEventListener('pagehide', flush);
       window.removeEventListener('beforeunload', flush);
+      document.removeEventListener('visibilitychange', onHidden);
       flush();
     };
   }, [reportPlayback]);
@@ -951,7 +1039,6 @@ export function VideoPlayer({
     });
   }
 
-  const shownTime = scrubTime ?? pendingSeek ?? timeOffset + currentTime;
   const playedRatio = duration ? Math.min(1, shownTime / duration) : 0;
   const volumeLevel = muted || volume === 0 ? 'muted' : volume < 0.5 ? 'low' : 'high';
   const captionHex =
@@ -962,9 +1049,9 @@ export function VideoPlayer({
       ref={containerRef}
       tabIndex={-1}
       onPointerMove={revealControls}
-      onPointerLeave={() => !keepControls && setControlsVisible(false)}
+      onPointerLeave={() => !keepControls && !creditsOverlay && setControlsVisible(false)}
       className={`group/player relative h-full w-full overflow-hidden bg-black outline-none ${
-        controlsVisible ? '' : 'cursor-none'
+        controlsVisible || creditsOverlay ? '' : 'cursor-none'
       }`}
     >
       <video
@@ -988,7 +1075,7 @@ export function VideoPlayer({
         }}
         onPause={() => {
           setPlaying(false);
-          reportPlayback(false);
+          reportPlayback(false, true);
           const video = videoRef.current;
           if (
             video?.isConnected &&
@@ -1016,7 +1103,7 @@ export function VideoPlayer({
           if (pendingSeekRef.current == null) {
             setCurrentTime(video.currentTime);
           }
-          if (performance.now() - lastProgressReport.current >= 10_000) {
+          if (performance.now() - lastProgressReport.current >= 1_000) {
             reportPlayback(false);
           }
         }}
@@ -1085,6 +1172,13 @@ export function VideoPlayer({
         </button>
 
       </div>
+
+      {creditsOverlay ? (
+        <CreditsNextOverlay
+          onNext={() => onNextEpisode?.()}
+          onWatchCredits={() => setWatchingCredits(true)}
+        />
+      ) : null}
 
       {/* Bottom chrome */}
       <div
@@ -1287,6 +1381,47 @@ export function VideoPlayer({
           </span>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function CreditsNextOverlay({
+  onNext,
+  onWatchCredits,
+}: {
+  onNext: () => void;
+  onWatchCredits: () => void;
+}) {
+  const [fill, setFill] = useState(false);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setFill(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  return (
+    <div className="pointer-events-auto absolute right-4 bottom-10 z-20 flex items-center gap-3 sm:right-6">
+      <button
+        type="button"
+        onClick={onWatchCredits}
+        className="cursor-pointer rounded-full px-3.5 py-2 text-[0.8rem] font-medium text-white/90 transition-colors hover:text-white"
+      >
+        Watch credits
+      </button>
+      <button
+        type="button"
+        onClick={onNext}
+        className="relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full bg-white px-4 py-2 text-[0.8rem] font-medium text-black"
+      >
+        <span
+          aria-hidden
+          className={`absolute inset-y-0 left-0 bg-black/15 transition-[width] ease-linear ${
+            fill ? 'w-full' : 'w-0'
+          }`}
+          style={{ transitionDuration: `${AUTO_NEXT_MS}ms` }}
+        />
+        <span className="relative">Next Episode</span>
+        <IoPlaySkipForward size={15} className="relative" aria-hidden />
+      </button>
     </div>
   );
 }

@@ -86,7 +86,7 @@ connections.
  (5 failures/min). Streaming endpoints accept session or device tokens; the
  HLS playlist rewrite must echo the CALLER's token, never the session token.
 3. **CORS is port-scoped.** Loopback/own-hostname origins are only trusted on
- ports 8765/4200 (`ALLOWED_ORIGIN_PORTS`); the Private-Network-Access
+ ports 8765/4200 plus the port this Core actually bound; the Private-Network-Access
  header is only granted to origins passing the allowlist.
 4. **Cache deletion refuses `..` components** in recorded file paths (they
  come from untrusted torrent metadata).

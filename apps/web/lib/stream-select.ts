@@ -29,7 +29,10 @@ const AUDIO_LANGUAGE_HINTS: [string, RegExp][] = [
   ['ar', /\b(?:ara|arabic)\b/i],
 ];
 const ORIGINAL_AUDIO_RE = /\b(?:original[ ._-]?(?:audio|language))\b/i;
-const MULTI_AUDIO_RE = /\b(?:multi|dual[ ._-]?audio|dubbed)\b/i;
+const MULTI_AUDIO_RE = /\b(?:multi|dual[ ._-]?audio)\b/i;
+/** Named dubs (DUBLADO = Portuguese dubbed, etc.). Checked before flags —
+ *  Torrentio often stamps 🇬🇧 on a dub because English subs are present. */
+const DUBBED_AUDIO_RE = /\b(?:dublado|dublada|dublagem|dubbed|dubbing)\b/i;
 /** Releases with subtitles burned into the picture (SUBBED/PLSUBBED, HC,
  *  KORSUB, VOSTFR, "napisy" …). No player setting can remove them, so they
  *  rank with the dubs — last. Soft-sub markers like MULTiSUBS stay fine. */
@@ -99,12 +102,14 @@ function audioLanguageRank(stream: Stream, nativeLanguage: string | null): numbe
   const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
   // Burned-in subtitles ruin a release regardless of its audio language.
   if (HARDSUB_RE.test(hint)) return 3;
+  if (DUBBED_AUDIO_RE.test(hint)) return 3;
   if (!nativeLanguage) return 1;
   const native = nativeLanguage.toLowerCase();
   if (ORIGINAL_AUDIO_RE.test(hint)) return 0;
 
   // Flags are authoritative when present: a release flagged only with
   // foreign languages is a dub even if its name carries no language tokens.
+  // A UK flag next to other flags is usually subs, not proof of English audio.
   const flags = flaggedLanguages(hint);
   if (flags.size > 0) {
     if (flags.has(native)) return 0;

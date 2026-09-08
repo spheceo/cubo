@@ -2,7 +2,7 @@ import { stillUrl, type Episode, type SeasonSummary } from '@cubo/core';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import gsap from 'gsap';
 import { useRef, useState } from 'react';
-import { IoCalendarOutline, IoClose, IoList } from 'react-icons/io5';
+import { IoCalendarOutline, IoCheckmark, IoClose, IoList } from 'react-icons/io5';
 import { Dropdown } from '@/components/dropdown';
 import { Link } from '@/components/link';
 import { useCore } from '@/components/core-provider';
@@ -172,7 +172,9 @@ export function EpisodeList({
                             src={still}
                             alt=""
                             loading="lazy"
-                            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                            className={`h-full w-full object-cover transition-transform duration-300 group-hover:scale-105 ${
+                              watched?.completed ? 'opacity-70' : ''
+                            }`}
                           />
                         ) : (
                           <div className="flex h-full w-full items-center justify-center">
@@ -183,7 +185,14 @@ export function EpisodeList({
                             />
                           </div>
                         )}
-                        {progress > 0 ? (
+                        {watched?.completed ? (
+                          <div
+                            className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-white"
+                            aria-label="Watched"
+                          >
+                            <IoCheckmark size={15} />
+                          </div>
+                        ) : progress > 0 ? (
                           <div
                             className="absolute inset-x-0 bottom-0 h-1 bg-black/45"
                             aria-hidden
