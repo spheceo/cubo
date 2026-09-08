@@ -129,6 +129,20 @@
   clip-path: inset(0 calc(100% - var(--logo-fill)) 0 0);
 }
 
+.update-fill-loop {
+  width: 38%;
+  animation: update-fill-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes update-fill-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .logo-fill {
     transition: none;
@@ -136,5 +150,20 @@
 
   .logo-fill-loop {
     animation-duration: 6s;
+  }
+
+  .update-fill-loop {
+    width: 100%;
+    animation: update-fill-pulse 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes update-fill-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
   }
 }
