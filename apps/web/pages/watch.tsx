@@ -2,6 +2,7 @@ import type { MediaType } from '@cubo/core';
 import { useQuery } from '@tanstack/react-query';
 import { useParams, useSearchParams } from 'react-router';
 import { WatchScreen } from '@/components/watch-screen';
+import { nextEpisodeTarget } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { NotFoundPage } from './not-found';
@@ -50,9 +51,14 @@ export function WatchPage() {
       ? `S${resolvedSeason} E${resolvedEpisode}${currentEpisode?.name ? ` · ${currentEpisode.name}` : ''}`
       : null;
 
+  const nextEpisode =
+    mediaType === 'tv' && resolvedSeason != null && resolvedEpisode != null
+      ? nextEpisodeTarget(details.data.seasons, resolvedSeason, resolvedEpisode)
+      : null;
+
   return (
     <WatchScreen
-      key={`${mediaType}:${id}:${resolvedSeason ?? '-'}`}
+      key={`${mediaType}:${id}:${resolvedSeason ?? '-'}:${resolvedEpisode ?? '-'}`}
       mediaType={mediaType}
       mediaId={id}
       imdbId={details.data.imdbId}
@@ -65,6 +71,7 @@ export function WatchPage() {
       originalLanguage={details.data.originalLanguage}
       season={resolvedSeason}
       episode={resolvedEpisode}
+      nextEpisode={nextEpisode}
     />
   );
 }

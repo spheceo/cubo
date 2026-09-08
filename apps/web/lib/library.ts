@@ -15,6 +15,22 @@ export function playbackKey(
   return [mediaType, mediaId, season ?? '-', episode ?? '-'].join(':');
 }
 
+export function nextEpisodeTarget(
+  seasons: { seasonNumber: number; episodeCount: number }[],
+  season: number,
+  episode: number,
+): { season: number; episode: number } | null {
+  const ordered = seasons
+    .filter((entry) => entry.seasonNumber > 0 && entry.episodeCount > 0)
+    .sort((a, b) => a.seasonNumber - b.seasonNumber);
+  const current = ordered.find((entry) => entry.seasonNumber === season);
+  if (current && episode < current.episodeCount) {
+    return { season, episode: episode + 1 };
+  }
+  const following = ordered.find((entry) => entry.seasonNumber > season);
+  return following ? { season: following.seasonNumber, episode: 1 } : null;
+}
+
 export function episodeLabel(season?: number | null, episode?: number | null): string | null {
   if (season == null || episode == null) return null;
   return `S${season} E${episode}`;

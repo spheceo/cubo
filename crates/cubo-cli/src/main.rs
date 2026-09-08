@@ -146,12 +146,6 @@ async fn serve(no_open: bool) {
         Err(error) => {
             // Common cause worth explaining plainly: another Cubo already runs.
             eprintln!("Cubo failed to start: {error}");
-            eprintln!(
-                "If another copy of Cubo is already running — including \
-                 `cubo persist` — stop it first (`cubo unpersist` or \
-                 `just stop-persist`). Only one engine can own port {port_hint}.",
-                port_hint = 8765
-            );
             std::process::exit(1);
         }
     };
@@ -160,6 +154,11 @@ async fn serve(no_open: bool) {
     println!();
     println!("  Cubo is running.");
     println!();
+    if port != 8765 {
+        println!("  Port 8765 is already in use, so this instance moved to {port}.");
+        println!("  The other Cubo (likely `cubo persist`) is still running.");
+        println!();
+    }
     println!("  Web app      http://localhost:{port}  (opens automatically)");
     if cubo_engine::pairing::PAIRING_ENABLED {
         println!("  Pairing      run `cubo pair` in another terminal to get a code");

@@ -12,9 +12,11 @@ Browser  →  http://127.0.0.1:8765  (embedded UI + /v1 + /api)
                 └── /v1/*           → torrents, remux, library
 ```
 
-Core always uses port `8765`. Startup fails clearly if that port is already
-occupied. Playback needs a per-launch session token (or a paired device
-token). The raw rqbit API remains on a separate ephemeral loopback port.
+Core prefers port `8765`. If that port is already taken (for example by
+`cubo persist`), a foreground `cubo serve` / `just dev` binds the next free
+port instead of stopping the other process. Playback needs a per-launch
+session token (or a paired device token). The raw rqbit API remains on a
+separate ephemeral loopback port.
 
 At startup, Core binds `127.0.0.1:8765` and automatically detects the
 machine's Tailscale IPv4 address using `tailscale ip -4`. When Tailscale is
@@ -43,12 +45,12 @@ Then open that HTTPS URL on any device in the tailnet.
 
 1. Install [just](https://just.systems) and [bun](https://bun.sh), then run `bun install`.
 2. Add `TMDB_API_KEY` to `apps/web/.env.local` (Vite dev catalog only).
-3. Run `just dev` to start Cubo Core on port 8765 and `just web` for the UI.
+3. Run `just dev` to start Cubo Core (port 8765, or the next free port) and `just web` for the UI.
 
 Useful commands:
 
 - `just` lists recipes.
-- `just dev` runs Cubo Core on port 8765 (stops a background `cubo persist` first).
+- `just dev` runs Cubo Core on port 8765, or the next free port if persist already owns it.
 - `just web` starts the app at `http://localhost:4200`.
 - `just site` starts the marketing site at `http://localhost:4300`.
 - `just apps` runs the app and marketing site together.

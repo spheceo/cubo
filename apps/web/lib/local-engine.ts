@@ -106,6 +106,7 @@ export interface PlaybackUpdate {
   sessionStarted: boolean;
   watchHref: string;
   detailHref: string;
+  creditsStartSeconds?: number | null;
 }
 
 export interface CacheStatus {
@@ -156,7 +157,13 @@ function coreFetch(url: string, init: RequestInit = {}) {
 
 export function currentOriginCoreEndpoint(): string {
   if (typeof window === 'undefined') return '';
-  return window.location.port === String(CORE_PORT) ? window.location.origin : '';
+  // Vite (:4200) and the marketing site (:4300) are separate processes.
+  // Core-hosted pages — preferred :8765 or a fallback like :8766 — use this origin.
+  if (window.location.port === '4200' || window.location.port === '4300') return '';
+  if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
+    return '';
+  }
+  return window.location.origin;
 }
 
 async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {

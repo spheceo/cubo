@@ -32,6 +32,30 @@ test('direct-play priority is preserved ahead of remux within the quality tier',
   assert.equal(rankStreams([single, directPack], { transcode: true, hevc: false }, null, episode)[0], directPack);
 });
 
+test('a named dub loses to original-language audio even with a UK flag and direct-play', () => {
+  const dubbed = {
+    ...single,
+    infoHash: 'dublado',
+    filename: 'Silo.S01E01.1080p.WEB-DL.mkv.mp4',
+    title: 'Silo.S01E01-02.1080p.WEB-DL.DUBLADO\n🇬🇧 / 🇵🇹',
+    seeders: 59,
+  };
+  const original = {
+    ...single,
+    infoHash: 'english',
+    filename: 'Silo.S01E01.1080p.mkv',
+    title: 'Silo S01E01 1080p WEB-DL\n🇬🇧 / 🇯🇵 / 🇷🇺',
+    seeders: 20,
+  };
+  const ranked = rankStreams(
+    [dubbed, original],
+    { transcode: true, hevc: false },
+    'en',
+    { season: 1, episode: 1 },
+  );
+  assert.equal(ranked[0].infoHash, 'english');
+});
+
 test('movie ranking has no episode pack preference', () => {
   assert.equal(seasonPackRank(pack), 0);
 });

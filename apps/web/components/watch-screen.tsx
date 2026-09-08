@@ -50,11 +50,20 @@ import {
   type CaptionSize,
 } from '@/lib/caption-prefs';
 import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playback';
+import {
+  clearCreditsStart,
+  loadCreditsStart,
+  resolveCreditsStart,
+  saveCreditsStart,
+} from '@/lib/credits-detect';
 import { playbackKey } from '@/lib/library';
+import { loadPlayhead, resumeSeconds, savePlayhead } from '@/lib/playhead';
 import { rankStreams, streamKey } from '@/lib/stream-select';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
 const AUTO_ATTEMPTS = 3;
+/** Core writes are coalesced; localStorage is updated on every tick. */
+const CORE_PROGRESS_MS = 5_000;
 /** Bytes that make the buffering stage feel "full" — playback usually starts well before this. */
 const BUFFER_TARGET_BYTES = 16 * 1024 * 1024;
 /** Stage ceilings the eased fill creeps toward, so the logo never sits still. */
@@ -82,6 +91,7 @@ export function WatchScreen({
   originalLanguage,
   season,
   episode,
+  nextEpisode = null,
 }: {
   mediaType: MediaType;
   mediaId: number;
@@ -96,10 +106,12 @@ export function WatchScreen({
   originalLanguage: string | null;
   season?: number;
   episode?: number;
+  nextEpisode?: { season: number; episode: number } | null;
 }) {
   const core = useCore();
   const refreshLibrary = core.refreshLibrary;
   const navigate = useNavigate();
+  const library = core.library;
 
   const [sources, setSources] = useState<Stream[]>([]);
   const [status, setStatus] = useState<Status>('loading');
@@ -179,6 +191,13 @@ export function WatchScreen({
   const playbackConnection = useRef<Awaited<ReturnType<typeof core.connect>> | null>(null);
   /** Last position the player reported — lets a source fallback resume in place. */
   const lastPositionRef = useRef(0);
+  const lastDurationRef = useRef(0);
+  const saveChainRef = useRef(Promise.resolve());
+  const lastCoreSaveRef = useRef(0);
+  const clearCreditsOnSave = useRef(false);
+  const creditsClearedKey = useRef<string | null>(null);
+  const playerFlushRef = useRef<(() => void) | null>(null);
+  const claimedReadyKey = useRef<string | null>(null);
   /** Torrent behind the current remux, so seeks can restart its converter. */
   const remuxContext = useRef<{
     connection: Awaited<ReturnType<typeof core.connect>>;
@@ -196,6 +215,19 @@ export function WatchScreen({
    *  flushes from overwriting `lastPositionRef` with the pre-seek time. */
   const seekTargetRef = useRef<number | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
+  const storedCreditsStart = resolveCreditsStart(
+    loadCreditsStart(itemKey),
+    library?.history.find((item) => item.key === itemKey)?.creditsStartSeconds,
+  );
+  const knownCreditsStart =
+    creditsClearedKey.current === itemKey ? null : storedCreditsStart;
+  const creditsStartRef = useRef<number | null>(knownCreditsStart);
+  if (creditsClearedKey.current !== itemKey) {
+    creditsStartRef.current = resolveCreditsStart(
+      creditsStartRef.current,
+      knownCreditsStart,
+    );
+  }
 
   useEffect(() => {
     armWatchSession();
@@ -248,14 +280,28 @@ export function WatchScreen({
       connection = await core.connect();
       playbackConnection.current = connection;
       if (resumeFrom == null) {
+        const local = loadPlayhead(itemKey);
         try {
           const library = await getLibrary(connection);
           const previous = library.history.find((item) => item.key === itemKey);
-          resume = previous && previous.progress < 0.9 ? previous.positionSeconds : 0;
+          resume = resumeSeconds(
+            local,
+            previous
+              ? {
+                  positionSeconds: previous.positionSeconds,
+                  durationSeconds: previous.durationSeconds,
+                  updatedAt: previous.lastWatchedAt,
+                }
+              : null,
+          );
         } catch {
-          resume = 0;
+          resume = resumeSeconds(local, null);
+        }
+        if (resume > 0 && !lastDurationRef.current) {
+          lastDurationRef.current = local?.durationSeconds ?? 0;
         }
       }
+      lastPositionRef.current = resume;
       setResumeAt(resume);
     } catch (reason) {
       if (stale()) return;
@@ -509,14 +555,33 @@ export function WatchScreen({
       durationSeconds: number,
       watchedDeltaSeconds: number,
       sessionStarted: boolean,
+      persistNow = false,
     ) => {
       // A remux seek's old player still reports time (and flushes on
       // src swap); that must not overwrite the seek target.
       if (seekingRef.current || seekTargetRef.current != null) return;
+      // Unmount / src teardown often reports timeOffset+0. That must not
+      // rewind the last trusted playhead we already persisted. A session
+      // start at 0 after resume still needs to reach Core — keep the
+      // stored playhead instead of dropping the tick.
+      if (lastPositionRef.current > 5 && positionSeconds + 1.5 < lastPositionRef.current) {
+        if (!sessionStarted) return;
+        positionSeconds = lastPositionRef.current;
+        durationSeconds = lastDurationRef.current || durationSeconds;
+      }
       lastPositionRef.current = positionSeconds;
+      lastDurationRef.current = durationSeconds;
+      savePlayhead(itemKey, positionSeconds, durationSeconds);
       const connection = playbackConnection.current;
       if (!connection) return;
-      void recordPlayback(connection, {
+      const now = performance.now();
+      if (!sessionStarted && !persistNow && now - lastCoreSaveRef.current < CORE_PROGRESS_MS) {
+        return;
+      }
+      lastCoreSaveRef.current = now;
+      const creditsStartSeconds = clearCreditsOnSave.current ? 0 : creditsStartRef.current;
+      clearCreditsOnSave.current = false;
+      const task = recordPlayback(connection, {
         key: itemKey,
         mediaId,
         mediaType,
@@ -534,14 +599,16 @@ export function WatchScreen({
         sessionStarted,
         watchHref: `/watch/${mediaType}/${mediaId}${season != null && episode != null ? `?season=${season}&episode=${episode}` : ''}`,
         detailHref: backHref,
+        creditsStartSeconds,
       })
         .then(() => {
           // Refreshing on every periodic report refetched the whole library
           // every 10s during playback; once per session start is enough while
-          // playing — the unmount refresh below picks up the final position.
+          // playing — leaving the player refreshes after the final save.
           if (sessionStarted) void refreshLibrary();
         })
         .catch(() => undefined);
+      saveChainRef.current = saveChainRef.current.then(() => task);
     },
     [
       itemKey,
@@ -636,12 +703,60 @@ export function WatchScreen({
   // Back means BACK — the page the viewer came from, not always the info
   // page (e.g. Home → Watch should land on Home). Falls back to `backHref`.
   const goBack = useCallback(() => {
-    if (window.history.length > 1) navigate(-1);
-    else navigate(backHref);
-    // History POP otherwise restores the catalog/title scroll we left from.
-    resetWindowScroll();
-    requestAnimationFrame(resetWindowScroll);
-  }, [navigate, backHref]);
+    playerFlushRef.current?.();
+    if (
+      !playerFlushRef.current &&
+      lastPositionRef.current > 0 &&
+      lastDurationRef.current > 0
+    ) {
+      savePlaybackProgress(lastPositionRef.current, lastDurationRef.current, 0, false, true);
+    }
+    const saved = saveChainRef.current.then(() => refreshLibrary());
+    const giveUp = new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 1500);
+    });
+    void Promise.race([saved, giveUp]).finally(() => {
+      if (window.history.length > 1) navigate(-1);
+      else navigate(backHref);
+      resetWindowScroll();
+      requestAnimationFrame(resetWindowScroll);
+    });
+  }, [navigate, backHref, refreshLibrary, savePlaybackProgress]);
+
+  const goNextEpisode = useCallback(() => {
+    if (!nextEpisode) return;
+    playerFlushRef.current?.();
+    navigate(
+      `/watch/tv/${mediaId}?season=${nextEpisode.season}&episode=${nextEpisode.episode}`,
+    );
+  }, [nextEpisode, mediaId, navigate]);
+
+  // Once this episode is actually loaded — even if play() never starts —
+  // touch its history row so the title button reads Continue Sx Ex.
+  useEffect(() => {
+    if (status !== 'ready' || mediaType !== 'tv') return;
+    if (season == null || episode == null) return;
+    if (claimedReadyKey.current === itemKey) return;
+    claimedReadyKey.current = itemKey;
+    void (async () => {
+      const connection = playbackConnection.current;
+      let position = lastPositionRef.current;
+      let duration = lastDurationRef.current || videoDurationHint || 1;
+      if (connection && position <= 0) {
+        try {
+          const library = await getLibrary(connection);
+          const previous = library.history.find((item) => item.key === itemKey);
+          if (previous) {
+            position = previous.positionSeconds;
+            duration = duration > 1 ? duration : previous.durationSeconds || 1;
+          }
+        } catch {
+          // Still claim the row so Continue points at this episode.
+        }
+      }
+      savePlaybackProgress(position, duration, 0, true);
+    })();
+  }, [status, mediaType, season, episode, itemKey, videoDurationHint, savePlaybackProgress]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -681,6 +796,44 @@ export function WatchScreen({
           initialTime={videoIsHls ? 0 : resumeAt}
           startTimeLocal={videoIsHls ? videoStartLocal : null}
           onPlaybackProgress={savePlaybackProgress}
+          flushRef={playerFlushRef}
+          onNextEpisode={nextEpisode ? goNextEpisode : undefined}
+          playbackKey={mediaType === 'tv' ? itemKey : undefined}
+          creditsStartSeconds={mediaType === 'tv' ? knownCreditsStart : null}
+          onCreditsMapped={
+            mediaType === 'tv'
+              ? (seconds) => {
+                  if (seconds == null) {
+                    creditsStartRef.current = null;
+                    creditsClearedKey.current = itemKey;
+                    clearCreditsStart(itemKey);
+                    clearCreditsOnSave.current = true;
+                  } else {
+                    creditsClearedKey.current = null;
+                    creditsStartRef.current = seconds;
+                    if (creditsStartRef.current != null) {
+                      saveCreditsStart(itemKey, creditsStartRef.current);
+                    }
+                  }
+                  const duration = lastDurationRef.current || videoDurationHint;
+                  if (duration && duration > 1) {
+                    savePlaybackProgress(lastPositionRef.current, duration, 0, false, true);
+                  }
+                }
+              : undefined
+          }
+          onCreditsLog={
+            mediaType === 'tv'
+              ? (event, data) => {
+                  const connection = playbackConnection.current;
+                  if (!connection) return;
+                  const level = event.endsWith('_failed') || event.endsWith('_tainted')
+                    ? 'error'
+                    : 'info';
+                  shipClientLog(connection, level, event, data);
+                }
+              : undefined
+          }
           onSeekOutside={(target) => void requestRemuxSeek(target)}
           onError={() => {
             // Restarting ffmpeg for a seek kills the current playlist;
