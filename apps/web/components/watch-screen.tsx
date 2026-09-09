@@ -963,7 +963,7 @@ function prepareSubtitles(tracks: SubtitleTrack[]): PlayerSubtitle[] {
     if (!label || label.toLowerCase() === track.language.toLowerCase()) continue;
     prepared.push({
       id: track.id,
-      src: apiUrl(`/api/subtitle-file?url=${encodeURIComponent(track.url)}`),
+      src: apiUrl(`/api/subtitle-file?url=${encodeURIComponent(track.url)}&enc=2`),
       language: track.language,
       label,
     });

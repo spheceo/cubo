@@ -28,6 +28,7 @@ getrandom = "0.3"
 flate2 = "1"
 tar = "0.4"
 include_dir = "0.7"
+encoding_rs = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { decodeSubtitleBytes, toWebVtt } from '../lib/subtitle-text.js';
 import { requestUrl } from './_shared.js';
 
 function sendText(res: ServerResponse, status: number, body: string, contentType = 'text/plain') {
@@ -26,7 +27,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   try {
     const upstream = await fetch(source);
     if (!upstream.ok) return sendText(res, upstream.status, 'Subtitle unavailable');
-    const subtitle = await upstream.text();
+    const subtitle = decodeSubtitleBytes(new Uint8Array(await upstream.arrayBuffer()));
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -35,10 +36,4 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   } catch {
     sendText(res, 502, 'Subtitle unavailable');
   }
-}
-
-function toWebVtt(source: string): string {
-  const normalized = source.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
-  if (normalized.trimStart().startsWith('WEBVTT')) return normalized;
-  return `WEBVTT\n\n${normalized.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')}`;
 }
