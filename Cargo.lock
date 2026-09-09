@@ -654,6 +654,7 @@ version = "0.0.14"
 dependencies = [
  "anyhow",
  "axum",
+ "encoding_rs",
  "flate2",
  "futures-util",
  "getrandom 0.3.4",
