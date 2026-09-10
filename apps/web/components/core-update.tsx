@@ -90,13 +90,11 @@ function useCoreUpdateState() {
     const read = async () => {
       try {
         const next = await getUpdateStatus(connection);
-        if (!next.latest) {
-          next.latest = coalesceLatest(
-            next.latest,
-            await fetchGithubLatestTag(),
-            connection.version,
-          );
-        }
+        next.latest = coalesceLatest(
+          next.latest,
+          await fetchGithubLatestTag(),
+          connection.version,
+        );
         if (!cancelled) {
           setStatus((current) => mergeUpdateStatus(current, next, inFlightRef.current));
         }

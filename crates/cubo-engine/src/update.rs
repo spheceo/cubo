@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 
 const REPO: &str = "spheceo/cubo";
 const USER_AGENT: &str = concat!("cubo-cli/", env!("CARGO_PKG_VERSION"));
-const CHECK_CACHE_SECONDS: u64 = 24 * 60 * 60;
+/// A known update must not hide a newer tag that ships later the same day.
+const CHECK_CACHE_SECONDS: u64 = 10 * 60;
 /// "You're current" must not hide a release that lands later the same day.
 const NEGATIVE_CHECK_CACHE_SECONDS: u64 = 10 * 60;
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -308,7 +309,7 @@ pub async fn check_for_latest_cached() -> Result<Option<LatestRelease>, String> 
 pub async fn check_for_latest() -> Result<Option<LatestRelease>, String> {
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .get(format!("https://api.github.com/repos/{REPO}/releases?per_page=100"))
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -322,29 +323,43 @@ pub async fn check_for_latest() -> Result<Option<LatestRelease>, String> {
         ));
     }
 
-    let release: ReleaseResponse = response
+    let releases: Vec<ReleaseResponse> = response
         .json()
         .await
         .map_err(|error| format!("unexpected GitHub release payload ({error})"))?;
-    if release.draft || release.prerelease {
-        return Ok(None);
-    }
-    let latest = parse_tag_version(&release.tag_name)
-        .ok_or_else(|| format!("unreadable release tag {}", release.tag_name))?;
-    if latest <= current_version() {
-        return Ok(None);
-    }
-
     let wanted = format!("cubo-cli-{}.tar.gz", target_triple());
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == wanted)
-        .ok_or_else(|| format!("release {} has no {wanted}", release.tag_name))?;
-    Ok(Some(LatestRelease {
-        tag: release.tag_name,
+    Ok(newest_installable(&releases, current_version(), &wanted))
+}
+
+/// Highest semver with a usable archive — not the first tag newer than current,
+/// and not GitHub's `latest` flag (that follows publish order / a manual pin).
+fn newest_installable(
+    releases: &[ReleaseResponse],
+    current: (u64, u64, u64),
+    wanted_asset: &str,
+) -> Option<LatestRelease> {
+    let mut best: Option<( (u64, u64, u64), &ReleaseResponse, &ReleaseAsset)> = None;
+    for release in releases {
+        if release.draft || release.prerelease {
+            continue;
+        }
+        let Some(version) = parse_tag_version(&release.tag_name) else {
+            continue;
+        };
+        if version <= current {
+            continue;
+        }
+        let Some(asset) = release.assets.iter().find(|asset| asset.name == wanted_asset) else {
+            continue;
+        };
+        if best.as_ref().map_or(true, |(best_version, _, _)| version > *best_version) {
+            best = Some((version, release, asset));
+        }
+    }
+    best.map(|(_, release, asset)| LatestRelease {
+        tag: release.tag_name.clone(),
         asset_url: asset.browser_download_url.clone(),
-    }))
+    })
 }
 
 /// One-shot CLI path: download, install, leave relaunch to the caller.
@@ -741,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_checks_expire_faster_than_known_updates() {
+    fn update_checks_do_not_cache_a_stale_next_tag_all_day() {
         let negative = CheckCache {
             checked_at: 0,
             current_version: "0.0.10".into(),
@@ -755,6 +770,57 @@ mod tests {
             asset_url: Some("https://example.invalid/cubo.tar.gz".into()),
         };
         assert_eq!(cache_ttl(&negative), 10 * 60);
-        assert_eq!(cache_ttl(&positive), 24 * 60 * 60);
+        assert_eq!(cache_ttl(&positive), 10 * 60);
+    }
+
+    fn release(tag: &str, asset: &str) -> ReleaseResponse {
+        ReleaseResponse {
+            draft: false,
+            prerelease: false,
+            tag_name: tag.into(),
+            assets: vec![ReleaseAsset {
+                name: asset.into(),
+                browser_download_url: format!("https://example.invalid/{asset}"),
+            }],
+        }
+    }
+
+    #[test]
+    fn updater_selects_the_highest_installable_tag_not_the_next_one() {
+        let wanted = "cubo-cli-aarch64-apple-darwin.tar.gz";
+        let releases = [
+            release("v0.0.16", wanted),
+            release("v0.0.15", wanted),
+            release("v0.0.13", wanted),
+        ];
+        let chosen = newest_installable(&releases, (0, 0, 12), wanted).expect("update");
+        assert_eq!(chosen.tag, "v0.0.16");
+    }
+
+    #[test]
+    fn updater_skips_a_newer_tag_that_has_no_archive_yet() {
+        let wanted = "cubo-cli-aarch64-apple-darwin.tar.gz";
+        let mut newest = release("v0.0.16", "notes.txt");
+        newest.assets.clear();
+        let releases = [newest, release("v0.0.15", wanted)];
+        let chosen = newest_installable(&releases, (0, 0, 14), wanted).expect("fallback");
+        assert_eq!(chosen.tag, "v0.0.15");
+    }
+
+    #[test]
+    fn updater_ignores_drafts_prereleases_and_current_or_older_tags() {
+        let wanted = "cubo-cli-x86_64-unknown-linux-gnu.tar.gz";
+        let mut draft = release("v0.0.20", wanted);
+        draft.draft = true;
+        let mut pre = release("v0.0.19", wanted);
+        pre.prerelease = true;
+        let releases = [draft, pre, release("v0.0.16", wanted)];
+        assert!(newest_installable(&releases, (0, 0, 16), wanted).is_none());
+        assert_eq!(
+            newest_installable(&releases, (0, 0, 15), wanted)
+                .expect("stable")
+                .tag,
+            "v0.0.16"
+        );
     }
 }

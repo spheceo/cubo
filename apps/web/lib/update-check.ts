@@ -1,4 +1,4 @@
-const GITHUB_LATEST = 'https://api.github.com/repos/spheceo/cubo/releases/latest';
+const GITHUB_RELEASES = 'https://api.github.com/repos/spheceo/cubo/releases?per_page=100';
 const GITHUB_TTL_MS = 10 * 60 * 1000;
 
 let githubCache: { at: number; tag: string | null } | null = null;
@@ -20,15 +20,24 @@ export function isNewerRelease(latest: string, current: string): boolean {
   return false;
 }
 
-/** Prefer Core's answer; if it has none (stale "up to date" cache), use GitHub. */
+/** Highest semver among tags that are newer than the running Core. */
+export function newestReleaseTag(tags: Array<string | null | undefined>): string | null {
+  let best: string | null = null;
+  for (const tag of tags) {
+    if (!tag) continue;
+    if (!best || isNewerRelease(tag, best)) best = tag;
+  }
+  return best;
+}
+
+/** Prefer the newest tag Core or GitHub knows, never the first increment. */
 export function coalesceLatest(
   coreLatest: string | null | undefined,
   githubTag: string | null,
   current: string,
 ): string | null {
-  if (coreLatest) return coreLatest;
-  if (githubTag && isNewerRelease(githubTag, current)) return githubTag;
-  return null;
+  const newest = newestReleaseTag([coreLatest, githubTag]);
+  return newest && isNewerRelease(newest, current) ? newest : null;
 }
 
 export async function fetchGithubLatestTag(): Promise<string | null> {
@@ -36,17 +45,22 @@ export async function fetchGithubLatestTag(): Promise<string | null> {
     return githubCache.tag;
   }
   try {
-    const response = await fetch(GITHUB_LATEST, {
+    const response = await fetch(GITHUB_RELEASES, {
       headers: { Accept: 'application/vnd.github+json' },
     });
     if (!response.ok) return githubCache?.tag ?? null;
-    const body = (await response.json()) as {
+    const body = (await response.json()) as Array<{
       tag_name?: string;
       draft?: boolean;
       prerelease?: boolean;
-    };
-    const tag =
-      !body.draft && !body.prerelease && typeof body.tag_name === 'string' ? body.tag_name : null;
+    }>;
+    const tags = Array.isArray(body)
+      ? body
+          .filter((release) => !release.draft && !release.prerelease)
+          .map((release) => release.tag_name)
+          .filter((tag): tag is string => typeof tag === 'string')
+      : [];
+    const tag = newestReleaseTag(tags);
     githubCache = { at: Date.now(), tag };
     return tag;
   } catch {
