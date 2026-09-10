@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { playableResume, resumeSeconds, type StoredPlayhead } from './playhead';
+import { playableResume, resumeForSource, resumeSeconds, type StoredPlayhead } from './playhead';
 
 function head(
   positionSeconds: number,
@@ -24,4 +24,11 @@ test('resume prefers the newer snapshot so a seek-back wins over Core', () => {
   assert.equal(resumeSeconds(null, remote), 3000);
   assert.equal(resumeSeconds(local, null), 600);
   assert.equal(resumeSeconds(null, null), 0);
+});
+
+test('a short leftover does not seek into a different torrent', () => {
+  assert.equal(resumeForSource(72, 'pack-hash', 'yts-hash'), 0);
+  assert.equal(resumeForSource(72, 'yts-hash', 'yts-hash'), 72);
+  assert.equal(resumeForSource(72, undefined, 'yts-hash'), 72);
+  assert.equal(resumeForSource(600, 'pack-hash', 'yts-hash'), 600);
 });

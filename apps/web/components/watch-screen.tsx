@@ -57,8 +57,8 @@ import {
   saveCreditsStart,
 } from '@/lib/credits-detect';
 import { playbackKey } from '@/lib/library';
-import { loadPlayhead, resumeSeconds, savePlayhead } from '@/lib/playhead';
-import { rankStreams, streamKey } from '@/lib/stream-select';
+import { loadPlayhead, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
+import { isOversizedStream, rankStreams, streamKey } from '@/lib/stream-select';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
 const AUTO_ATTEMPTS = 3;
@@ -191,6 +191,7 @@ export function WatchScreen({
   const playbackConnection = useRef<Awaited<ReturnType<typeof core.connect>> | null>(null);
   /** Last position the player reported — lets a source fallback resume in place. */
   const lastPositionRef = useRef(0);
+  const activeInfoHashRef = useRef<string | null>(null);
   const lastDurationRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
   const lastCoreSaveRef = useRef(0);
@@ -276,11 +277,13 @@ export function WatchScreen({
 
     let connection;
     let resume = resumeFrom ?? 0;
+    let savedInfoHash: string | undefined;
     try {
       connection = await core.connect();
       playbackConnection.current = connection;
       if (resumeFrom == null) {
         const local = loadPlayhead(itemKey);
+        savedInfoHash = local?.infoHash;
         try {
           const library = await getLibrary(connection);
           const previous = library.history.find((item) => item.key === itemKey);
@@ -312,11 +315,26 @@ export function WatchScreen({
     }
     if (stale()) return;
 
-    const limit = auto ? Math.min(list.length, startIndex + AUTO_ATTEMPTS) : startIndex + 1;
+    const limit = auto ? list.length : startIndex + 1;
     let lastError = 'Could not start playback';
+    let attempts = 0;
 
     for (let index = startIndex; index < limit; index += 1) {
       const stream = list[index];
+      if (auto && isOversizedStream(stream)) {
+        lastError = 'This source is too large to start automatically.';
+        continue;
+      }
+      if (auto && attempts >= AUTO_ATTEMPTS) break;
+      attempts += 1;
+
+      const startAt =
+        resumeFrom != null
+          ? resume
+          : resumeForSource(resume, savedInfoHash, stream.infoHash);
+      lastPositionRef.current = startAt;
+      setResumeAt(startAt);
+      activeInfoHashRef.current = stream.infoHash;
       setActiveKey(streamKey(stream));
       setSubtitleMatch(null);
 
@@ -358,7 +376,7 @@ export function WatchScreen({
             index,
             total: list.length,
             auto,
-            resume: resume || undefined,
+            resume: startAt || undefined,
             direct_play: direct,
             name: stream.name,
             source_title: stream.title,
@@ -398,14 +416,14 @@ export function WatchScreen({
             connection,
             id,
             fileIndex,
-            resume,
+            startAt,
             ++remuxGenRef.current,
           );
           url = remux.url;
           durationHint = remux.durationSeconds;
           usesHls = true;
           timeOffset = remux.startSeconds;
-          localJump = resume - timeOffset;
+          localJump = startAt - timeOffset;
           if (localJump < 0.25) localJump = null;
           remuxContext.current = { connection, id, fileIndex };
           if (stale()) return;
@@ -571,7 +589,7 @@ export function WatchScreen({
       }
       lastPositionRef.current = positionSeconds;
       lastDurationRef.current = durationSeconds;
-      savePlayhead(itemKey, positionSeconds, durationSeconds);
+      savePlayhead(itemKey, positionSeconds, durationSeconds, activeInfoHashRef.current);
       const connection = playbackConnection.current;
       if (!connection) return;
       const now = performance.now();
