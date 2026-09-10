@@ -149,10 +149,7 @@ async fn forward_json(client: &Client, url: &str, timeout: Duration, cache_secon
                 StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             match upstream.bytes().await {
                 Ok(body) => {
-                    let cache = format!(
-                        "public, s-maxage={cache_seconds}, stale-while-revalidate={}",
-                        cache_seconds.saturating_mul(2)
-                    );
+                    let cache = json_cache_policy(status, cache_seconds);
                     (
                         status,
                         [
@@ -190,19 +187,22 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 }
 
 fn query_params(query: &str) -> std::collections::HashMap<String, String> {
-    let mut params = std::collections::HashMap::new();
-    for pair in query.split('&').filter(|part| !part.is_empty()) {
-        let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
-        let value = parts.next().unwrap_or("");
-        if let (Ok(key), Ok(value)) = (
-            urlencoding::decode(key),
-            urlencoding::decode(value),
-        ) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
+    let mut url = reqwest::Url::parse("http://localhost/").expect("valid base URL");
+    url.set_query(Some(query));
+    url.query_pairs()
+        .into_owned()
+        .collect()
+}
+
+fn json_cache_policy(status: StatusCode, cache_seconds: u32) -> String {
+    if status.is_success() {
+        format!(
+            "public, s-maxage={cache_seconds}, stale-while-revalidate={}",
+            cache_seconds.saturating_mul(2)
+        )
+    } else {
+        "no-store".into()
     }
-    params
 }
 
 pub fn tmdb_allowed(path: &str) -> bool {
@@ -372,6 +372,22 @@ mod tests {
         decode_subtitle_bytes, imdb_id, srt_commas_to_dots, tmdb_allowed, to_web_vtt,
         torrentio_allowed,
     };
+
+    #[test]
+    fn query_parameters_decode_form_spaces_and_literal_plus() {
+        let params = super::query_params("query=The+Matrix&literal=a%2Bb&unicode=caf%C3%A9");
+        assert_eq!(params["query"], "The Matrix");
+        assert_eq!(params["literal"], "a+b");
+        assert_eq!(params["unicode"], "café");
+    }
+
+    #[test]
+    fn upstream_failures_are_not_cached() {
+        for status in [429, 500, 502, 503] {
+            assert_eq!(super::json_cache_policy(super::StatusCode::from_u16(status).unwrap(), 3600), "no-store");
+        }
+        assert!(super::json_cache_policy(super::StatusCode::OK, 3600).contains("s-maxage=3600"));
+    }
 
     #[test]
     fn tmdb_allowlist_matches_the_app() {

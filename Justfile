@@ -41,11 +41,11 @@ apps:
 
 # Typecheck every TypeScript package
 typecheck:
-    bun run --recursive typecheck
+    bun run --filter '*' typecheck
 
 # Production build of the web app and marketing site
 build:
-    bun run --recursive build
+    bun run --filter '*' build
 
 # Compile the Rust workspace
 check:

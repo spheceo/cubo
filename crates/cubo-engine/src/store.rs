@@ -43,6 +43,10 @@ pub struct LibraryItem {
     pub progress: f64,
     pub completed: bool,
     pub last_watched_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_device_id: Option<String>,
     pub watch_href: String,
     pub detail_href: String,
     /// Absolute seconds where end credits began, mapped while watching.
@@ -139,6 +143,12 @@ impl Default for CoreData {
     }
 }
 
+/// Cache maintenance never needs to clone watch history or saved titles.
+pub struct CacheSnapshot {
+    pub cache: CachePreferences,
+    pub cache_entries: Vec<CacheEntry>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackUpdate {
@@ -158,6 +168,10 @@ pub struct PlaybackUpdate {
     pub duration_seconds: f64,
     #[serde(default)]
     pub watched_delta_seconds: f64,
+    #[serde(default)]
+    pub progress_updated_at: Option<u64>,
+    #[serde(default)]
+    pub progress_device_id: Option<String>,
     #[serde(default)]
     pub session_started: bool,
     pub watch_href: String,
@@ -200,11 +214,31 @@ impl CoreStore {
         self.data.lock().await.clone()
     }
 
+    pub async fn cache_snapshot(&self) -> CacheSnapshot {
+        let data = self.data.lock().await;
+        CacheSnapshot {
+            cache: data.cache.clone(),
+            cache_entries: data.cache_entries.clone(),
+        }
+    }
+
     /// Progress ticks arrive every ~10 s during playback, so this stays
     /// lean: one pass over history and no snapshot in the response.
     pub async fn record_playback(&self, update: PlaybackUpdate) -> Result<(), String> {
         let mut data = self.data.lock().await;
         let now = now_millis();
+        // HTTP arrival order is not playback order: an old tab's keepalive
+        // POST may arrive after a refresh or a newer backward seek. Only
+        // compare observation clocks from the same browser/device.
+        if let Some(incoming) = update.progress_updated_at {
+            if data.history.iter().find(|entry| entry.key == update.key
+                && entry.progress_device_id == update.progress_device_id)
+                .and_then(|entry| entry.progress_updated_at)
+                .is_some_and(|saved| incoming < saved)
+            {
+                return Ok(());
+            }
+        }
         let progress = if update.duration_seconds > 0.0 {
             (update.position_seconds / update.duration_seconds).clamp(0.0, 1.0)
         } else {
@@ -243,6 +277,8 @@ impl CoreStore {
             progress,
             completed,
             last_watched_at: now,
+            progress_updated_at: update.progress_updated_at,
+            progress_device_id: update.progress_device_id,
             watch_href: update.watch_href,
             detail_href: update.detail_href,
             credits_start_seconds,
@@ -279,6 +315,7 @@ impl CoreStore {
     }
 
     pub async fn remove_history_item(&self, key: &str) -> Result<CoreData, String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         let title = data
             .history
@@ -293,11 +330,13 @@ impl CoreStore {
             }
             None => data.history.retain(|item| item.key != key),
         }
-        self.persist_locked(&data).await?;
-        Ok(data.clone())
+        let snapshot = data.clone();
+        self.persist_locked(data).await?;
+        Ok(snapshot)
     }
 
     pub async fn update_watch_later(&self, update: WatchLaterUpdate) -> Result<CoreData, String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         data.watch_later.retain(|item| item.key != update.item.key);
         if update.saved {
@@ -305,22 +344,27 @@ impl CoreStore {
             item.saved_at = now_millis();
             data.watch_later.insert(0, item);
         }
-        self.persist_locked(&data).await?;
-        Ok(data.clone())
+        let snapshot = data.clone();
+        self.persist_locked(data).await?;
+        Ok(snapshot)
     }
 
     pub async fn update_cache_limit(&self, max_bytes: u64) -> Result<CoreData, String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         data.cache.max_bytes = max_bytes.clamp(1024 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
-        self.persist_locked(&data).await?;
-        Ok(data.clone())
+        let snapshot = data.clone();
+        self.persist_locked(data).await?;
+        Ok(snapshot)
     }
 
     pub async fn update_cache_directory(&self, directory: PathBuf) -> Result<CoreData, String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         data.cache.directory = Some(directory.to_string_lossy().into_owned());
-        self.persist_locked(&data).await?;
-        Ok(data.clone())
+        let snapshot = data.clone();
+        self.persist_locked(data).await?;
+        Ok(snapshot)
     }
 
     pub async fn touch_cache(
@@ -331,6 +375,7 @@ impl CoreStore {
         title: Option<String>,
         files: Vec<String>,
     ) -> Result<(), String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         let now = now_millis();
         if let Some(entry) = data
@@ -355,22 +400,24 @@ impl CoreStore {
                 last_accessed_at: now,
             });
         }
-        self.persist_locked(&data).await
+        self.persist_locked(data).await
     }
 
     pub async fn remove_cache_entry(&self, id_or_hash: &str) -> Result<(), String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         data.cache_entries.retain(|entry| {
             entry.info_hash != id_or_hash
-                && entry.torrent_id.map(|id| id.to_string()) != Some(id_or_hash.to_owned())
+                && entry.torrent_id.map(|id| id.to_string()).as_deref() != Some(id_or_hash)
         });
-        self.persist_locked(&data).await
+        self.persist_locked(data).await
     }
 
     pub async fn clear_cache_entries(&self) -> Result<(), String> {
+        let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         data.cache_entries.clear();
-        self.persist_locked(&data).await
+        self.persist_locked(data).await
     }
 
     /// Persists at most once per [`PERSIST_MIN_INTERVAL_MS`]; ticks in between
@@ -409,13 +456,16 @@ impl CoreStore {
 
     async fn persist_now(&self) -> Result<(), String> {
         let _guard = self.persist_lock.lock().await;
-        let data = self.data.lock().await.clone();
-        self.persist_locked(&data).await
+        let data = self.data.lock().await;
+        self.persist_locked(data).await
     }
 
-    async fn persist_locked(&self, data: &CoreData) -> Result<(), String> {
-        let bytes = serde_json::to_vec(data)
+    async fn persist_locked(&self, data: tokio::sync::MutexGuard<'_, CoreData>) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&*data)
             .map_err(|error| format!("could not encode Cubo state: {error}"))?;
+        // Callers hold persist_lock through the rename, but readers need not
+        // wait for disk I/O once the state has been serialized.
+        drop(data);
         let temporary = self.path.with_extension("json.tmp");
         tokio::fs::write(&temporary, bytes)
             .await
@@ -435,4 +485,99 @@ pub(crate) fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_store() -> (CoreStore, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("cubo-store-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let store = CoreStore::load(directory.join("state.json")).await.unwrap();
+        (store, directory)
+    }
+
+    fn playback(position: f64, observed: u64) -> PlaybackUpdate {
+        serde_json::from_value(serde_json::json!({
+            "key": "movie:42", "mediaId": 42, "mediaType": "movie",
+            "title": "Movie", "positionSeconds": position, "durationSeconds": 3600,
+            "progressUpdatedAt": observed, "watchedDeltaSeconds": 5,
+            "watchHref": "/watch/movie/42", "detailHref": "/movie/42"
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn delayed_progress_cannot_undo_a_newer_backward_seek() {
+        let (store, directory) = test_store().await;
+        store.record_playback(playback(1800.0, 100)).await.unwrap();
+        store.record_playback(playback(600.0, 300)).await.unwrap();
+        // Old page's final request arrives last, after the user sought back.
+        store.record_playback(playback(1810.0, 200)).await.unwrap();
+        store.persist_now().await.unwrap();
+        let loaded = CoreStore::load(store.path.clone()).await.unwrap();
+        let snapshot = loaded.snapshot().await;
+        assert_eq!(snapshot.history[0].position_seconds, 600.0);
+        assert_eq!(snapshot.history[0].progress_updated_at, Some(300));
+        assert_eq!(snapshot.analytics.total_watch_seconds, 10.0);
+        // Newer progress is accepted even when it moves further backwards.
+        loaded.record_playback(playback(120.0, 400)).await.unwrap();
+        assert_eq!(loaded.snapshot().await.history[0].position_seconds, 120.0);
+        // The runtime cancels pending throttled tasks when this test ends.
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_device_clocks_do_not_block_progress() {
+        let (store, directory) = test_store().await;
+        let mut first = playback(1800.0, 9000);
+        first.progress_device_id = Some("laptop".into());
+        store.record_playback(first).await.unwrap();
+        let mut second = playback(600.0, 1000);
+        second.progress_device_id = Some("phone".into());
+        store.record_playback(second).await.unwrap();
+        assert_eq!(store.snapshot().await.history[0].position_seconds, 600.0);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_mutations_wait_for_the_shared_writer_lock() {
+        let (store, directory) = test_store().await;
+        let writer = store.persist_lock.lock().await;
+        // A progress flush owns this same lock. An immediate mutation must
+        // not start another write to state.json.tmp while it is held.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30),
+            store.update_cache_limit(2 * 1024 * 1024 * 1024),
+        ).await.is_err());
+        assert_eq!(store.snapshot().await.cache.max_bytes, DEFAULT_CACHE_BYTES);
+        drop(writer);
+        store.update_cache_limit(2 * 1024 * 1024 * 1024).await.unwrap();
+        let loaded = CoreStore::load(store.path.clone()).await.unwrap();
+        assert_eq!(loaded.snapshot().await.cache.max_bytes, 2 * 1024 * 1024 * 1024);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_flushes_and_mutations_preserve_all_entries() {
+        let (store, directory) = test_store().await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for id in 0..32 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                store.touch_cache(Some(id), format!("hash-{id}"), None, None, vec![]).await?;
+                store.persist_now().await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        let loaded = CoreStore::load(store.path.clone()).await.unwrap();
+        let snapshot = loaded.cache_snapshot().await;
+        assert_eq!(snapshot.cache_entries.len(), 32);
+        for id in 0..32 {
+            assert!(snapshot.cache_entries.iter().any(|entry| entry.torrent_id == Some(id)));
+        }
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }

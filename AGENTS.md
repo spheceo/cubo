@@ -167,3 +167,36 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   `apps/web/components` instead of `window.confirm` / `<select>`.
 - No new color tokens without approval; reuse the theme in
   `packages/ui/src/theme.css`.
+
+## Speed, quality, and stability rules
+
+- Successful playback remembers the exact torrent and file per movie/episode
+  (`source-affinity.ts`). Reopening tries that source while alternatives load
+  in parallel. Seeder-count changes alone must not switch releases. Failed
+  sources are forgotten and excluded from further automatic attempts in the
+  same session; an explicit retry resets that exclusion.
+- Automatic playback and previews exclude positively identified foreign dubs,
+  burned-in subtitles, and cinema captures. Unknown language is still eligible:
+  release metadata is heuristic and does not prove the audio track's language.
+  Keep direct-play precedence within the established quality tiers.
+- Preview startup uses already-buffered footage where a full clip fits, otherwise
+  an early scene past the opening titles (roughly 3–7 minutes for typical
+  episodes/movies). Do not restore a random seek halfway through a
+  cold torrent or make a loader animation delay media attachment.
+- Intentional seeks are persisted before the asynchronous seek starts. Keep the
+  old-player teardown guards, but never treat an explicit backward seek as an
+  accidental rewind. `ProgressWriter` permits one in-flight POST and coalesces
+  queued snapshots to the newest, preserving accumulated watch time.
+- Progress sends `progressUpdatedAt` and `progressDeviceId`; Core rejects older
+  observations from the same browser. `lastWatchedAt` remains server receipt
+  time for library recency. Do not compare observation clocks across devices.
+  Legacy clients without these optional fields retain their existing behavior.
+- Command-line tests cover ordering and selection; they do not establish real
+  first-frame latency, browser seek behavior, or actual audio language. Cold
+  startup still depends on peer availability. The ffmpeg offset, A/V sync,
+  playlist generation, and segment-cache invariants above remain load-bearing.
+
+- Featured heroes rotate across eligible catalog titles (last decade only),
+  using recent history shared across Home, Movies, and TV. Each page holds
+  its choice for several hours across refreshes; never revert to always
+  taking item zero.

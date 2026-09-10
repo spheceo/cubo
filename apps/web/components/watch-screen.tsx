@@ -57,8 +57,10 @@ import {
   saveCreditsStart,
 } from '@/lib/credits-detect';
 import { playbackKey } from '@/lib/library';
-import { loadPlayhead, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
-import { isOversizedStream, rankStreams, streamKey } from '@/lib/stream-select';
+import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
+import { isAutomaticSource, rankStreams, streamKey } from '@/lib/stream-select';
+import { ProgressWriter } from '@/lib/progress-writer';
+import { forgetSource, loadSource, preferSource, rememberSource } from '@/lib/source-affinity';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
 const AUTO_ATTEMPTS = 3;
@@ -184,6 +186,8 @@ export function WatchScreen({
   }, [subtitleTracks]);
 
   const attemptRef = useRef(0);
+  const failedSourcesRef = useRef(new Set<string>());
+  const sourceRefreshRef = useRef<Promise<Stream[]> | null>(null);
   /** Cancels the in-flight start sequence (buffer polling included) the
    *  moment a newer attempt begins or the screen unmounts. */
   const startAbortRef = useRef<AbortController | null>(null);
@@ -191,10 +195,22 @@ export function WatchScreen({
   const playbackConnection = useRef<Awaited<ReturnType<typeof core.connect>> | null>(null);
   /** Last position the player reported — lets a source fallback resume in place. */
   const lastPositionRef = useRef(0);
+  const activeSourceRef = useRef<Stream | null>(null);
   const activeInfoHashRef = useRef<string | null>(null);
   const lastDurationRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
+  const progressWriterRef = useRef<ProgressWriter | null>(null);
+  const storageBlockedRef = useRef(false);
+  if (!progressWriterRef.current) {
+    progressWriterRef.current = new ProgressWriter(async (update) => {
+      const connection = playbackConnection.current;
+      if (!connection) return;
+      await recordPlayback(connection, update);
+      if (update.sessionStarted) void refreshLibrary();
+    });
+  }
   const lastCoreSaveRef = useRef(0);
+  const unsavedWatchSeconds = useRef(0);
   const clearCreditsOnSave = useRef(false);
   const creditsClearedKey = useRef<string | null>(null);
   const playerFlushRef = useRef<(() => void) | null>(null);
@@ -256,13 +272,14 @@ export function WatchScreen({
     startIndex: number,
     auto: boolean,
     resumeFrom?: number,
-  ) {
+  ): Promise<boolean> {
     const attempt = (attemptRef.current += 1);
-    const stale = () => attemptRef.current !== attempt;
+    const stale = () => attemptRef.current !== attempt || abort.signal.aborted;
     startAbortRef.current?.abort();
     const abort = new AbortController();
     startAbortRef.current = abort;
 
+    storageBlockedRef.current = false;
     setStatus('starting');
     setError(null);
     setNeedsCore(false);
@@ -280,24 +297,31 @@ export function WatchScreen({
     let savedInfoHash: string | undefined;
     try {
       connection = await core.connect();
+      if (stale()) return false;
       playbackConnection.current = connection;
       if (resumeFrom == null) {
         const local = loadPlayhead(itemKey);
         savedInfoHash = local?.infoHash;
         try {
           const library = await getLibrary(connection);
+          if (stale()) return false;
           const previous = library.history.find((item) => item.key === itemKey);
-          resume = resumeSeconds(
+          const chosen = pickPlayhead(
             local,
             previous
               ? {
                   positionSeconds: previous.positionSeconds,
                   durationSeconds: previous.durationSeconds,
-                  updatedAt: previous.lastWatchedAt,
+                  updatedAt: previous.progressDeviceId === playheadDeviceId()
+                    ? previous.progressUpdatedAt ?? previous.lastWatchedAt
+                    : previous.lastWatchedAt,
                 }
               : null,
           );
+          resume = chosen ? playableResume(chosen.positionSeconds, chosen.durationSeconds) : 0;
+          lastDurationRef.current = chosen?.durationSeconds ?? 0;
         } catch {
+          if (stale()) return false;
           resume = resumeSeconds(local, null);
         }
         if (resume > 0 && !lastDurationRef.current) {
@@ -307,13 +331,13 @@ export function WatchScreen({
       lastPositionRef.current = resume;
       setResumeAt(resume);
     } catch (reason) {
-      if (stale()) return;
+      if (stale()) return false;
       setNeedsCore(true);
       setStatus('error');
       setError(reason instanceof Error ? reason.message : 'Cubo Core is not connected.');
-      return;
+      return false;
     }
-    if (stale()) return;
+    if (stale()) return false;
 
     const limit = auto ? list.length : startIndex + 1;
     let lastError = 'Could not start playback';
@@ -321,8 +345,9 @@ export function WatchScreen({
 
     for (let index = startIndex; index < limit; index += 1) {
       const stream = list[index];
-      if (auto && isOversizedStream(stream)) {
-        lastError = 'This source is too large to start automatically.';
+      if (auto && failedSourcesRef.current.has(stream.infoHash)) continue;
+      if (auto && !isAutomaticSource(stream, originalLanguage)) {
+        lastError = 'No suitable original-language source is available.';
         continue;
       }
       if (auto && attempts >= AUTO_ATTEMPTS) break;
@@ -335,6 +360,7 @@ export function WatchScreen({
       lastPositionRef.current = startAt;
       setResumeAt(startAt);
       activeInfoHashRef.current = stream.infoHash;
+      activeSourceRef.current = stream;
       setActiveKey(streamKey(stream));
       setSubtitleMatch(null);
 
@@ -345,9 +371,10 @@ export function WatchScreen({
           title,
           fileIndex: stream.fileIdx,
         });
-        if (stale()) return;
+        if (stale()) return false;
 
         const fileIndex = stream.fileIdx ?? largestFileIndex(added.files);
+        activeSourceRef.current = { ...stream, fileIdx: fileIndex };
         const filename = added.files[fileIndex]?.name ?? stream.filename ?? '';
         const hint = `${stream.name} ${stream.title}`;
         const direct = isBrowserPlayableFilename(filename, hint);
@@ -361,12 +388,6 @@ export function WatchScreen({
         const id = added.id ?? added.infoHash;
         if (id === null || id === '') throw new Error('Cubo Core did not return a torrent ID');
 
-        // Compute the release hash in the background — it may pull the file's
-        // tail from peers and take a while. When it lands, the subtitle
-        // effect refetches with an exact-release match.
-        void getSubtitleMatch(connection, id, fileIndex).then((match) => {
-          if (!stale()) setSubtitleMatch(match);
-        });
 
         shipClientLog(
           connection,
@@ -392,11 +413,20 @@ export function WatchScreen({
         await waitUntilLive(connection, id, {
           signal: abort.signal,
           onProgress: (stats) => {
-            if (stale()) return;
+            if (stale()) return false;
             setStage(bufferingTarget(stats));
           },
         });
-        if (stale()) return;
+        if (stale()) return false;
+
+        // rqbit is now live; hashing during checksum validation returns 500.
+        // Compute the release hash in the background — it may pull the file's
+        // tail from peers and take a while. When it lands, the subtitle
+        // effect refetches with an exact-release match.
+        void getSubtitleMatch(connection, id, fileIndex).then((match) => {
+          if (!stale()) setSubtitleMatch(match);
+        });
+
 
         let url: string;
         let usesHls = false;
@@ -425,14 +455,14 @@ export function WatchScreen({
           timeOffset = remux.startSeconds;
           localJump = startAt - timeOffset;
           if (localJump < 0.25) localJump = null;
+          if (stale()) return false;
           remuxContext.current = { connection, id, fileIndex };
-          if (stale()) return;
         }
 
         setStage(STAGE.ready);
         setProgress(1);
         const reveal = () => {
-          if (stale()) return;
+          if (stale()) return false;
           setVideoUrl(url);
           setVideoIsHls(usesHls);
           setVideoDurationHint(durationHint);
@@ -440,20 +470,25 @@ export function WatchScreen({
           setVideoStartLocal(localJump);
           setStatus('ready');
         };
-        // Hidden tabs clamp setTimeout — attach immediately so play() can
-        // start (and be heard) without waiting on a frozen 480ms timer.
-        if (document.hidden) reveal();
-        else window.setTimeout(reveal, 480);
-        return;
+        // Attach as soon as the source is ready; loader animation must not
+        // delay the first media request.
+        reveal();
+        return true;
       } catch (reason) {
-        if (stale() || abort.signal.aborted) return;
+        if (stale() || abort.signal.aborted) return false;
         lastError = reason instanceof Error ? reason.message : lastError;
-        if (reason instanceof InsufficientStorageError) break;
+        if (reason instanceof InsufficientStorageError) {
+          storageBlockedRef.current = true;
+          break;
+        }
+        failedSourcesRef.current.add(stream.infoHash);
+        forgetSource(itemKey, stream.infoHash);
       }
     }
 
     setStatus('error');
     setError(lastError);
+    return false;
   }
 
   // `start` closes over fresh state every render; a ref keeps the effect below
@@ -476,26 +511,43 @@ export function WatchScreen({
     setError(null);
 
     void (async () => {
-      // The Core's transcode capability decides which sources are playable,
-      // so resolve the connection before ranking. A failed connection still
-      // ranks (direct-play only) and surfaces the Core error via start().
+      // A successful source can start without waiting for Torrentio again.
+      // Refresh alternatives in parallel for real mid-play failures.
+      const foundPromise = queryClient.fetchQuery(
+        streamQueries.streams(mediaType, imdbId, season, episode),
+      ).catch(() => [] as Stream[]);
       const connection = await core.connect().catch(() => null);
+      if (cancelled) return;
+      const savedSource = loadSource(itemKey);
+      const rank = (found: Stream[], saved: Stream | null) => preferSource(rankStreams(
+        saved ? [saved, ...found.filter((stream) =>
+          stream.infoHash !== saved.infoHash || (stream.fileIdx != null && stream.fileIdx !== saved.fileIdx),
+        )] : found,
+        { transcode: connection?.transcode ?? false, hevc: supportsHevcRemux() },
+        originalLanguage,
+        season != null && episode != null ? { season, episode } : null,
+      ).filter((stream) => isAutomaticSource(stream, originalLanguage)), saved);
+      sourceRefreshRef.current = foundPromise.then((found) => rank(found, savedSource));
       try {
-        const [found, seasonEpisodes] = await Promise.all([
-          queryClient.fetchQuery(
-            streamQueries.streams(mediaType, imdbId, season, episode),
-          ),
-          mediaType === 'tv' && season != null
-            ? queryClient.fetchQuery(tmdbQueries.season(mediaId, season))
-            : Promise.resolve(undefined),
-        ]);
+        const preferred = rank([], savedSource);
+        if (preferred.length > 0 && connection) {
+          setSources(preferred);
+          const started = await startRef.current(preferred, 0, true);
+          if (cancelled || storageBlockedRef.current) return;
+          if (started) {
+            void foundPromise.then((found) => {
+              if (!cancelled) setSources(rank(found, savedSource));
+            });
+            return;
+          }
+          setStatus('loading');
+        }
+        const found = await foundPromise;
         if (cancelled) return;
-        const ranked = rankStreams(
-          found,
-          { transcode: connection?.transcode ?? false, hevc: supportsHevcRemux() },
-          originalLanguage,
-          season != null && episode != null ? { season, episode } : null,
-        );
+        // A failed remembered torrent must not consume the first retry too.
+        const ranked = rank(preferred.length > 0
+          ? found.filter((stream) => stream.infoHash !== savedSource?.infoHash)
+          : found, null);
         setSources(ranked);
         if (connection) {
           shipClientLog(
@@ -519,13 +571,17 @@ export function WatchScreen({
           );
         }
         if (ranked.length === 0) {
+          const seasonEpisodes = mediaType === 'tv' && season != null
+            ? await queryClient.fetchQuery(tmdbQueries.season(mediaId, season)).catch(() => undefined)
+            : undefined;
+          if (cancelled) return;
           const airDate = seasonEpisodes?.find((entry) => entry.episodeNumber === episode)
             ?.airDate;
           setStatus('error');
           setError(
             airDate && isUpcomingAirDate(airDate)
               ? "This episode hasn't come out yet."
-              : 'No browser-compatible sources were found for this title.',
+              : 'No suitable original-language sources were found for this title.',
           );
           return;
         }
@@ -539,6 +595,8 @@ export function WatchScreen({
 
     return () => {
       cancelled = true;
+      startAbortRef.current?.abort();
+      seekAttemptRef.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- core.connect is stable for a given endpoint
   }, [mediaType, mediaId, imdbId, season, episode]);
@@ -583,13 +641,14 @@ export function WatchScreen({
       // start at 0 after resume still needs to reach Core — keep the
       // stored playhead instead of dropping the tick.
       if (lastPositionRef.current > 5 && positionSeconds + 1.5 < lastPositionRef.current) {
-        if (!sessionStarted) return;
+        if (!sessionStarted && !persistNow) return;
         positionSeconds = lastPositionRef.current;
         durationSeconds = lastDurationRef.current || durationSeconds;
       }
       lastPositionRef.current = positionSeconds;
       lastDurationRef.current = durationSeconds;
-      savePlayhead(itemKey, positionSeconds, durationSeconds, activeInfoHashRef.current);
+      const progressUpdatedAt = savePlayhead(itemKey, positionSeconds, durationSeconds, activeInfoHashRef.current);
+      unsavedWatchSeconds.current += Math.max(0, watchedDeltaSeconds);
       const connection = playbackConnection.current;
       if (!connection) return;
       const now = performance.now();
@@ -599,7 +658,7 @@ export function WatchScreen({
       lastCoreSaveRef.current = now;
       const creditsStartSeconds = clearCreditsOnSave.current ? 0 : creditsStartRef.current;
       clearCreditsOnSave.current = false;
-      const task = recordPlayback(connection, {
+      const update = {
         key: itemKey,
         mediaId,
         mediaType,
@@ -613,20 +672,17 @@ export function WatchScreen({
         episode: episode ?? null,
         positionSeconds,
         durationSeconds,
-        watchedDeltaSeconds,
+        progressUpdatedAt,
+        progressDeviceId: playheadDeviceId(),
+        watchedDeltaSeconds: unsavedWatchSeconds.current,
         sessionStarted,
         watchHref: `/watch/${mediaType}/${mediaId}${season != null && episode != null ? `?season=${season}&episode=${episode}` : ''}`,
         detailHref: backHref,
         creditsStartSeconds,
-      })
-        .then(() => {
-          // Refreshing on every periodic report refetched the whole library
-          // every 10s during playback; once per session start is enough while
-          // playing — leaving the player refreshes after the final save.
-          if (sessionStarted) void refreshLibrary();
-        })
-        .catch(() => undefined);
-      saveChainRef.current = saveChainRef.current.then(() => task);
+      };
+      unsavedWatchSeconds.current = 0;
+      saveChainRef.current = progressWriterRef.current!.enqueue(update);
+
     },
     [
       itemKey,
@@ -644,6 +700,15 @@ export function WatchScreen({
       refreshLibrary,
     ],
   );
+
+  const recordSeekIntent = useCallback((targetSeconds: number) => {
+    lastPositionRef.current = targetSeconds;
+    if (seekingRef.current || seekTargetRef.current != null) {
+      savePlayhead(itemKey, targetSeconds, lastDurationRef.current || videoDurationHint || 0, activeInfoHashRef.current);
+    } else {
+      savePlaybackProgress(targetSeconds, lastDurationRef.current || videoDurationHint || 0, 0, false, true);
+    }
+  }, [itemKey, savePlaybackProgress, videoDurationHint]);
 
   // A seek outside the converted window restarts ffmpeg at the target and
   // swaps in the new playlist. Last request wins if the viewer keeps seeking.
@@ -704,16 +769,38 @@ export function WatchScreen({
     seekTargetRef.current = null;
   }, [seekConverting]);
 
-  // Refresh Continue Watching once the viewer leaves the player. The small
-  // delay lets the player's final progress flush land first. Leaving also
-  // cancels any start sequence still buffering — it would otherwise keep
-  // polling Core long after the viewer has moved on.
+  const persistLastPlayhead = useCallback(() => {
+    playerFlushRef.current?.();
+    const duration = lastDurationRef.current || videoDurationHint || 0;
+    if (lastPositionRef.current > 0 && duration > 0) {
+      savePlaybackProgress(lastPositionRef.current, duration, 0, false, true);
+    }
+  }, [savePlaybackProgress, videoDurationHint]);
+
+  const persistLastPlayheadRef = useRef(persistLastPlayhead);
+  persistLastPlayheadRef.current = persistLastPlayhead;
   const refreshLibraryRef = useRef(refreshLibrary);
   refreshLibraryRef.current = refreshLibrary;
+
+  const finishPlayback = useCallback(async () => {
+    persistLastPlayhead();
+    const idle = progressWriterRef.current?.whenIdle() ?? saveChainRef.current;
+    const saved = idle.then(() => refreshLibrary());
+    const giveUp = new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 1500);
+    });
+    await Promise.race([saved, giveUp]);
+  }, [persistLastPlayhead, refreshLibrary]);
+
+  // Leaving cancels any start sequence still buffering, then waits for the
+  // last playhead to reach Core so Continue Watching is current on arrival.
   useEffect(
     () => () => {
       startAbortRef.current?.abort();
-      window.setTimeout(() => void refreshLibraryRef.current(), 400);
+      persistLastPlayheadRef.current();
+      void (progressWriterRef.current?.whenIdle() ?? Promise.resolve()).then(() => {
+        void refreshLibraryRef.current();
+      });
     },
     [],
   );
@@ -721,25 +808,13 @@ export function WatchScreen({
   // Back means BACK — the page the viewer came from, not always the info
   // page (e.g. Home → Watch should land on Home). Falls back to `backHref`.
   const goBack = useCallback(() => {
-    playerFlushRef.current?.();
-    if (
-      !playerFlushRef.current &&
-      lastPositionRef.current > 0 &&
-      lastDurationRef.current > 0
-    ) {
-      savePlaybackProgress(lastPositionRef.current, lastDurationRef.current, 0, false, true);
-    }
-    const saved = saveChainRef.current.then(() => refreshLibrary());
-    const giveUp = new Promise<void>((resolve) => {
-      window.setTimeout(resolve, 1500);
-    });
-    void Promise.race([saved, giveUp]).finally(() => {
+    void finishPlayback().finally(() => {
       if (window.history.length > 1) navigate(-1);
       else navigate(backHref);
       resetWindowScroll();
       requestAnimationFrame(resetWindowScroll);
     });
-  }, [navigate, backHref, refreshLibrary, savePlaybackProgress]);
+  }, [navigate, backHref, finishPlayback]);
 
   const goNextEpisode = useCallback(() => {
     if (!nextEpisode) return;
@@ -756,24 +831,15 @@ export function WatchScreen({
     if (season == null || episode == null) return;
     if (claimedReadyKey.current === itemKey) return;
     claimedReadyKey.current = itemKey;
-    void (async () => {
-      const connection = playbackConnection.current;
-      let position = lastPositionRef.current;
-      let duration = lastDurationRef.current || videoDurationHint || 1;
-      if (connection && position <= 0) {
-        try {
-          const library = await getLibrary(connection);
-          const previous = library.history.find((item) => item.key === itemKey);
-          if (previous) {
-            position = previous.positionSeconds;
-            duration = duration > 1 ? duration : previous.durationSeconds || 1;
-          }
-        } catch {
-          // Still claim the row so Continue points at this episode.
-        }
-      }
-      savePlaybackProgress(position, duration, 0, true);
-    })();
+    // start() already reconciled Core and local progress. A second library
+    // fetch here can arrive after a seek and overwrite the user's new time.
+    savePlaybackProgress(
+      lastPositionRef.current,
+      lastDurationRef.current || videoDurationHint || 1,
+      0,
+      false,
+      true,
+    );
   }, [status, mediaType, season, episode, itemKey, videoDurationHint, savePlaybackProgress]);
 
   useEffect(() => {
@@ -814,6 +880,9 @@ export function WatchScreen({
           initialTime={videoIsHls ? 0 : resumeAt}
           startTimeLocal={videoIsHls ? videoStartLocal : null}
           onPlaybackProgress={savePlaybackProgress}
+          onPlaying={() => {
+            if (activeSourceRef.current) rememberSource(itemKey, activeSourceRef.current);
+          }}
           flushRef={playerFlushRef}
           onNextEpisode={nextEpisode ? goNextEpisode : undefined}
           playbackKey={mediaType === 'tv' ? itemKey : undefined}
@@ -852,6 +921,7 @@ export function WatchScreen({
                 }
               : undefined
           }
+          onSeekIntent={recordSeekIntent}
           onSeekOutside={(target) => void requestRemuxSeek(target)}
           onError={() => {
             // Restarting ffmpeg for a seek kills the current playlist;
@@ -864,6 +934,10 @@ export function WatchScreen({
               (stream) => streamKey(stream) === activeKey,
             );
             const failed = failedIndex >= 0 ? sources[failedIndex] : null;
+            if (failed) {
+              failedSourcesRef.current.add(failed.infoHash);
+              forgetSource(itemKey, failed.infoHash);
+            }
             if (playbackConnection.current) {
               shipClientLog(
                 playbackConnection.current,
@@ -882,8 +956,20 @@ export function WatchScreen({
             if (nextIndex < sources.length) {
               void start(sources, nextIndex, true, lastPositionRef.current);
             } else {
-              setStatus('error');
-              setError('None of the available sources could be played in this browser.');
+              // A remembered source can fail before its alternatives have
+              // arrived. Wait for that existing lookup before giving up.
+              const attempt = attemptRef.current;
+              void (sourceRefreshRef.current ?? Promise.resolve(sources)).then((available) => {
+                if (attemptRef.current !== attempt || startAbortRef.current?.signal.aborted) return;
+                const alternatives = available.filter((stream) => !failedSourcesRef.current.has(stream.infoHash));
+                if (alternatives.length > 0) {
+                  setSources(alternatives);
+                  void start(alternatives, 0, true, lastPositionRef.current);
+                } else {
+                  setStatus('error');
+                  setError('None of the suitable sources could be played in this browser.');
+                }
+              });
             }
           }}
           />
@@ -936,7 +1022,10 @@ export function WatchScreen({
                   {sources.length > 0 ? (
                     <button
                       type="button"
-                      onClick={() => void start(sources, 0, true)}
+                      onClick={() => {
+                        failedSourcesRef.current.clear();
+                        void start(sources, 0, true);
+                      }}
                       className="flex h-12 cursor-pointer items-center justify-center rounded-full bg-control px-7 font-semibold text-white transition-colors hover:bg-control-hover"
                     >
                       Try again

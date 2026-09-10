@@ -93,13 +93,16 @@ export function latestItemsByTitle(
   return [...latestByTitle.values()].sort((a, b) => b.lastWatchedAt - a.lastWatchedAt);
 }
 
+/** Skip accidental opens (player start at 0, immediate back). */
+export const CONTINUE_WATCHING_MIN_SECONDS = 5;
+
 /** One card per title — always the last season/episode touched. */
 export function continueWatchingItems(
   history: LibraryItem[] | undefined,
   mediaType?: MediaType,
 ): LibraryItem[] {
   return latestItemsByTitle(history, mediaType)
-    .filter((item) => item.positionSeconds >= 30 && item.progress < 0.9)
+    .filter((item) => item.positionSeconds >= CONTINUE_WATCHING_MIN_SECONDS && item.progress < 0.9)
     .slice(0, 8);
 }
 

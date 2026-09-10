@@ -88,6 +88,9 @@ export interface LibraryItem {
   progress: number;
   completed: boolean;
   lastWatchedAt: number;
+  /** Client observation time, so delayed requests cannot undo a newer seek. */
+  progressUpdatedAt?: number | null;
+  progressDeviceId?: string | null;
   watchHref: string;
   detailHref: string;
   /** Absolute seconds where end credits began, mapped while watching. */
@@ -310,31 +313,32 @@ function cineType(mediaType: MediaType): 'movie' | 'series' {
 
 class CinemetaMetadata {
   /** Numeric route ids are TMDB ids; this bridges them to IMDb ids. */
-  private bridge = new Map<number, string>();
+  private bridge = new Map<string, string>();
   private metaCache = new Map<string, CinemetaMeta>();
 
-  private trackPair(numericId: number, imdbId: string): void {
+  private trackPair(mediaType: MediaType, numericId: number, imdbId: string): void {
     if (Number.isSafeInteger(numericId) && numericId > 0 && imdbId.startsWith('tt')) {
-      this.bridge.set(numericId, imdbId);
+      this.bridge.set(`${mediaType}:${numericId}`, imdbId);
     }
   }
 
   /** Records the tmdb→imdb pair when the meta carries both ids. */
-  private remember(meta: CinemetaMeta): void {
+  private remember(mediaType: MediaType, meta: CinemetaMeta): void {
     const tmdbId = Number(meta.moviedb_id);
     if (Number.isFinite(tmdbId) && tmdbId > 0 && meta.id) {
-      this.trackPair(tmdbId, meta.id);
+      this.trackPair(mediaType, tmdbId, meta.id);
     }
   }
 
   /** Public because catalog/search mapping lives outside the class.
    *  Search results carry no moviedb_id, so callers pass an id derived
    *  from the IMDb number instead. */
-  trackId(meta: CinemetaMeta, forcedNumericId?: number): void {
+  trackId(mediaType: MediaType, meta: CinemetaMeta, forcedNumericId?: number): void {
     const imdb = meta.id?.startsWith('tt') ? meta.id : meta.imdb_id ?? null;
     if (!imdb) return;
     const tmdbId = Number(meta.moviedb_id);
     this.trackPair(
+      mediaType,
       Number.isFinite(tmdbId) && tmdbId > 0 ? tmdbId : (forcedNumericId ?? NaN),
       imdb,
     );
@@ -352,18 +356,14 @@ class CinemetaMetadata {
   }
 
   async resolveImdb(mediaType: MediaType, id: number): Promise<string> {
-    const cached = this.bridge.get(id);
+    const cached = this.bridge.get(`${mediaType}:${id}`);
     if (cached) return cached;
-    // Cold deep link (old history entry): warm the map from popular catalogs
-    // before giving up.
-    for (const type of ['movie', 'series'] as MediaType[]) {
-      try {
-        for (const meta of await this.catalog(type)) this.remember(meta);
-      } catch {
-        // Catalog failure just means the miss stands.
-      }
+    // Route ids are scoped to movie/TV. Fetch only the matching catalog;
+    // the same numeric TMDB id can refer to two different titles.
+    for (const meta of await this.catalog(mediaType)) {
+      cinemetaSummary(this, meta, mediaType);
     }
-    const imdb = this.bridge.get(id);
+    const imdb = this.bridge.get(`${mediaType}:${id}`);
     if (!imdb) {
       throw new Error('This title is not in the connected catalog right now.');
     }
@@ -380,7 +380,7 @@ class CinemetaMetadata {
     );
     const meta = data.meta;
     if (!meta) throw new Error('The catalog has no record of this title.');
-    this.remember(meta);
+    this.remember(mediaType, meta);
     this.metaCache.set(cacheKey, meta);
     return meta;
   }
@@ -403,7 +403,7 @@ function cinemetaSummary(
     numericId = Number(digits);
   }
   if (!imdb) return null;
-  provider.trackId(meta, numericId);
+  provider.trackId(mediaType, meta, numericId);
   return {
     id: numericId,
     mediaType,
@@ -700,11 +700,8 @@ export function createClient(config?: CuboClientConfig): CuboClient {
       return cinemetaDetails(id, mediaType, meta);
     },
     async season(showId: number, seasonNumber: number) {
-      const imdb = await cinemeta.resolveImdb('tv', showId);
-      const data = await getJson<CinemetaMetaResponse>(
-        `${CINEMETA_BASE}/meta/series/${imdb}.json`,
-      );
-      const videos = data.meta?.videos ?? [];
+      const meta = await cinemeta.meta('tv', showId);
+      const videos = meta.videos ?? [];
       return videos
         .filter((video) => video.season === seasonNumber)
         .map((video, index): Episode => {

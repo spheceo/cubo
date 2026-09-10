@@ -104,6 +104,8 @@ export interface PlaybackUpdate {
   episode: number | null;
   positionSeconds: number;
   durationSeconds: number;
+  progressUpdatedAt?: number;
+  progressDeviceId?: string;
   watchedDeltaSeconds: number;
   sessionStarted: boolean;
   watchHref: string;

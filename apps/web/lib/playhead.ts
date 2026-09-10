@@ -4,6 +4,22 @@
  * gets periodic writes; this file is the fast, sync source of truth.
  */
 const STORAGE_KEY = 'cubo.playhead';
+let lastObservation = 0;
+let deviceId: string | undefined;
+
+/** Scope event ordering to a browser; clocks on remote devices may differ. */
+export function playheadDeviceId(): string {
+  if (deviceId) return deviceId;
+  const fresh = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+  try {
+    deviceId = window.localStorage.getItem('cubo.playhead-device') || fresh;
+    window.localStorage.setItem('cubo.playhead-device', deviceId);
+  } catch {
+    deviceId = fresh;
+  }
+  return deviceId;
+}
+
 export const RESUME_MIN_SECONDS = 5;
 export const RESUME_END_EPSILON = 3;
 /** A leftover from a failed open (tens of seconds) must not seek into a
@@ -88,12 +104,18 @@ export function savePlayhead(
   positionSeconds: number,
   durationSeconds: number,
   infoHash?: string | null,
-): void {
-  if (!Number.isFinite(positionSeconds) || positionSeconds < 0) return;
+): number {
+  let updatedAt = Math.max(Date.now(), lastObservation + 1);
+  lastObservation = updatedAt;
+  if (!Number.isFinite(positionSeconds) || positionSeconds < 0) return updatedAt;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     const parsed = raw ? (JSON.parse(raw) as Record<string, StoredPlayhead>) : {};
     const previous = parsed[playbackKey];
+    if (Number.isFinite(previous?.updatedAt)) {
+      updatedAt = Math.max(updatedAt, previous.updatedAt + 1);
+      lastObservation = updatedAt;
+    }
     const nextHash =
       infoHash && infoHash.length > 0
         ? infoHash
@@ -103,11 +125,12 @@ export function savePlayhead(
     parsed[playbackKey] = {
       positionSeconds,
       durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : 0,
-      updatedAt: Date.now(),
+      updatedAt,
       ...(nextHash ? { infoHash: nextHash } : {}),
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
   } catch {
     // Private mode — Core still keeps the mapping.
   }
+  return updatedAt;
 }

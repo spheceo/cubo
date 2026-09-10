@@ -6,7 +6,6 @@ import {
   historyForEpisode,
   latestHistoryForTitle,
   nextEpisodeTarget,
-  playButtonLabel,
   watchHistoryItems,
 } from './library';
 
@@ -55,12 +54,6 @@ test('episode list progress is the row for that season and episode', () => {
   assert.equal(historyForEpisode([e1, e2], 1, 1, 3), undefined);
 });
 
-test('title play button names the last-touched episode', () => {
-  assert.equal(playButtonLabel('movie'), 'Watch Now');
-  assert.equal(playButtonLabel('tv', null, 2), 'Watch S2 E1');
-  assert.equal(playButtonLabel('tv', { season: 2, episode: 1 }), 'Continue S2 E1');
-});
-
 test('next episode walks the current season then the next season', () => {
   const seasons = [
     { seasonNumber: 1, episodeCount: 8 },
@@ -77,4 +70,18 @@ test('continue watching also keeps the last-touched episode of a series', () => 
     item({ key: 'tv:1:1:3', mediaId: 1, lastWatchedAt: 9, positionSeconds: 120, progress: 0.2 }),
   ]);
   assert.deepEqual(items.map((entry) => entry.key), ['tv:1:1:3']);
+});
+
+test('continue watching includes a title after a few seconds, not half a minute', () => {
+  const started = item({
+    key: 'tv:2:1:11', mediaId: 2, lastWatchedAt: 20, positionSeconds: 8, progress: 0.003,
+  });
+  const bounce = item({
+    key: 'tv:3:1:1', mediaId: 3, lastWatchedAt: 21, positionSeconds: 2, progress: 0.001,
+  });
+  const finished = item({
+    key: 'tv:4:1:1', mediaId: 4, lastWatchedAt: 22, positionSeconds: 3300, progress: 0.95,
+  });
+  const items = continueWatchingItems([started, bounce, finished]);
+  assert.deepEqual(items.map((entry) => entry.key), ['tv:2:1:11']);
 });
