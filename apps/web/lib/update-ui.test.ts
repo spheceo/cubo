@@ -14,9 +14,16 @@ const base: CoreUpdateStatus = {
   state: 'idle',
 };
 
-test('idle update button is just Update', () => {
+test('idle update button names the latest version', () => {
   assert.equal(updateButtonLabel({ state: 'idle', progress: 0 }), 'Update');
-  assert.equal(updateButtonLabel({ state: 'ready', progress: 1 }), 'Update');
+  assert.equal(
+    updateButtonLabel({ state: 'idle', progress: 0, latest: 'v0.0.13' }),
+    'Update to v0.0.13',
+  );
+  assert.equal(
+    updateButtonLabel({ state: 'ready', progress: 1, latest: '0.1.0' }),
+    'Update to v0.1.0',
+  );
 });
 
 test('download progress lands on the button label', () => {
