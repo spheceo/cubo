@@ -41,6 +41,7 @@ import { logoUrl } from '@cubo/core';
 import { findActiveCue, loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
+import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
 import { nextEpisodeDue, normalizeCreditsStart, startCreditsMapper, creditsOverlayActive } from '@/lib/credits-detect';
 
@@ -115,6 +116,8 @@ export function VideoPlayer({
   startTimeLocal = null,
   onPlaybackProgress,
   onSeekOutside,
+  onSeekIntent,
+  onPlaying,
   onError,
   flushRef,
   onNextEpisode,
@@ -163,7 +166,10 @@ export function VideoPlayer({
   /** Called with an absolute target when a seek lands outside the converted
    *  window, so the owner can restart the converter at that position. */
   onSeekOutside?: (absoluteSeconds: number) => void;
+  /** Persist an intentional jump before asynchronous seeking begins. */
+  onSeekIntent?: (absoluteSeconds: number) => void;
   onError: () => void;
+  onPlaying?: () => void;
   /** Parent calls this before leaving so progress is snapshotted while the
    *  video element still has a real currentTime. */
   flushRef?: MutableRefObject<(() => void) | null>;
@@ -183,6 +189,7 @@ export function VideoPlayer({
   const pendingScrubRatio = useRef(0);
   const scrubbing = useRef(false);
   const initialSeekApplied = useRef(false);
+  const lastObservedTime = useRef<number | null>(null);
   const lastProgressReport = useRef(0);
   const lastProgressWallTime = useRef(0);
   const sessionReported = useRef(false);
@@ -564,6 +571,8 @@ export function VideoPlayer({
   );
 
   useEffect(() => {
+    initialSeekApplied.current = false;
+    lastObservedTime.current = null;
     setDuration(hls && durationHint && Number.isFinite(durationHint) ? durationHint : 0);
     setCurrentTime(0);
     setBufferedRanges([]);
@@ -832,6 +841,7 @@ export function VideoPlayer({
         0,
         fullDuration > 0 ? Math.min(fullDuration, absoluteSeconds) : absoluteSeconds,
       );
+      onSeekIntent?.(target);
       holdSeek(target);
       setCurrentTime(target - timeOffsetRef.current);
 
@@ -851,7 +861,7 @@ export function VideoPlayer({
       pendingSeekKickedRef.current = true;
       video.currentTime = Math.max(0, local);
     },
-    [hls, holdSeek, resolveDuration],
+    [hls, holdSeek, resolveDuration, onSeekIntent],
   );
 
   const seekBy = useCallback((seconds: number) => {
@@ -1089,9 +1099,16 @@ export function VideoPlayer({
         onWaiting={() => {
           if (!userPaused.current) setWaiting(true);
         }}
-        onPlaying={() => setWaiting(false)}
+        onPlaying={(event) => {
+          syncBuffered(event.currentTarget);
+          applyPendingSeek(event.currentTarget);
+          setWaiting(false);
+          onPlaying?.();
+        }}
         onCanPlay={(event) => {
           const video = event.currentTarget;
+          syncBuffered(video);
+          applyPendingSeek(video);
           if (!reloadHoldRef.current && !userPaused.current && video.paused) {
             requestPlay(video);
           }
@@ -1099,6 +1116,9 @@ export function VideoPlayer({
         }}
         onTimeUpdate={(event) => {
           const video = event.currentTarget;
+          syncBuffered(video);
+          if (isAdvancingPlayback(lastObservedTime.current, video)) setWaiting(false);
+          lastObservedTime.current = video.currentTime;
           applyPendingSeek(video);
           if (pendingSeekRef.current == null) {
             setCurrentTime(video.currentTime);
@@ -1106,6 +1126,13 @@ export function VideoPlayer({
           if (performance.now() - lastProgressReport.current >= 1_000) {
             reportPlayback(false);
           }
+        }}
+        onSeeked={(event) => {
+          const video = event.currentTarget;
+          syncBuffered(video);
+          applyPendingSeek(video);
+          if (pendingSeekRef.current == null) setCurrentTime(video.currentTime);
+          lastObservedTime.current = video.currentTime;
         }}
         onProgress={(event) => {
           syncBuffered(event.currentTarget);
@@ -1122,10 +1149,15 @@ export function VideoPlayer({
           if (!hls && !initialSeekApplied.current && initialTime > 5 && fullDuration > initialTime) {
             initialSeekApplied.current = true;
             holdSeek(initialTime);
-            applyPendingSeek(video);
+            // Direct MP4/WebM seeks initiate HTTP range reads. Waiting for
+            // this position to be buffered first plays from zero beneath
+            // a permanently pending resume overlay on some sources.
+            pendingSeekKickedRef.current = true;
+            video.currentTime = initialTime;
             if (!reloadHoldRef.current) requestPlay(video);
           }
-        }}        onVolumeChange={(event) => {
+        }}
+        onVolumeChange={(event) => {
           setVolume(event.currentTarget.volume);
           setMuted(event.currentTarget.muted);
         }}

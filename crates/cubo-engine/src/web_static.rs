@@ -32,26 +32,24 @@ fn requested_file(path: &str) -> String {
 }
 
 fn looks_like_asset(path: &str) -> bool {
-    PathExt(path).has_extension()
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| !ext.is_empty())
 }
 
-struct PathExt<'a>(&'a str);
-
-impl PathExt<'_> {
-    fn has_extension(&self) -> bool {
-        std::path::Path::new(self.0)
-            .extension()
-            .is_some_and(|ext| !ext.is_empty())
+fn cache_policy(path: &str) -> &'static str {
+    // Vite fingerprints generated assets. Public files keep stable names
+    // and must revalidate after an upgrade (icons, manifests, etc.).
+    if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
     }
 }
 
 fn file_response(path: &str, bytes: &'static [u8]) -> Response {
     let mime = mime_for(path);
-    let cache = if path == "index.html" {
-        "no-cache"
-    } else {
-        "public, max-age=31536000, immutable"
-    };
+    let cache = cache_policy(path);
     (
         [
             (CONTENT_TYPE, HeaderValue::from_static(mime)),
@@ -87,6 +85,14 @@ fn mime_for(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::requested_file;
+
+    #[test]
+    fn only_versioned_assets_are_immutable() {
+        assert!(super::cache_policy("assets/app-123.js").contains("immutable"));
+        for path in ["index.html", "manifest.webmanifest", "favicon.ico"] {
+            assert_eq!(super::cache_policy(path), "no-cache");
+        }
+    }
 
     #[test]
     fn root_and_dot_dot_become_index() {

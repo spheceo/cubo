@@ -6,6 +6,7 @@ import { MediaRow } from '@/components/media-row';
 import { MotionReveal } from '@/components/motion-reveal';
 import { HeroSkeleton, MediaRowsSkeleton } from '@/components/page-skeletons';
 import { WatchLaterList } from '@/components/watch-later-list';
+import { useFeaturedTitle } from '@/lib/use-featured-title';
 import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
 
@@ -14,9 +15,12 @@ export function HomePage() {
 
   const movies = useQuery(tmdbQueries.trending('movie'));
   const shows = useQuery(tmdbQueries.trending('tv'));
-  const featuredId = movies.data?.[0]?.id;
+  const featuredTitle = useFeaturedTitle('home',
+    movies.data && shows.data ? [...movies.data, ...shows.data] : null,
+  );
+  const featuredId = featuredTitle?.id;
   const featured = useQuery({
-    ...tmdbQueries.details('movie', featuredId ?? 0),
+    ...tmdbQueries.details(featuredTitle?.mediaType ?? 'movie', featuredId ?? 0),
     enabled: featuredId != null,
   });
 
@@ -30,7 +34,7 @@ export function HomePage() {
   }
 
   const loading =
-    !movies.data || !shows.data || (featuredId != null && featured.isLoading);
+    !movies.data || !shows.data || featuredTitle === undefined || (featuredId != null && featured.isLoading);
   if (loading) return <HomeSkeleton />;
 
   return (

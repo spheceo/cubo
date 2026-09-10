@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { CatalogError } from '@/components/catalog-error';
 import { CatalogLanding } from '@/components/catalog-landing';
 import { HeroSkeleton, MediaRowsSkeleton } from '@/components/page-skeletons';
+import { useFeaturedTitle } from '@/lib/use-featured-title';
 import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
 
@@ -28,7 +29,12 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }) {
   const current = useQuery(tmdbQueries.collection(mediaType, 'current'));
   const popular = useQuery(tmdbQueries.collection(mediaType, 'popular'));
   const topRated = useQuery(tmdbQueries.collection(mediaType, 'top_rated'));
-  const featuredId = trending.data?.[0]?.id;
+  const featuredTitle = useFeaturedTitle(`catalog:${mediaType}`,
+    trending.data && current.data && popular.data && topRated.data
+      ? [...trending.data, ...current.data, ...popular.data, ...topRated.data]
+      : null,
+  );
+  const featuredId = featuredTitle?.id;
   const featured = useQuery({
     ...tmdbQueries.details(mediaType, featuredId ?? 0),
     enabled: featuredId != null,
@@ -48,6 +54,7 @@ export function CatalogPage({ mediaType }: { mediaType: MediaType }) {
     !current.data ||
     !popular.data ||
     !topRated.data ||
+    featuredTitle === undefined ||
     (featuredId != null && featured.isLoading);
   if (loading) return <CatalogSkeleton />;
 

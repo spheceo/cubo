@@ -259,7 +259,7 @@ pub async fn cache_directory() -> Option<PathBuf> {
 
 async fn resolve_startup_download_dir(store: &CoreStore, default_dir: PathBuf) -> PathBuf {
     let configured = store
-        .snapshot()
+        .cache_snapshot()
         .await
         .cache
         .directory
@@ -953,7 +953,7 @@ async fn update_cache_directory(
         Err(error) => return bridge_error(StatusCode::BAD_REQUEST, error),
     };
     if paths_match(&old_dir, &new_dir) {
-        let snapshot = state.store.snapshot().await;
+        let snapshot = state.store.cache_snapshot().await;
         return Json(json!({
             "maxBytes": snapshot.cache.max_bytes,
             "directory": old_dir.to_string_lossy(),
@@ -999,7 +999,7 @@ async fn cache_status(State(state): State<BridgeState>, headers: HeaderMap) -> R
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
-    let snapshot = state.store.snapshot().await;
+    let snapshot = state.store.cache_snapshot().await;
     let download_dir = state.current_download_dir().await;
     let transcode_dir = state.transcode.dir().to_path_buf();
     let free_bytes = system::volume_free_bytes(&download_dir);
@@ -1037,7 +1037,7 @@ async fn delete_cache_item(
         return bridge_error(StatusCode::BAD_GATEWAY, error);
     }
 
-    let snapshot = state.store.snapshot().await;
+    let snapshot = state.store.cache_snapshot().await;
     let entry_files = snapshot
         .cache_entries
         .iter()
@@ -1052,7 +1052,7 @@ async fn delete_cache_item(
     if let Err(error) = state.store.remove_cache_entry(&id).await {
         return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
-    let remaining = state.store.snapshot().await.cache_entries;
+    let remaining = state.store.cache_snapshot().await.cache_entries;
     remove_deleted_torrent_trees(&download_dir, &entry_files, &remaining).await;
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1222,7 +1222,7 @@ async fn cache_maintenance_loop(state: BridgeState) {
 }
 
 async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
-    let snapshot = state.store.snapshot().await;
+    let snapshot = state.store.cache_snapshot().await;
     let download_dir = state.current_download_dir().await;
     let transcode_dir = state.transcode.dir().to_path_buf();
     let free_bytes = system::volume_free_bytes(&download_dir);
@@ -1273,7 +1273,7 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     // still blows the budget — except a title still inside the startup
     // grace, which has not had time to produce segments yet.
     if !playing && used_bytes > snapshot.cache.max_bytes {
-        let leftover = state.store.snapshot().await.cache_entries;
+        let leftover = state.store.cache_snapshot().await.cache_entries;
         for entry in leftover {
             if used_bytes <= snapshot.cache.max_bytes {
                 break;
@@ -1293,14 +1293,14 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     }
 
     if !deleted_files.is_empty() {
-        let remaining = state.store.snapshot().await.cache_entries;
+        let remaining = state.store.cache_snapshot().await.cache_entries;
         remove_deleted_torrent_trees(&download_dir, &deleted_files, &remaining).await;
     }
 
     if used_bytes <= snapshot.cache.max_bytes {
         return Ok(());
     }
-    if playing || state.store.snapshot().await.cache_entries.iter().any(|entry| {
+    if playing || state.store.cache_snapshot().await.cache_entries.iter().any(|entry| {
         entry_in_startup_grace(entry, now)
     }) {
         return Ok(());
@@ -1354,7 +1354,7 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     let download_dir = state.current_download_dir().await;
     let critical = cache::disk_is_critical(system::volume_free_bytes(&download_dir));
     let playing = state.is_playback_active();
-    let snapshot = state.store.snapshot().await;
+    let snapshot = state.store.cache_snapshot().await;
     let now = store::now_millis();
     let active = snapshot
         .cache_entries

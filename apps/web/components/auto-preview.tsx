@@ -12,11 +12,12 @@ import {
   waitUntilLive,
 } from '@/lib/local-engine';
 import { isBrowserPlayableFilename } from '@/lib/media-compatibility';
+import { previewStart } from '@/lib/preview-start';
 import { rankPreviewStreams } from '@/lib/stream-select';
 import { useCore } from './core-provider';
 
 const PREVIEW_SECONDS = 40;
-const PREPARE_DELAY_MS = 100;
+const PREPARE_DELAY_MS = 0;
 
 /** Preview randomness is stable for the day: the first visit picks a spot
  *  (and an episode, for shows), every later visit that day reuses it, and
@@ -110,6 +111,8 @@ export function AutoPreview({
   onActiveChange?: (active: boolean) => void;
 }) {
   const { connect } = useCore();
+  const itemRef = useRef(item);
+  itemRef.current = item;
   const videoRef = useRef<HTMLVideoElement>(null);
   const startedRef = useRef(false);
   /** Episode picked for today's preview, persisted alongside the position. */
@@ -131,6 +134,7 @@ export function AutoPreview({
     startedRef.current = false;
     previewEpisodeRef.current = null;
 
+    const item = itemRef.current;
     if (!item.imdbId || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     let cancelled = false;
     const abort = new AbortController();
@@ -142,15 +146,17 @@ export function AutoPreview({
         if (item.mediaType === 'tv' && !target) return;
         previewEpisodeRef.current = target ?? null;
 
-        const connection = await connect();
-        const streams = await queryClient.fetchQuery(
+        const [connection, streams] = await Promise.all([
+          connect(),
+          queryClient.fetchQuery(
           streamQueries.streams(
             item.mediaType,
             item.imdbId as string,
             target?.season,
             target?.episode,
           ),
-        );
+          ),
+        ]);
         const source = rankPreviewStreams(
           streams,
           item.originalLanguage,
@@ -191,8 +197,9 @@ export function AutoPreview({
       abort.abort();
       window.clearTimeout(idle);
       videoRef.current?.pause();
+      videoRef.current?.removeAttribute('src');
     };
-  }, [connect, item]);
+  }, [connect, item.mediaType, item.id, item.imdbId]);
 
   useGSAP(
     () => {
@@ -201,7 +208,7 @@ export function AutoPreview({
 
       const timeline = gsap.timeline();
       timeline
-        .to(video, { autoAlpha: 1, duration: 1.8, ease: 'power2.inOut' })
+        .to(video, { autoAlpha: 1, duration: 0.35, ease: 'power2.out' })
         .to(video, {
           autoAlpha: 0,
           duration: 2.2,
@@ -239,13 +246,6 @@ export function AutoPreview({
     const video = videoRef.current;
     if (!video || startedRef.current || !Number.isFinite(video.duration) || video.duration <= 0) return;
 
-    const latestStart = Math.max(
-      0,
-      Math.min(video.duration / 2, video.duration - PREVIEW_SECONDS - 6),
-    );
-    const earliestStart = Math.min(20, latestStart);
-    const span = Math.max(0, latestStart - earliestStart);
-
     // One random spot per title per day — same clip on every visit today.
     const choiceKey = `${item.mediaType}:${item.id}`;
     let fraction = loadDailyChoice(choiceKey)?.fraction;
@@ -257,18 +257,23 @@ export function AutoPreview({
         fraction,
       });
     }
-    video.currentTime = earliestStart + fraction * span;
+    const buffered = Array.from({ length: video.buffered.length }, (_, index) =>
+      [video.buffered.start(index), video.buffered.end(index)] as const,
+    );
+    video.currentTime = previewStart(video.duration, fraction, buffered, PREVIEW_SECONDS);
   }
 
   function startPreview() {
     const video = videoRef.current;
-    if (!video || startedRef.current) return;
+    if (!video || video.seeking || startedRef.current) return;
     startedRef.current = true;
     disableTextTracks();
     video.muted = true;
     void video
       .play()
-      .then(() => setPreviewActive(true))
+      .then(() => {
+        if (video === videoRef.current && video.isConnected && !video.paused) setPreviewActive(true);
+      })
       .catch(() => {
         startedRef.current = false;
       });

@@ -64,7 +64,9 @@ export default {
       status: upstream.status,
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': 'public, s-maxage=3600, stale-while-revalidate=7200',
+        'Cache-Control': upstream.ok
+          ? 'public, s-maxage=3600, stale-while-revalidate=7200'
+          : 'no-store',
         ...cors(),
       },
     });

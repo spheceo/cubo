@@ -269,7 +269,7 @@ export function rankPreviewStreams(
   episode?: EpisodeHint | null,
 ): Stream[] {
   const direct = streams.filter(
-    (stream) => isBrowserPlayableStream(stream) && !isOversizedStream(stream),
+    (stream) => isBrowserPlayableStream(stream) && isAutomaticSource(stream, nativeLanguage),
   );
   const goodQuality = direct.filter((stream) =>
     ['720p', '1080p'].includes(stream.quality?.toLowerCase() ?? ''),
@@ -288,6 +288,8 @@ export function rankPreviewStreams(
     if (bySizeClass !== 0) return bySizeClass;
     const byBucket = seederBucket(b.seeders) - seederBucket(a.seeders);
     if (byBucket !== 0) return byBucket;
+    const byQuality = rank(a) - rank(b);
+    if (byQuality !== 0) return byQuality;
     const bySeeders = (b.seeders ?? 0) - (a.seeders ?? 0);
     if (bySeeders !== 0) return bySeeders;
     const bySize =
@@ -300,4 +302,13 @@ export function rankPreviewStreams(
 
 export function streamKey(stream: Stream): string {
   return `${stream.infoHash}:${stream.fileIdx ?? 'auto'}`;
+}
+
+/** Automatic fallback must not silently change the title's audio language
+ * or replace a proper release with a cinema capture. Unknown audio remains
+ * eligible: most original-language releases do not label their language. */
+export function isAutomaticSource(stream: Stream, nativeLanguage: string | null): boolean {
+  return !isOversizedStream(stream)
+    && capturedReleaseRank(stream) === 0
+    && audioLanguageRank(stream, nativeLanguage) < 3;
 }
