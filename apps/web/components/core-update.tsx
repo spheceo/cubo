@@ -16,6 +16,7 @@ import {
 } from '@/lib/local-engine';
 import { coalesceLatest, fetchGithubLatestTag } from '@/lib/update-check';
 import {
+  displayTag,
   mergeUpdateStatus,
   updateButtonLabel,
   updateInProgress,
@@ -36,10 +37,6 @@ function previewStatus(kind: string | null): CoreUpdateStatus | null {
     return { current: '0.0.9', latest: 'v0.1.0', state: 'applying', progress: 1 };
   }
   return null;
-}
-
-function displayTag(tag: string): string {
-  return tag.startsWith('v') ? tag : `v${tag}`;
 }
 
 function versionMatches(running: string, expected: string): boolean {
@@ -238,7 +235,7 @@ function UpdateActionButton({
       title={status.error ?? (status.latest ? `Update to ${displayTag(status.latest)}` : undefined)}
       aria-label={status.latest ? `Update to ${displayTag(status.latest)}` : 'Update'}
       aria-busy={live}
-      className="relative isolate h-10 min-w-[9.5rem] shrink-0 overflow-hidden rounded-full bg-fg px-5 text-sm font-semibold text-ink transition-opacity hover:opacity-90 disabled:cursor-wait"
+      className="relative isolate h-10 min-w-[11.5rem] shrink-0 overflow-hidden rounded-full bg-fg px-5 text-sm font-semibold text-ink transition-opacity hover:opacity-90 disabled:cursor-wait"
     >
       {live ? (
         <span

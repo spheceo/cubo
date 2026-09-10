@@ -12,8 +12,13 @@ export function updateInProgress(
   return state === 'downloading' || state === 'applying' || busy;
 }
 
+export function displayTag(tag: string): string {
+  return tag.startsWith('v') ? tag : `v${tag}`;
+}
+
 export function updateButtonLabel(
-  status: Pick<CoreUpdateStatus, 'state' | 'progress'>,
+  status: Pick<CoreUpdateStatus, 'state' | 'progress'> &
+    Partial<Pick<CoreUpdateStatus, 'latest'>>,
   busy = false,
 ): string {
   if (status.state === 'applying' || (busy && status.state === 'ready')) {
@@ -23,7 +28,7 @@ export function updateButtonLabel(
     const percent = updateProgressPercent(status.progress);
     return percent == null ? 'Updating…' : `Updating ${percent}%`;
   }
-  return 'Update';
+  return status.latest ? `Update to ${displayTag(status.latest)}` : 'Update';
 }
 
 /** Keep an in-flight download visible if a status poll races back to idle. */
