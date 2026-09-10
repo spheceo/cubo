@@ -80,6 +80,8 @@ export interface LocalEngineConnection {
   version: string;
   /** True when this Core has ffmpeg and can remux MKV/incompatible-audio sources. */
   transcode: boolean;
+  /** Origin of the Vite/dev UI this Core was started for, when known. */
+  webUrl?: string | null;
 }
 
 export interface AddedTorrent {
@@ -166,9 +168,12 @@ export function currentOriginCoreEndpoint(): string {
   return window.location.origin;
 }
 
-async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {
+async function probeEndpoint(
+  baseUrl: string,
+  timeoutMs = DISCOVERY_TIMEOUT_MS,
+): Promise<LocalEngineConnection> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT_MS);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await coreFetch(`${baseUrl}/v1/health`, {
@@ -182,6 +187,7 @@ async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {
       sessionToken?: string;
       transcode?: boolean;
       pairingRequired?: boolean;
+      webUrl?: string | null;
     };
     if (health.name !== 'cubo-core') {
       throw new Error('Unexpected service on Cubo port');
@@ -207,6 +213,7 @@ async function probeEndpoint(baseUrl: string): Promise<LocalEngineConnection> {
       token,
       version: health.version ?? 'unknown',
       transcode: health.transcode === true,
+      webUrl: typeof health.webUrl === 'string' && health.webUrl ? health.webUrl : null,
     };
   } finally {
     window.clearTimeout(timeout);
@@ -271,6 +278,39 @@ function explainCoreFailure(endpoint: string): string {
   return `Could not reach Cubo Core at ${endpoint}`;
 }
 
+/** `just dev` binds the next free port when persist already owns :8765. */
+const DEV_CORE_PORTS = [CORE_PORT, CORE_PORT + 1, CORE_PORT + 2];
+
+function isLoopbackName(host: string): boolean {
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+/** True when this Core's advertised UI is the page the user is on.
+ *  `127.0.0.1:4200` and `localhost:4200` count as the same Vite app. */
+export function coreServesPage(
+  webUrl: string | null | undefined,
+  page: { hostname: string; port: string },
+): boolean {
+  if (!webUrl) return false;
+  try {
+    const advertised = new URL(webUrl);
+    if (advertised.port !== page.port) return false;
+    if (advertised.hostname === page.hostname) return true;
+    return isLoopbackName(advertised.hostname) && isLoopbackName(page.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function pickDiscoveredCore<T extends { webUrl?: string | null }>(
+  found: T[],
+  page: { hostname: string; port: string } | null,
+): T | undefined {
+  if (found.length === 0) return undefined;
+  if (!page) return found[0];
+  return found.find((core) => coreServesPage(core.webUrl, page)) ?? found[0];
+}
+
 export async function discoverLocalEngine(
   configuredEndpoint = '',
 ): Promise<LocalEngineConnection> {
@@ -288,21 +328,47 @@ export async function discoverLocalEngine(
     if (!hosts.includes(host)) hosts.push(host);
   }
 
+  const onVite =
+    typeof window !== 'undefined' && window.location.port === '4200';
+  const ports = onVite ? DEV_CORE_PORTS : [CORE_PORT];
+  const found: LocalEngineConnection[] = [];
+  let pairing: PairingRequiredError | null = null;
+
   for (const host of hosts) {
     // IPv6 literals (::1) need brackets in a URL authority.
     const authority = host.includes(':') ? `[${host}]` : host;
-    try {
-      return await probeEndpoint(`http://${authority}:${CORE_PORT}`);
-    } catch (reason) {
-      // A Core that wants pairing IS a found Core — surface the prompt.
-      if (reason instanceof PairingRequiredError) throw reason;
-      // Otherwise try the next candidate host.
-    }
+    await Promise.all(
+      ports.map(async (port, index) => {
+        try {
+          found.push(
+            await probeEndpoint(
+              `http://${authority}:${port}`,
+              index === 0 ? DISCOVERY_TIMEOUT_MS : 800,
+            ),
+          );
+        } catch (reason) {
+          if (reason instanceof PairingRequiredError) pairing = reason;
+        }
+      }),
+    );
+    if (found.length > 0) break;
   }
 
-  throw new Error(
-    'Cubo Core was not found on this device. Open Settings to add a remote Core.',
+  if (found.length === 0 && pairing) throw pairing;
+
+  found.sort((a, b) => (a.port ?? 0) - (b.port ?? 0));
+  const chosen = pickDiscoveredCore(
+    found,
+    typeof window !== 'undefined'
+      ? { hostname: window.location.hostname, port: window.location.port }
+      : null,
   );
+  if (!chosen) {
+    throw new Error(
+      'Cubo Core was not found on this device. Open Settings to add a remote Core.',
+    );
+  }
+  return chosen;
 }
 
 /** Reliable open trackers appended to every magnet. Torrentio often returns

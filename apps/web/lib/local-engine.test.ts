@@ -1,6 +1,13 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { addMagnet, InsufficientStorageError, startRemux, waitUntilLive } from './local-engine';
+import {
+  addMagnet,
+  coreServesPage,
+  InsufficientStorageError,
+  pickDiscoveredCore,
+  startRemux,
+  waitUntilLive,
+} from './local-engine';
 
 const connection = {
   baseUrl: 'http://127.0.0.1:8765', port: 8765, token: 'test', version: 'test', transcode: true,
@@ -26,6 +33,18 @@ test('storage errors stay distinguishable from source failures throughout startu
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('Vite on localhost prefers the just-dev Core that advertised :4200', () => {
+  const persist = { baseUrl: 'http://127.0.0.1:8765', webUrl: null };
+  const justDev = { baseUrl: 'http://127.0.0.1:8766', webUrl: 'http://127.0.0.1:4200' };
+  assert.equal(
+    pickDiscoveredCore([persist, justDev], { hostname: 'localhost', port: '4200' }),
+    justDev,
+  );
+  assert.equal(pickDiscoveredCore([persist], { hostname: 'localhost', port: '4200' }), persist);
+  assert.equal(coreServesPage('http://127.0.0.1:4200', { hostname: 'localhost', port: '4200' }), true);
+  assert.equal(coreServesPage('http://127.0.0.1:4200', { hostname: 'localhost', port: '4300' }), false);
 });
 
 test('ordinary source failures remain eligible for fallback', async () => {

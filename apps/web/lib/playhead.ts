@@ -6,11 +6,15 @@
 const STORAGE_KEY = 'cubo.playhead';
 export const RESUME_MIN_SECONDS = 5;
 export const RESUME_END_EPSILON = 3;
+/** A leftover from a failed open (tens of seconds) must not seek into a
+ *  brand-new torrent. A committed watch on another rip still resumes. */
+export const CROSS_SOURCE_RESUME_MIN = 120;
 
 export type StoredPlayhead = {
   positionSeconds: number;
   durationSeconds: number;
   updatedAt: number;
+  infoHash?: string;
 };
 
 export function playableResume(
@@ -48,6 +52,19 @@ export function resumeSeconds(
   return playableResume(chosen.positionSeconds, chosen.durationSeconds);
 }
 
+/** Mid-play fallback always keeps `position`. A fresh open of a different
+ *  torrent drops a short leftover so the player does not seek into a cold
+ *  file; a real watch (2+ minutes) still resumes on the new rip. */
+export function resumeForSource(
+  position: number,
+  savedInfoHash: string | null | undefined,
+  streamInfoHash: string,
+): number {
+  if (!savedInfoHash || savedInfoHash === streamInfoHash) return position;
+  if (position < CROSS_SOURCE_RESUME_MIN) return 0;
+  return position;
+}
+
 export function loadPlayhead(playbackKey: string): StoredPlayhead | null {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -59,6 +76,7 @@ export function loadPlayhead(playbackKey: string): StoredPlayhead | null {
       positionSeconds: value.positionSeconds,
       durationSeconds: typeof value.durationSeconds === 'number' ? value.durationSeconds : 0,
       updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : 0,
+      infoHash: typeof value.infoHash === 'string' && value.infoHash ? value.infoHash : undefined,
     };
   } catch {
     return null;
@@ -69,15 +87,24 @@ export function savePlayhead(
   playbackKey: string,
   positionSeconds: number,
   durationSeconds: number,
+  infoHash?: string | null,
 ): void {
   if (!Number.isFinite(positionSeconds) || positionSeconds < 0) return;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     const parsed = raw ? (JSON.parse(raw) as Record<string, StoredPlayhead>) : {};
+    const previous = parsed[playbackKey];
+    const nextHash =
+      infoHash && infoHash.length > 0
+        ? infoHash
+        : typeof previous?.infoHash === 'string'
+          ? previous.infoHash
+          : undefined;
     parsed[playbackKey] = {
       positionSeconds,
       durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : 0,
       updatedAt: Date.now(),
+      ...(nextHash ? { infoHash: nextHash } : {}),
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
   } catch {

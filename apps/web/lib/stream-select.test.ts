@@ -1,7 +1,14 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import type { Stream } from '@cubo/core';
-import { rankStreams, seasonPackRank } from './stream-select';
+import {
+  AUTO_PLAY_MAX_BYTES,
+  collectionPackRank,
+  isOversizedStream,
+  rankStreams,
+  seasonPackRank,
+  streamSizeBytes,
+} from './stream-select';
 
 const episode = { season: 2, episode: 1 };
 const single: Stream = {
@@ -27,9 +34,20 @@ test('single episodes beat larger healthy packs within the same playback tier', 
     .map((stream) => stream.infoHash), ['single', 'pack']);
 });
 
-test('direct-play priority is preserved ahead of remux within the quality tier', () => {
+test('a single-title remux beats a direct-play file inside a pack', () => {
   const directPack = { ...pack, filename: 'The.Gentlemen.S02E01.mp4' };
-  assert.equal(rankStreams([single, directPack], { transcode: true, hevc: false }, null, episode)[0], directPack);
+  assert.equal(
+    rankStreams([single, directPack], { transcode: true, hevc: false }, null, episode)[0],
+    single,
+  );
+});
+
+test('direct-play still beats remux for the same kind of release', () => {
+  const direct = { ...single, infoHash: 'direct', filename: 'The.Gentlemen.S02E01.mp4' };
+  assert.equal(
+    rankStreams([single, direct], { transcode: true, hevc: false }, null, episode)[0],
+    direct,
+  );
 });
 
 test('a named dub loses to original-language audio even with a UK flag and direct-play', () => {
@@ -58,4 +76,100 @@ test('a named dub loses to original-language audio even with a UK flag and direc
 
 test('movie ranking has no episode pack preference', () => {
   assert.equal(seasonPackRank(pack), 0);
+});
+
+test('a UK flag beside other flags does not beat a flagless direct-play file', () => {
+  const yts: Stream = {
+    ...single,
+    infoHash: 'yts',
+    filename: 'Black Panther (2018) [BluRay] [YTS.AM].mp4',
+    title: 'Black Panther (2018) [BluRay] [1080p] [YTS.AM]\n👤 80 💾 2.11 GB ⚙️ YTS',
+    seeders: 80,
+    sizeBytes: null,
+  };
+  const collection: Stream = {
+    ...single,
+    infoHash: 'mcu-pack',
+    filename: 'Black Panther BD1080.www.pctnew.org.mkv',
+    title:
+      'Marvel Coleccion Volumen 4 [BluRay 1080p][DTS 5.1-AC3 5.1 Castellano DTS 5.1-Ingles+Subs][ES-EN]\nBlack Panther BD1080.www.pctnew.org.mkv\n👤 78 💾 16.27 GB ⚙️ Wolfmax4k\n🇬🇧 / 🇪🇸',
+    seeders: 78,
+    sizeBytes: null,
+  };
+  const saga: Stream = {
+    ...single,
+    infoHash: 'saga',
+    filename: '18.Black Panther (2018) IMAX 1080p.mkv',
+    title:
+      'Marvel Cinematic Universe (2008-2025) Phase I-II-III-IV-V-VI 1080p 10bit IMAX\n👤 14 💾 5.66 GB ⚙️ 1337x\nMulti Subs / 🇬🇧 / 🇮🇳',
+    seeders: 14,
+    sizeBytes: null,
+  };
+  assert.equal(collectionPackRank(collection), 2);
+  assert.equal(collectionPackRank(saga), 2);
+  assert.equal(collectionPackRank(yts), 0);
+  assert.ok(streamSizeBytes(collection) > 16 * 1024 * 1024 * 1024);
+  const ranked = rankStreams([collection, saga, yts], { transcode: true, hevc: true }, 'en');
+  assert.deepEqual(ranked.map((stream) => stream.infoHash), ['yts', 'saga', 'mcu-pack']);
+});
+
+test('year ranges with "to" and anthology names count as collection packs', () => {
+  const marvelFilms: Stream = {
+    ...single,
+    infoHash: 'marvel-films',
+    filename: 'M18 Black Panther (2018) 1080p.mp4',
+    title:
+      'Marvel Films (2008 to 2021) Iron Man Thor Avengers - Mp4 1080p\nM18 Black Panther (2018) 1080p.mp4\n👤 56 💾 2.72 GB ⚙️ 1337x',
+    seeders: 56,
+    sizeBytes: 2_920_577_761,
+  };
+  const greatFilms: Stream = {
+    ...single,
+    infoHash: 'great-films',
+    filename: 'Black Panther (2018) 1080p Surround.mp4',
+    title: 'Great Films 6: MP4 X264 AC3 1080p\nBlack Panther (2018) 1080p Surround.mp4\n👤 477 💾 3 GB ⚙️ MagnetDL',
+    seeders: 477,
+    sizeBytes: 3_221_225_472,
+  };
+  const brrip: Stream = {
+    ...single,
+    infoHash: 'brrip',
+    filename: 'Black.Panther.2018.1080p.BRRip.x264-BRRIP.mkv',
+    title: 'Black.Panther.2018.1080p.BRRip.x264-BRRIP\n👤 100 💾 2.17 GB ⚙️ ThePirateBay',
+    seeders: 100,
+    sizeBytes: 2_330_019_758,
+  };
+  assert.equal(collectionPackRank(marvelFilms), 2);
+  assert.equal(collectionPackRank(greatFilms), 2);
+  assert.equal(collectionPackRank(brrip), 0);
+  const ranked = rankStreams(
+    [marvelFilms, greatFilms, brrip],
+    { transcode: true, hevc: true },
+    'en',
+  );
+  assert.equal(ranked[0].infoHash, 'brrip');
+});
+
+test('a 30 GB remux loses to a normal-sized rip and is not auto-playable', () => {
+  const remux: Stream = {
+    ...single,
+    infoHash: 'huge',
+    filename: 'Black.Panther.2018.1080p.BluRay.REMUX.mkv',
+    title: 'Black.Panther.2018.1080p.BluRay.REMUX.AVC.DTS-HD.MA.7.1-FGT\n👤 33 💾 30.06 GB ⚙️ RARBG',
+    seeders: 33,
+    sizeBytes: 32_276_679_229,
+  };
+  const rip: Stream = {
+    ...single,
+    infoHash: 'rip',
+    filename: 'Black.Panther.2018.1080p.BluRay.x264.mkv',
+    title: 'Black.Panther.2018.REPACK.1080p.BluRay.x264.MkvCage\n👤 89 💾 3.34 GB ⚙️ ThePirateBay',
+    seeders: 89,
+    sizeBytes: 3_586_297_692,
+  };
+  assert.ok(remux.sizeBytes! > AUTO_PLAY_MAX_BYTES);
+  assert.equal(isOversizedStream(remux), true);
+  assert.equal(isOversizedStream(rip), false);
+  const ranked = rankStreams([remux, rip], { transcode: true, hevc: true }, 'en');
+  assert.deepEqual(ranked.map((stream) => stream.infoHash), ['rip', 'huge']);
 });

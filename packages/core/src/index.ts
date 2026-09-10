@@ -559,6 +559,7 @@ export function normalizeEpisode(episode: TmdbEpisodeRaw): Episode {
 
 const QUALITY_RE = /\b(2160p|1080p|720p|480p)\b/i;
 const SEEDERS_RE = /👤\s*(\d+)/;
+const SIZE_RE = /💾\s*([\d.]+)\s*(TB|GB|MB)/i;
 
 function toStream(raw: TorrentioStreamRaw): Stream {
   const name = raw.name ?? '';
@@ -572,7 +573,7 @@ function toStream(raw: TorrentioStreamRaw): Stream {
     infoHash: raw.infoHash ?? '',
     fileIdx: raw.fileIdx ?? null,
     quality: qualityMatch ? qualityMatch[1] : null,
-    sizeBytes: raw.behaviorHints?.videoSize ?? null,
+    sizeBytes: raw.behaviorHints?.videoSize ?? parseTitleSize(title),
     seeders: parseSeeders(title),
     trackers: (raw.sources ?? [])
       .filter((source) => source.startsWith('tracker:'))
@@ -583,6 +584,17 @@ function toStream(raw: TorrentioStreamRaw): Stream {
 function parseSeeders(title: string): number | null {
   const match = SEEDERS_RE.exec(title);
   return match ? Number(match[1]) : null;
+}
+
+function parseTitleSize(title: string): number | null {
+  const match = SIZE_RE.exec(title);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) return null;
+  const unit = match[2].toUpperCase();
+  const multiplier =
+    unit === 'TB' ? 1024 ** 4 : unit === 'GB' ? 1024 ** 3 : 1024 ** 2;
+  return Math.round(value * multiplier);
 }
 
 /** Alternates two ranked lists (movie, show, movie, …) so neither media type

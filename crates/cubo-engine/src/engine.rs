@@ -19,7 +19,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use librqbit::http_api::{HttpApi, HttpApiOptions};
-use librqbit::{Api, Session};
+use librqbit::{Api, DhtSessionConfig, Session, SessionOptions};
 use librqbit_dualstack_sockets::TcpListener as RqbitListener;
 use serde::Deserialize;
 use serde_json::json;
@@ -154,9 +154,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             // in the terminal would never match a running Core.
             let pairing = Arc::new(PairingManager::load(&crate::paths::data_dir())?);
             let download_dir = resolve_startup_download_dir(&store, download_dir).await;
-            let session = Session::new(download_dir.clone())
-                .await
-                .map_err(|e| format!("rqbit session init failed: {e:#}"))?;
+            let session = open_rqbit_session(download_dir.clone()).await?;
 
             let api = Api::new(session.clone(), None, None);
             let http_api = HttpApi::new(
@@ -304,6 +302,44 @@ enum BindAttempt {
     Ready(Vec<TcpListener>),
     Busy,
     Failed(String),
+}
+
+/// Persist already owns the DHT UDP port saved in rqbit's `dht.json`.
+/// A second Core (`just dev` while persist is up) must not steal that
+/// socket or overwrite the routing table.
+async fn open_rqbit_session(download_dir: PathBuf) -> Result<Arc<Session>, String> {
+    match Session::new(download_dir.clone()).await {
+        Ok(session) => Ok(session),
+        Err(error) if is_addr_in_use(&error) => {
+            tracing::info!(
+                target: "engine",
+                "DHT UDP port already in use; starting without a persisted socket"
+            );
+            Session::new_with_opts(
+                download_dir,
+                SessionOptions {
+                    dht: Some(DhtSessionConfig {
+                        port: Some(0),
+                        persistence: None,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| format!("rqbit session init failed: {error:#}"))
+        }
+        Err(error) => Err(format!("rqbit session init failed: {error:#}")),
+    }
+}
+
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+            || cause.to_string().contains("Address already in use")
+    })
 }
 
 async fn bind_bridges(
@@ -2519,6 +2555,14 @@ mod tests {
         assert!(!pack.exists());
         assert!(other.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn addr_in_use_is_detected_from_anyhow_chain() {
+        let io = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let nested = anyhow::anyhow!(io).context("error initializing persistent DHT");
+        assert!(is_addr_in_use(&nested));
+        assert!(!is_addr_in_use(&anyhow::anyhow!("some other failure")));
     }
 
     #[test]
