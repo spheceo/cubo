@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -42,6 +42,10 @@ const CORE_PORT: u16 = 8765;
 /// How many ports after `CORE_PORT` to try when the preferred one is taken
 /// (e.g. `cubo persist` already owns :8765 and `just dev` should not kill it).
 const CORE_PORT_SCAN: u16 = 20;
+/// Persist often starts at login before Tailscale has an address. Retry soon,
+/// then keep polling so a later connect still gets :8765 on the tailnet IP.
+const TAILSCALE_REBIND_FIRST: Duration = Duration::from_secs(2);
+const TAILSCALE_REBIND_INTERVAL: Duration = Duration::from_secs(15);
 const WEB_PROXY_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Catalog pages and static assets. Fail before the old 45 s hang when the
 /// Vite origin is unreachable. `/api/*` is handled by Core itself.
@@ -57,7 +61,7 @@ const BASE_ALLOWED_ORIGIN_PORTS: [u16; 2] = [CORE_PORT, 4200];
 
 pub struct Engine {
     bridge_port: u16,
-    bridge_addresses: Vec<SocketAddr>,
+    bridge_addresses: Arc<StdRwLock<Vec<SocketAddr>>>,
     download_dir: Arc<RwLock<PathBuf>>,
     // Held for the app's lifetime so the session and its DHT tasks stay alive.
     _session: Arc<Session>,
@@ -72,8 +76,9 @@ struct BridgeState {
     /// Hostnames/IPs this machine answers to (hostname, Tailscale IP). Pages
     /// served from e.g. http://kenobi:4200 on another tailnet device carry
     /// that origin, so the CORS layer accepts host matches — but only on
-    /// Cubo's own ports (see `allowed_origin_ports`).
-    allowed_hosts: Arc<Vec<String>>,
+    /// Cubo's own ports (see `allowed_origin_ports`). Shared so a Tailscale
+    /// IP that appears after boot can be trusted without a restart.
+    allowed_hosts: Arc<StdRwLock<Vec<String>>>,
     bridge_port: u16,
     download_dir: Arc<RwLock<PathBuf>>,
     /// Last time a viewer was clearly pulling video (progress, buffer poll,
@@ -179,13 +184,16 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 }
             });
 
-            // Probed once here; binding and the CORS host allowlist both use it.
+            // Probed once here so the first bind can include Tailscale when
+            // it is already up. A later loop retries if it was not.
             let tailscale_address = detect_tailscale_ipv4();
             let (bridge_port, bridge_listeners) = bind_bridges(tailscale_address).await?;
-            let bridge_addresses = bridge_listeners
-                .iter()
-                .filter_map(|listener| listener.local_addr().ok())
-                .collect::<Vec<_>>();
+            let bridge_addresses = Arc::new(StdRwLock::new(
+                bridge_listeners
+                    .iter()
+                    .filter_map(|listener| listener.local_addr().ok())
+                    .collect::<Vec<_>>(),
+            ));
             // Remux output stays next to Cubo state, not inside the (movable)
             // torrent cache. A directory swap must not relocate ffmpeg jobs.
             let transcode_dir = state_path
@@ -193,12 +201,13 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 .unwrap_or(download_dir.as_path())
                 .join("transcode");
             let download_dir = Arc::new(RwLock::new(download_dir));
+            let allowed_hosts = Arc::new(StdRwLock::new(local_machine_hosts(tailscale_address)));
             let state = BridgeState {
                 rqbit_port,
                 token: Uuid::new_v4().simple().to_string().into(),
                 client: reqwest::Client::new(),
                 web_origin: resolve_web_origin()?,
-                allowed_hosts: Arc::new(local_machine_hosts(tailscale_address)),
+                allowed_hosts: allowed_hosts.clone(),
                 bridge_port,
                 download_dir: download_dir.clone(),
                 playback_last_ms: Arc::new(AtomicU64::new(0)),
@@ -221,22 +230,20 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 target: "engine",
                 bridge_port,
                 rqbit_port,
-                addresses = ?bridge_addresses,
+                addresses = ?snapshot_addresses(&bridge_addresses),
                 "Cubo engine started"
             );
 
             for listener in bridge_listeners {
-                let listener_router = router.clone();
-                tokio::spawn(async move {
-                    // Connect info lets /v1/health tell loopback callers
-                    // (handed the session token) from remote ones (must pair).
-                    let service =
-                        listener_router.into_make_service_with_connect_info::<SocketAddr>();
-                    if let Err(error) = axum::serve(listener, service).await {
-                        tracing::error!(target: "engine", error = %error, "Cubo bridge exited");
-                    }
-                });
+                spawn_bridge_listener(listener, router.clone());
             }
+
+            tokio::spawn(tailscale_rebind_loop(
+                router,
+                bridge_port,
+                allowed_hosts,
+                bridge_addresses.clone(),
+            ));
 
             Ok::<Engine, String>(Engine {
                 bridge_port,
@@ -289,7 +296,7 @@ pub fn status() -> serde_json::Value {
             "engine": "rqbit",
             "version": librqbit::version(),
             "port": engine.bridge_port,
-            "addresses": engine.bridge_addresses,
+            "addresses": snapshot_addresses(&engine.bridge_addresses),
         }),
         None => json!({
             "state": "idle",
@@ -409,6 +416,101 @@ async fn try_bind_port(addresses: &[IpAddr], port: u16) -> BindAttempt {
     }
 }
 
+fn spawn_bridge_listener(listener: TcpListener, router: Router) {
+    tokio::spawn(async move {
+        // Connect info lets /v1/health tell loopback callers
+        // (handed the session token) from remote ones (must pair).
+        let service = router.into_make_service_with_connect_info::<SocketAddr>();
+        if let Err(error) = axum::serve(listener, service).await {
+            tracing::error!(target: "engine", error = %error, "Cubo bridge exited");
+        }
+    });
+}
+
+fn snapshot_addresses(addresses: &StdRwLock<Vec<SocketAddr>>) -> Vec<SocketAddr> {
+    addresses.read().map(|value| value.clone()).unwrap_or_default()
+}
+
+/// Bind this IPv4 when Tailscale is up and Core is not already listening on it.
+fn pending_tailscale_bind(already_bound: Option<IpAddr>, detected: Option<IpAddr>) -> Option<IpAddr> {
+    let address = detected?;
+    if address.is_loopback() || already_bound == Some(address) {
+        None
+    } else {
+        Some(address)
+    }
+}
+
+fn bound_non_loopback_ipv4(addresses: &[SocketAddr]) -> Option<IpAddr> {
+    addresses
+        .iter()
+        .map(SocketAddr::ip)
+        .find(|ip| matches!(ip, IpAddr::V4(v4) if !v4.is_loopback()))
+}
+
+fn remember_bound_address(
+    allowed_hosts: &StdRwLock<Vec<String>>,
+    bridge_addresses: &StdRwLock<Vec<SocketAddr>>,
+    address: IpAddr,
+    socket: SocketAddr,
+) {
+    if let Ok(mut hosts) = allowed_hosts.write() {
+        let host = address.to_string();
+        if !hosts.iter().any(|existing| existing == &host) {
+            hosts.push(host);
+        }
+    }
+    if let Ok(mut addresses) = bridge_addresses.write() {
+        if !addresses.contains(&socket) {
+            addresses.push(socket);
+        }
+    }
+}
+
+/// Tailscale often comes up after persist. Keep trying the current IPv4 on
+/// the already-chosen Core port and grow CORS when a bind succeeds.
+async fn tailscale_rebind_loop(
+    router: Router,
+    port: u16,
+    allowed_hosts: Arc<StdRwLock<Vec<String>>>,
+    bridge_addresses: Arc<StdRwLock<Vec<SocketAddr>>>,
+) {
+    let mut bound = bound_non_loopback_ipv4(&snapshot_addresses(&bridge_addresses));
+    let mut delay = TAILSCALE_REBIND_FIRST;
+    loop {
+        tokio::time::sleep(delay).await;
+        delay = TAILSCALE_REBIND_INTERVAL;
+        let detected = tokio::task::spawn_blocking(detect_tailscale_ipv4)
+            .await
+            .ok()
+            .flatten();
+        let Some(address) = pending_tailscale_bind(bound, detected) else {
+            continue;
+        };
+        match TcpListener::bind((address, port)).await {
+            Ok(listener) => {
+                let socket = listener.local_addr().unwrap_or(SocketAddr::new(address, port));
+                remember_bound_address(&allowed_hosts, &bridge_addresses, address, socket);
+                bound = Some(address);
+                tracing::info!(
+                    target: "engine",
+                    %address,
+                    port,
+                    "Cubo Core bound Tailscale address"
+                );
+                spawn_bridge_listener(listener, router.clone());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "engine",
+                    %address, port, %error,
+                    "Cubo Core could not bind optional address"
+                );
+            }
+        }
+    }
+}
+
 fn detect_tailscale_ipv4() -> Option<IpAddr> {
     let candidates = [
         "tailscale",
@@ -455,7 +557,7 @@ fn origin_host_port(origin: &HeaderValue) -> Option<(String, Option<u16>)> {
 /// unrelated local app on some other port is not silently trusted.
 struct OriginPolicy {
     allowed_origins: Arc<Vec<HeaderValue>>,
-    allowed_hosts: Arc<Vec<String>>,
+    allowed_hosts: Arc<StdRwLock<Vec<String>>>,
     allowed_ports: Arc<Vec<u16>>,
 }
 
@@ -470,7 +572,14 @@ impl OriginPolicy {
         if !port.is_some_and(|port| self.allowed_ports.contains(&port)) {
             return false;
         }
-        is_loopback_host(&host) || self.allowed_hosts.contains(&host)
+        is_loopback_host(&host) || self.host_allowed(&host)
+    }
+
+    fn host_allowed(&self, host: &str) -> bool {
+        self.allowed_hosts
+            .read()
+            .map(|hosts| hosts.iter().any(|allowed| allowed == host))
+            .unwrap_or(false)
     }
 }
 
@@ -2573,6 +2682,58 @@ mod tests {
         assert!(ports.contains(&8766));
     }
 
+    #[test]
+    fn pending_tailscale_bind_skips_loopback_and_already_bound() {
+        let ip: IpAddr = "100.80.66.124".parse().unwrap();
+        let other: IpAddr = "100.1.2.3".parse().unwrap();
+        assert_eq!(pending_tailscale_bind(None, Some(ip)), Some(ip));
+        assert_eq!(pending_tailscale_bind(Some(ip), Some(ip)), None);
+        assert_eq!(
+            pending_tailscale_bind(None, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            None
+        );
+        assert_eq!(pending_tailscale_bind(None, None), None);
+        assert_eq!(pending_tailscale_bind(Some(ip), Some(other)), Some(other));
+    }
+
+    #[test]
+    fn bound_non_loopback_ipv4_ignores_localhost() {
+        let addresses = vec![
+            "127.0.0.1:8765".parse().unwrap(),
+            "[::1]:8765".parse().unwrap(),
+            "100.80.66.124:8765".parse().unwrap(),
+        ];
+        assert_eq!(
+            bound_non_loopback_ipv4(&addresses),
+            Some("100.80.66.124".parse().unwrap())
+        );
+        assert_eq!(
+            bound_non_loopback_ipv4(&addresses[..2]),
+            None
+        );
+    }
+
+    #[test]
+    fn origin_policy_sees_hosts_added_after_startup() {
+        let hosts = Arc::new(StdRwLock::new(vec!["kenobi".into()]));
+        let policy = OriginPolicy {
+            allowed_origins: allowed_origins(None),
+            allowed_hosts: hosts.clone(),
+            allowed_ports: allowed_origin_ports(CORE_PORT),
+        };
+        let late = HeaderValue::from_static("http://100.80.66.124:8765");
+        assert!(!policy.allows(&late));
+        hosts.write().unwrap().push("100.80.66.124".into());
+        assert!(policy.allows(&late));
+        remember_bound_address(
+            &hosts,
+            &StdRwLock::new(vec!["127.0.0.1:8765".parse().unwrap()]),
+            "100.64.0.1".parse().unwrap(),
+            "100.64.0.1:8765".parse().unwrap(),
+        );
+        assert!(policy.allows(&HeaderValue::from_static("http://100.64.0.1:8765")));
+    }
+
     #[tokio::test]
     async fn bind_bridges_moves_off_a_busy_preferred_port() {
         let _occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, CORE_PORT))
@@ -2660,7 +2821,7 @@ mod tests {
             token: "test-session-token".into(),
             client: reqwest::Client::new(),
             web_origin: Some(format!("http://127.0.0.1:{web_port}").into()),
-            allowed_hosts: Arc::new(vec!["kenobi.test".into()]),
+            allowed_hosts: Arc::new(StdRwLock::new(vec!["kenobi.test".into()])),
             bridge_port: port,
             download_dir: Arc::new(RwLock::new(test_dir)),
             playback_last_ms: Arc::new(AtomicU64::new(0)),
