@@ -32,8 +32,10 @@ import { fileURLToPath } from 'node:url';
 // macOS: Martin Riedl's signed release builds (ffmpeg 9.0.1).
 const RIEDL = 'https://ffmpeg.martin-riedl.de/download/macos';
 // Windows + Linux: BtbN autobuild, pinned tag, ffmpeg release branch 9.0.
-const BTBN_TAG = 'autobuild-2026-09-04-14-01';
-const BTBN_BUILD = 'n9.0.1-11-ge47273f4d9';
+// Note: BtbN prunes dated autobuilds aggressively — a release that worked
+// yesterday can 404 today. Repin to a live autobuild when cutting releases.
+const BTBN_TAG = 'autobuild-2026-09-22-13-18';
+const BTBN_BUILD = 'n9.0.2-3-ga5923073bf';
 const BTBN = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 
 /** Per-triple pinned sources. `riedl` entries are one zip per tool; `btbn`
@@ -64,19 +66,19 @@ const SOURCES = {
   'x86_64-pc-windows-msvc': {
     kind: 'btbn',
     url: `${BTBN}/ffmpeg-${BTBN_BUILD}-win64-gpl-9.0.zip`,
-    sha256: '41d735c9364a8deda25b3bd5f05abf37720316be9495edfe94f51bc088ce9d86',
+    sha256: '649f40e14a3fadb377de32d88fa1106d33cc0b85d53ba8aa0c1b8d87e1bfbc35',
     bundleDir: `ffmpeg-${BTBN_BUILD}-win64-gpl-9.0`,
   },
   'x86_64-unknown-linux-gnu': {
     kind: 'btbn',
     url: `${BTBN}/ffmpeg-${BTBN_BUILD}-linux64-gpl-9.0.tar.xz`,
-    sha256: '1a4fa0f89f690bd81bddbb7cf3a65554095e8e9f9dc98693494e6f5fb97918c5',
+    sha256: '6cb8d11e4ce7f067079a6866b94145918d1c121604d578236015181f9677d5fd',
     bundleDir: `ffmpeg-${BTBN_BUILD}-linux64-gpl-9.0`,
   },
   'aarch64-unknown-linux-gnu': {
     kind: 'btbn',
     url: `${BTBN}/ffmpeg-${BTBN_BUILD}-linuxarm64-gpl-9.0.tar.xz`,
-    sha256: 'e29d8d6b0c7713120743fed6ce42c1f7a1ece1fbcfd2750cbe375a19fd675a64',
+    sha256: '277a31bc8dadb0208640448deafd019df70414327e33b4ef8896a7bf4c4a965f',
     bundleDir: `ffmpeg-${BTBN_BUILD}-linuxarm64-gpl-9.0`,
   },
 };
