@@ -765,23 +765,38 @@ export function VideoPlayer({
     if (!inCredits) creditsMarkedRef.current = false;
   }, [inCredits]);
 
-  // Next episode countdown — the fill sweep doubles as the timer. Pausing
-  // freezes it; completing it auto-advances.
-  const [nextFill, setNextFill] = useState(0);
+  // Next episode countdown — the fill sweep doubles as the timer. Driven by
+  // rAF writing a scaleX transform straight onto the node: compositor-smooth
+  // and zero re-renders. Pausing freezes it; completing it auto-advances.
+  const nextFillRef = useRef<HTMLSpanElement | null>(null);
+  const nextFillPos = useRef(0);
+  const nextFired = useRef(false);
   useEffect(() => {
-    if (!creditsTakeover) setNextFill(0);
+    if (creditsTakeover) return;
+    nextFillPos.current = 0;
+    nextFired.current = false;
+    if (nextFillRef.current) nextFillRef.current.style.transform = 'scaleX(0)';
   }, [creditsTakeover]);
   useEffect(() => {
     if (!creditsTakeover || !onNextEpisode || !playing) return;
-    const step = 100;
-    const interval = window.setInterval(() => {
-      setNextFill((v) => Math.min(1, v + step / AUTO_NEXT_MS));
-    }, step);
-    return () => window.clearInterval(interval);
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      nextFillPos.current = Math.min(1, nextFillPos.current + (now - last) / AUTO_NEXT_MS);
+      last = now;
+      if (nextFillRef.current) nextFillRef.current.style.transform = `scaleX(${nextFillPos.current})`;
+      if (nextFillPos.current >= 1) {
+        if (!nextFired.current) {
+          nextFired.current = true;
+          onNextEpisode();
+        }
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [creditsTakeover, onNextEpisode, playing]);
-  useEffect(() => {
-    if (nextFill >= 1 && creditsTakeover) onNextEpisode?.();
-  }, [nextFill, creditsTakeover, onNextEpisode]);
 
   const revealControls = useCallback(() => {
     // No chrome during the credits takeover — a click still toggles play,
@@ -1338,8 +1353,9 @@ export function VideoPlayer({
             {onNextEpisode ? (
               <span
                 aria-hidden
-                className="absolute inset-y-0 left-0 bg-white"
-                style={{ width: `${nextFill * 100}%` }}
+                ref={nextFillRef}
+                className="absolute inset-0 origin-left bg-white"
+                style={{ transform: 'scaleX(0)' }}
               />
             ) : null}
             <span className="relative">{onNextEpisode ? 'Next episode' : 'Skip credits'}</span>
