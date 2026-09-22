@@ -1,5 +1,5 @@
-import type { MediaType, SubtitleReleaseHint } from '@cubo/core';
-import { QueryClient, queryOptions } from '@tanstack/react-query';
+import type { DiscoverQuery, MediaType, SubtitleReleaseHint } from '@cubo/core';
+import { infiniteQueryOptions, QueryClient, queryOptions } from '@tanstack/react-query';
 import { catalog } from './api';
 
 /** Shared client: TMDB data barely changes minute to minute, so revisits and
@@ -25,6 +25,15 @@ export const tmdbQueries = {
     queryOptions({
       queryKey: ['tmdb', 'collection', mediaType, collection],
       queryFn: () => catalog.tmdb.collection(mediaType, collection),
+    }),
+  /** Pages accumulate under one key so "load more" appends instead of
+   *  replacing the grid. */
+  discover: (query: Omit<DiscoverQuery, 'page'>) =>
+    infiniteQueryOptions({
+      queryKey: ['tmdb', 'discover', query],
+      queryFn: ({ pageParam }) => catalog.tmdb.discover({ ...query, page: pageParam }),
+      initialPageParam: 1,
+      getNextPageParam: (last) => (last.page < last.totalPages ? last.page + 1 : undefined),
     }),
   details: (mediaType: MediaType, id: number) =>
     queryOptions({

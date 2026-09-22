@@ -6,9 +6,11 @@ import { StorageWarningBanner } from '@/components/storage-warning-banner';
 import { CoreProvider } from '@/components/core-provider';
 import { ScrollbarReveal } from '@/components/scrollbar-reveal';
 import { ScrollToTop } from '@/components/scroll-to-top';
+import { WatchOriginTracker } from '@/components/watch-origin';
 import { SiteFooter } from '@/components/site-footer';
 import { SiteHeader } from '@/components/site-header';
 import { CatalogPage } from '@/pages/catalog';
+import { DiscoverPage } from '@/pages/discover';
 import { HomePage } from '@/pages/home';
 import { LibraryPage } from '@/pages/library';
 import { NotFoundPage } from '@/pages/not-found';
@@ -45,6 +47,7 @@ export function App() {
       <CoreProvider>
         <UpdateProvider>
           <ScrollToTop />
+          <WatchOriginTracker />
           <ScrollbarReveal />
           <StorageWarningBanner />
           <UpdateOverlay />
@@ -55,6 +58,7 @@ export function App() {
                 <Route index element={<HomePage />} />
                 <Route path="movies" element={<CatalogPage mediaType="movie" />} />
                 <Route path="tv-shows" element={<CatalogPage mediaType="tv" />} />
+                <Route path="discover" element={<DiscoverPage />} />
                 <Route path="search" element={<SearchPage />} />
                 <Route path="library" element={<LibraryPage />} />
                 <Route path="legal" element={<LegalPage />} />

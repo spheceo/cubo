@@ -6,6 +6,10 @@ const LEGACY_KEY = 'cubo.featured.v1';
 /** Featured heroes should feel current. Older titles stay in the rows. */
 export const FEATURED_MAX_AGE_YEARS = 10;
 
+/** Featured heroes should feel curated, not arbitrary: below this score the
+ *  pool falls back to whatever is eligible rather than headline obscure picks. */
+export const FEATURED_MIN_VOTE = 7;
+
 /** Keep the same billboard across refreshes; rotate after this, not every load. */
 export const FEATURED_HOLD_MS = 6 * 60 * 60 * 1000;
 
@@ -91,8 +95,12 @@ export function pickFeatured(
   const unique = new Map(candidates.map((item) => [titleKey(item), item]));
   const eligible = [...unique.values()].filter((item) => isFeaturedEligible(item, today));
   if (eligible.length === 0) return null;
-  const oldest = Math.min(...eligible.map((item) => history.indexOf(titleKey(item))));
-  const pool = eligible.filter((item) => history.indexOf(titleKey(item)) === oldest);
+  // Rotation stays, but only over titles worth headlining. If every eligible
+  // pick is unrated or poorly rated, showing one beats showing nothing.
+  const curated = eligible.filter((item) => item.voteAverage >= FEATURED_MIN_VOTE);
+  const rotationSet = curated.length > 0 ? curated : eligible;
+  const oldest = Math.min(...rotationSet.map((item) => history.indexOf(titleKey(item))));
+  const pool = rotationSet.filter((item) => history.indexOf(titleKey(item)) === oldest);
   const fraction = Number.isFinite(random) ? Math.max(0, Math.min(random, 0.999999)) : 0;
   return pool[Math.floor(fraction * pool.length)];
 }

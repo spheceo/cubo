@@ -14,6 +14,7 @@ import {
 import { isBrowserPlayableFilename } from '@/lib/media-compatibility';
 import { previewStart } from '@/lib/preview-start';
 import { rankPreviewStreams } from '@/lib/stream-select';
+import { onCacheClear } from '@/lib/cache-events';
 import { useCore } from './core-provider';
 
 const PREVIEW_SECONDS = 40;
@@ -138,6 +139,16 @@ export function AutoPreview({
     if (!item.imdbId || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     let cancelled = false;
     const abort = new AbortController();
+    let previewCore: string | null = null;
+    const unsubscribe = onCacheClear((baseUrl) => {
+      if (previewCore && previewCore !== baseUrl) return;
+      cancelled = true;
+      abort.abort();
+      videoRef.current?.pause();
+      videoRef.current?.removeAttribute('src');
+      setPreviewUrl(null);
+      setPreviewActive(false);
+    });
 
     async function preparePreview() {
       try {
@@ -157,6 +168,7 @@ export function AutoPreview({
           ),
           ),
         ]);
+        previewCore = connection.baseUrl;
         const source = rankPreviewStreams(
           streams,
           item.originalLanguage,
@@ -191,6 +203,7 @@ export function AutoPreview({
 
     const idle = window.setTimeout(() => void preparePreview(), PREPARE_DELAY_MS);
     return () => {
+      unsubscribe();
       cancelled = true;
       // Stop the readiness polling immediately — hovering across several
       // titles would otherwise stack concurrent 500 ms poll loops.

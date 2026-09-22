@@ -49,9 +49,6 @@ pub struct LibraryItem {
     pub progress_device_id: Option<String>,
     pub watch_href: String,
     pub detail_href: String,
-    /// Absolute seconds where end credits began, mapped while watching.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credits_start_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,8 +173,6 @@ pub struct PlaybackUpdate {
     pub session_started: bool,
     pub watch_href: String,
     pub detail_href: String,
-    #[serde(default)]
-    pub credits_start_seconds: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,8 +226,12 @@ impl CoreStore {
         // POST may arrive after a refresh or a newer backward seek. Only
         // compare observation clocks from the same browser/device.
         if let Some(incoming) = update.progress_updated_at {
-            if data.history.iter().find(|entry| entry.key == update.key
-                && entry.progress_device_id == update.progress_device_id)
+            if data
+                .history
+                .iter()
+                .find(|entry| {
+                    entry.key == update.key && entry.progress_device_id == update.progress_device_id
+                })
                 .and_then(|entry| entry.progress_updated_at)
                 .is_some_and(|saved| incoming < saved)
             {
@@ -244,21 +243,9 @@ impl CoreStore {
         } else {
             0.0
         };
-        let completed = progress >= 0.9;
-        let existing_credits = data
-            .history
-            .iter()
-            .find(|entry| entry.key == update.key)
-            .and_then(|entry| entry.credits_start_seconds)
-            .filter(|value| *value > 0.0);
-        let credits_start_seconds = match (existing_credits, update.credits_start_seconds) {
-            // 0 is an explicit clear — a false marker must be removable.
-            (_, Some(new)) if new <= 0.0 => None,
-            (Some(old), Some(new)) => Some(old.min(new)),
-            (Some(old), None) => Some(old),
-            (None, Some(new)) if new > 0.0 => Some(new),
-            (None, _) => None,
-        };
+        // Keep genuinely unfinished titles available, including long endings.
+        let completed =
+            progress >= 0.98 && update.duration_seconds - update.position_seconds <= 60.0;
 
         let item = LibraryItem {
             key: update.key.clone(),
@@ -281,7 +268,6 @@ impl CoreStore {
             progress_device_id: update.progress_device_id,
             watch_href: update.watch_href,
             detail_href: update.detail_href,
-            credits_start_seconds,
         };
 
         let existing = data
@@ -324,9 +310,8 @@ impl CoreStore {
             .map(|item| (item.media_type.clone(), item.media_id));
         match title {
             Some((media_type, media_id)) => {
-                data.history.retain(|item| {
-                    item.media_type != media_type || item.media_id != media_id
-                });
+                data.history
+                    .retain(|item| item.media_type != media_type || item.media_id != media_id);
             }
             None => data.history.retain(|item| item.key != key),
         }
@@ -460,7 +445,10 @@ impl CoreStore {
         self.persist_locked(data).await
     }
 
-    async fn persist_locked(&self, data: tokio::sync::MutexGuard<'_, CoreData>) -> Result<(), String> {
+    async fn persist_locked(
+        &self,
+        data: tokio::sync::MutexGuard<'_, CoreData>,
+    ) -> Result<(), String> {
         let bytes = serde_json::to_vec(&*data)
             .map_err(|error| format!("could not encode Cubo state: {error}"))?;
         // Callers hold persist_lock through the rename, but readers need not
@@ -504,7 +492,35 @@ mod tests {
             "title": "Movie", "positionSeconds": position, "durationSeconds": 3600,
             "progressUpdatedAt": observed, "watchedDeltaSeconds": 5,
             "watchHref": "/watch/movie/42", "detailHref": "/movie/42"
-        })).unwrap()
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn completion_keeps_long_endings_available_and_accepts_legacy_credits() {
+        let (store, directory) = test_store().await;
+        store.record_playback(playback(3240.0, 100)).await.unwrap();
+        assert!(!store.snapshot().await.history[0].completed);
+        store.record_playback(playback(3530.0, 200)).await.unwrap();
+        assert!(!store.snapshot().await.history[0].completed);
+        let update = serde_json::from_value(serde_json::json!({
+            "key": "movie:42", "mediaId": 42, "mediaType": "movie",
+            "title": "Movie", "positionSeconds": 3550, "durationSeconds": 3600,
+            "progressUpdatedAt": 300, "creditsStartSeconds": 3240,
+            "watchHref": "/watch/movie/42", "detailHref": "/movie/42"
+        }))
+        .unwrap();
+        store.record_playback(update).await.unwrap();
+        let snapshot = store.snapshot().await;
+        assert!(snapshot.history[0].completed);
+        assert!(serde_json::to_value(&snapshot.history[0])
+            .unwrap()
+            .get("creditsStartSeconds")
+            .is_none());
+        // An intentional rewind makes the title resumable again.
+        store.record_playback(playback(120.0, 400)).await.unwrap();
+        assert!(!store.snapshot().await.history[0].completed);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[tokio::test]
@@ -549,12 +565,20 @@ mod tests {
         assert!(tokio::time::timeout(
             Duration::from_millis(30),
             store.update_cache_limit(2 * 1024 * 1024 * 1024),
-        ).await.is_err());
+        )
+        .await
+        .is_err());
         assert_eq!(store.snapshot().await.cache.max_bytes, DEFAULT_CACHE_BYTES);
         drop(writer);
-        store.update_cache_limit(2 * 1024 * 1024 * 1024).await.unwrap();
+        store
+            .update_cache_limit(2 * 1024 * 1024 * 1024)
+            .await
+            .unwrap();
         let loaded = CoreStore::load(store.path.clone()).await.unwrap();
-        assert_eq!(loaded.snapshot().await.cache.max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            loaded.snapshot().await.cache.max_bytes,
+            2 * 1024 * 1024 * 1024
+        );
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -565,7 +589,9 @@ mod tests {
         for id in 0..32 {
             let store = store.clone();
             tasks.spawn(async move {
-                store.touch_cache(Some(id), format!("hash-{id}"), None, None, vec![]).await?;
+                store
+                    .touch_cache(Some(id), format!("hash-{id}"), None, None, vec![])
+                    .await?;
                 store.persist_now().await
             });
         }
@@ -576,7 +602,10 @@ mod tests {
         let snapshot = loaded.cache_snapshot().await;
         assert_eq!(snapshot.cache_entries.len(), 32);
         for id in 0..32 {
-            assert!(snapshot.cache_entries.iter().any(|entry| entry.torrent_id == Some(id)));
+            assert!(snapshot
+                .cache_entries
+                .iter()
+                .any(|entry| entry.torrent_id == Some(id)));
         }
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

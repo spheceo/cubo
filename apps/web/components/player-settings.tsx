@@ -9,9 +9,22 @@ import {
   FRAMING_LABELS,
   type FramingMode,
 } from '@/lib/framing-prefs';
+import {
+  SECTION_COLOR_OPTIONS,
+  SECTION_KINDS,
+  type SectionKind,
+} from '@/lib/section-prefs';
 import type { PlayerSubtitle } from './video-player';
 
-type Panel = 'root' | 'subtitles' | 'language' | 'size' | 'color' | 'framing';
+type Panel =
+  | 'root'
+  | 'subtitles'
+  | 'language'
+  | 'size'
+  | 'color'
+  | 'framing'
+  | 'sections'
+  | 'section-color';
 
 const FRAMING_MODES: FramingMode[] = ['fit', 'fill-width', 'fill-height', 'auto'];
 
@@ -34,6 +47,10 @@ export function PlayerSettings({
   onPickCaptionColor,
   framing = 'fit',
   onPickFraming,
+  sectionsVisible = true,
+  onToggleSections,
+  sectionColors,
+  onPickSectionColor,
 }: {
   subtitles: PlayerSubtitle[];
   activeSubtitleId: string | null;
@@ -44,13 +61,29 @@ export function PlayerSettings({
   onPickCaptionColor: (color: CaptionColor) => void;
   framing?: FramingMode;
   onPickFraming?: (mode: FramingMode) => void;
+  /** Whether intro/credits/etc. bands are drawn on the timeline. Detection
+   *  and skip actions keep working either way — this is purely display. */
+  sectionsVisible?: boolean;
+  onToggleSections?: (visible: boolean) => void;
+  /** Every section kind resolved to a concrete color (defaults applied). */
+  sectionColors?: Record<SectionKind, string>;
+  onPickSectionColor?: (kind: SectionKind, color: string) => void;
 }) {
   const [panel, setPanel] = useState<Panel>('root');
+  const [coloring, setColoring] = useState<SectionKind>('intro');
   const active = subtitles.find((track) => track.id === activeSubtitleId);
   const sizeLabel = SIZES.find((size) => size.value === captionSize)?.label ?? 'Medium';
   const colorEntry =
     CAPTION_COLORS.find((entry) => entry.value === captionColor) ?? CAPTION_COLORS[0];
   const framingLabel = FRAMING_LABELS[framing];
+  const colorFor = (kind: SectionKind) =>
+    sectionColors?.[kind] ??
+    SECTION_KINDS.find((entry) => entry.kind === kind)?.default ??
+    '#52525b';
+  const colorName = (hex: string) =>
+    SECTION_COLOR_OPTIONS.find((option) => option.value === hex)?.label ?? 'Custom';
+  const coloringEntry =
+    SECTION_KINDS.find((entry) => entry.kind === coloring) ?? SECTION_KINDS[0];
 
   if (panel === 'subtitles') {
     return (
@@ -80,7 +113,55 @@ export function PlayerSettings({
       aria-label="Playback settings"
       className="absolute bottom-12 right-0 z-20 w-56 overflow-hidden rounded-xl border border-white/10 bg-black/92 shadow-2xl backdrop-blur-md"
     >
-      {panel === 'framing' ? (
+      {panel === 'sections' ? (
+        <>
+          <PaneHeader label="Timeline sections" onBack={() => setPanel('root')} />
+          <div className="border-t border-white/8">
+            <button
+              type="button"
+              onClick={() => onToggleSections?.(!sectionsVisible)}
+              className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+            >
+              <span>Show sections</span>
+              <span className="min-w-0 truncate text-white/45">
+                {sectionsVisible ? 'On' : 'Off'}
+              </span>
+            </button>
+          </div>
+          <div className="border-t border-white/8">
+            {SECTION_KINDS.map((entry) => (
+              <SubRow
+                key={entry.kind}
+                label={entry.label}
+                value={colorName(colorFor(entry.kind))}
+                swatch={colorFor(entry.kind)}
+                onClick={() => {
+                  setColoring(entry.kind);
+                  setPanel('section-color');
+                }}
+              />
+            ))}
+          </div>
+        </>
+      ) : panel === 'section-color' ? (
+        <>
+          <PaneHeader
+            label={`${coloringEntry.label} color`}
+            onBack={() => setPanel('sections')}
+          />
+          <div className="py-1">
+            {SECTION_COLOR_OPTIONS.map((option) => (
+              <OptionRow
+                key={option.value}
+                label={option.label}
+                active={option.value === colorFor(coloring)}
+                swatch={option.value}
+                onClick={() => onPickSectionColor?.(coloring, option.value)}
+              />
+            ))}
+          </div>
+        </>
+      ) : panel === 'framing' ? (
         <>
           <PaneHeader label="Framing" onBack={() => setPanel('root')} />
           <div className="py-1">
@@ -152,6 +233,18 @@ export function PlayerSettings({
             <span>Framing</span>
             <span className="flex min-w-0 items-center gap-1 text-white/45">
               <span className="truncate">{framingLabel}</span>
+              <IoChevronForward size={14} className="shrink-0" />
+            </span>
+          </button>
+          <div className="border-t border-white/8" />
+          <button
+            type="button"
+            onClick={() => setPanel('sections')}
+            className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+          >
+            <span>Timeline sections</span>
+            <span className="flex min-w-0 items-center gap-1 text-white/45">
+              <span className="truncate">{sectionsVisible ? 'On' : 'Off'}</span>
               <IoChevronForward size={14} className="shrink-0" />
             </span>
           </button>

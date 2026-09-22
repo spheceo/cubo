@@ -11,15 +11,25 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use crate::remux_sink::RemuxSink;
+
 const PLAYLIST_NAME: &str = "media.m3u8";
 const PLAYLIST_WAIT: Duration = Duration::from_secs(90);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// A timeout is the only probe failure worth retrying: the swarm keeps
+/// fetching while ffprobe stalls, so the second attempt lands on warm pieces.
+enum ProbeError {
+    TimedOut,
+    Failed(String),
+}
 
 /// Codecs the remux path can pass through with `-c:v copy`. HEVC remuxes to
 /// fMP4 with an `hvc1` tag; the client only routes HEVC here after detecting
@@ -39,6 +49,150 @@ pub struct MediaProbe {
     /// never blindly take `0:a:0`.
     pub audio_stream_index: Option<u32>,
     pub duration_seconds: Option<f64>,
+    /// Container chapters — named ones ("Intro", "Credits", "OP"/"ED") give
+    /// exact, provider-independent skip windows.
+    pub chapters: Vec<Chapter>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Chapter {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SkipSegment {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// A chapter (or crowd-sourced equivalent) with its section type, for the
+/// player's dev timeline overlay.
+#[derive(Debug, Clone)]
+pub struct SkipSection {
+    pub start: f64,
+    pub end: f64,
+    pub kind: &'static str,
+    pub label: String,
+}
+
+/// Classifies one chapter title into a section kind. `chapter` is the
+/// catch-all for real but generic markers ("Scene 2", "Chapter 4") — the
+/// dev overlay still shows them so label coverage is visible at a glance.
+fn chapter_kind(title: &str) -> &'static str {
+    let title = title.trim().to_ascii_lowercase();
+    let tagged = |prefix: &str| {
+        title.starts_with(prefix)
+            && title[prefix.len()..]
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch.is_whitespace())
+    };
+    if title.contains("intro")
+        || title.contains("opening")
+        || tagged("op")
+        || title.contains("title sequence")
+        || title.contains("main title")
+    {
+        return "intro";
+    }
+    if title.contains("recap") || title.contains("previously") || title.contains("last time") {
+        return "recap";
+    }
+    if title.contains("post credit")
+        || title.contains("post-credit")
+        || title.contains("postcredit")
+        || title.contains("mid credit")
+        || title.contains("mid-credit")
+        || title.contains("after credit")
+        || title.contains("stinger")
+    {
+        return "postcredits";
+    }
+    if title.contains("credits")
+        || title.contains("ending")
+        || tagged("ed")
+        || title.contains("outro")
+        || title.contains("closing")
+    {
+        return "credits";
+    }
+    if title.contains("preview")
+        || title.contains("next time")
+        || title.contains("coming up")
+        || title.contains("next on")
+    {
+        return "preview";
+    }
+    "chapter"
+}
+
+/// Every chapter as a typed section, keeping the container's own labels.
+/// Unlike `chapter_skip_segments` there are no position bounds — the dev
+/// overlay should show what the file actually declares, mislabeled or not.
+pub fn chapter_sections(chapters: &[Chapter]) -> Vec<SkipSection> {
+    chapters
+        .iter()
+        .filter(|chapter| {
+            chapter.start_seconds.is_finite()
+                && chapter.end_seconds.is_finite()
+                && chapter.end_seconds > chapter.start_seconds
+        })
+        .map(|chapter| SkipSection {
+            start: chapter.start_seconds,
+            end: chapter.end_seconds,
+            kind: chapter_kind(&chapter.title),
+            label: chapter.title.clone(),
+        })
+        .collect()
+}
+
+/// Maps named container chapters to skip windows. Returns (intro, credits).
+/// Names are release-dependent, so anything unrecognized is ignored and the
+/// API fallbacks in the skip-segments endpoint cover the gap. Sanity bounds
+/// keep a mislabeled chapter from producing an absurd skip: an intro must sit
+/// in the first half, credits must start past the 40% mark.
+pub fn chapter_skip_segments(
+    chapters: &[Chapter],
+    duration_seconds: f64,
+) -> (Option<SkipSegment>, Option<SkipSegment>) {
+    let mut intro = None;
+    let mut credits = None;
+    for chapter in chapters {
+        if !chapter.start_seconds.is_finite()
+            || !chapter.end_seconds.is_finite()
+            || chapter.end_seconds <= chapter.start_seconds
+        {
+            continue;
+        }
+        // The position bounds guard against a mislabeled mid-file chapter;
+        // an unknown duration skips them — a chapter literally named "Intro"
+        // is trustworthy on its own.
+        match chapter_kind(&chapter.title) {
+            "intro"
+                if intro.is_none()
+                    && (duration_seconds <= 0.0
+                        || chapter.start_seconds < duration_seconds * 0.5) =>
+            {
+                intro = Some(SkipSegment {
+                    start: chapter.start_seconds,
+                    end: chapter.end_seconds,
+                });
+            }
+            "credits"
+                if credits.is_none()
+                    && (duration_seconds <= 0.0
+                        || chapter.start_seconds > duration_seconds * 0.4) =>
+            {
+                credits = Some(SkipSegment {
+                    start: chapter.start_seconds,
+                    end: chapter.end_seconds,
+                });
+            }
+            _ => {}
+        }
+    }
+    (intro, credits)
 }
 
 impl MediaProbe {
@@ -62,6 +216,21 @@ struct FfprobeOutput {
     streams: Vec<FfprobeStream>,
     #[serde(default)]
     format: FfprobeFormat,
+    #[serde(default)]
+    chapters: Vec<FfprobeChapter>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeChapter {
+    start_time: Option<String>,
+    end_time: Option<String>,
+    #[serde(default)]
+    tags: FfprobeChapterTags,
+}
+
+#[derive(Default, Deserialize)]
+struct FfprobeChapterTags {
+    title: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -157,6 +326,12 @@ pub struct TranscodeManager {
     /// first playlist request doesn't pay for ffprobe serially.
     probes: Mutex<HashMap<String, MediaProbe>>,
     prewarming: Mutex<HashSet<String>>,
+    /// Invalidates background probe tasks when cache contents are cleared.
+    cache_epoch: AtomicU64,
+    cache_changed: tokio::sync::watch::Sender<u64>,
+    cache_blocked: std::sync::atomic::AtomicBool,
+    remux_sink: RemuxSink,
+    sink_endpoint: Mutex<Option<String>>,
 }
 
 impl TranscodeManager {
@@ -167,11 +342,107 @@ impl TranscodeManager {
         Self {
             ffmpeg: find_tool("ffmpeg"),
             ffprobe: find_tool("ffprobe"),
-            dir,
+            dir: dir.clone(),
             active: Mutex::new(None),
             probes: Mutex::new(HashMap::new()),
             prewarming: Mutex::new(HashSet::new()),
+            cache_epoch: AtomicU64::new(0),
+            cache_changed: tokio::sync::watch::channel(0).0,
+            cache_blocked: std::sync::atomic::AtomicBool::new(false),
+            remux_sink: RemuxSink::new(dir.clone(), 1024 * 1024 * 1024),
+            sink_endpoint: Mutex::new(None),
         }
+    }
+
+    /// Configure the hard byte budget reserved for rolling remux output.
+    pub async fn set_budget(&self, bytes: u64) -> Result<(), String> {
+        self.remux_sink.set_budget(bytes).await
+    }
+
+    /// Start the sink namespace for a job. The bridge should use the job's
+    /// unguessable nonce as the HTTP PUT path component.
+    pub async fn begin_sink_job(&self, job: &str, actual_start: f64) -> Result<PathBuf, String> {
+        self.remux_sink.begin_job(job, actual_start).await
+    }
+
+    pub fn remux_sink(&self) -> RemuxSink {
+        self.remux_sink.clone()
+    }
+
+    pub async fn listen_sink(&self) -> Result<String, String> {
+        let mut endpoint = self.sink_endpoint.lock().await;
+        if let Some(endpoint) = endpoint.as_ref() {
+            return Ok(endpoint.clone());
+        }
+        let address = self.remux_sink.listen().await?;
+        *endpoint = Some(address.clone());
+        Ok(address)
+    }
+
+    /// Returns the private HTTP PUT destinations ffmpeg should use for the
+    /// playlist and numbered fMP4 segments of the active source.
+    pub async fn sink_output_urls(&self, key: &str) -> Result<(String, String), String> {
+        let job = self.active_sink_job(key).await?;
+        let playlist = self
+            .remux_sink
+            .put_url(&job, "media.m3u8")
+            .await
+            .ok_or("remux sink is not listening")?;
+        let segments = self
+            .remux_sink
+            .put_url(&job, "segment%05d.m4s")
+            .await
+            .ok_or("remux sink is not listening")?;
+        Ok((playlist, segments))
+    }
+
+    pub async fn read_sink_file(&self, key: &str, file: &str) -> Result<Vec<u8>, String> {
+        let job = self.active_sink_job(key).await?;
+        self.remux_sink.read(&job, file).await
+    }
+
+    /// Resolve the private sink namespace for the currently active source.
+    /// The bridge uses this to authorize HTTP PUTs without exposing arbitrary
+    /// filesystem paths or accepting a caller-supplied job id.
+    async fn active_sink_job(&self, key: &str) -> Result<String, String> {
+        let active = self.active.lock().await;
+        let job = active
+            .as_ref()
+            .filter(|job| job.key == key)
+            .ok_or("no active remux job")?;
+        Ok(job.nonce.clone())
+    }
+
+    pub async fn put_sink_file(&self, key: &str, file: &str, bytes: &[u8]) -> Result<(), String> {
+        let job = self.active_sink_job(key).await?;
+        self.remux_sink.put(&job, file, bytes).await
+    }
+
+    pub async fn note_sink_playlist(&self, key: &str, playlist: &str) -> Result<(), String> {
+        let job = self.active_sink_job(key).await?;
+        self.remux_sink.note_playlist(&job, playlist).await
+    }
+
+    /// Advance the absolute playback watermark for the active sink job.
+    pub async fn set_playhead(&self, key: &str, absolute_seconds: f64) -> Result<(), String> {
+        let job = self.active_sink_job(key).await?;
+        self.remux_sink.set_playhead(&job, absolute_seconds).await
+    }
+
+    pub async fn retained_start(&self, key: &str) -> Option<f64> {
+        let job = self
+            .active
+            .lock()
+            .await
+            .as_ref()
+            .filter(|job| job.key == key)
+            .map(|job| job.nonce.clone())?;
+        self.remux_sink.retained_start(&job).await
+    }
+
+    pub async fn report_segment_served(&self, key: &str, file: &str) -> Result<(), String> {
+        let job = self.active_sink_job(key).await?;
+        self.remux_sink.report_segment_served(&job, file).await
     }
 
     pub fn available(&self) -> bool {
@@ -182,8 +453,33 @@ impl TranscodeManager {
         &self.dir
     }
 
+    pub fn cache_blocked(&self) -> bool {
+        self.cache_blocked.load(Ordering::Acquire)
+    }
+
     pub async fn probe(&self, input_url: &str) -> Result<MediaProbe, String> {
         let ffprobe = self.ffprobe.as_ref().ok_or("ffprobe is not available")?;
+        // A cold torrent can legitimately need more than one timeout window:
+        // the killed attempt already pulled the header pieces into the cache,
+        // so an immediate retry usually finishes fast.
+        match self.probe_once(ffprobe, input_url).await {
+            Err(ProbeError::TimedOut) => {
+                tracing::info!(target: "probe", "source probe timed out; retrying once");
+                self.probe_once(ffprobe, input_url).await
+            }
+            result => result,
+        }
+        .map_err(|error| match error {
+            ProbeError::TimedOut => "probing the source timed out".to_string(),
+            ProbeError::Failed(error) => error,
+        })
+    }
+
+    async fn probe_once(
+        &self,
+        ffprobe: &Path,
+        input_url: &str,
+    ) -> Result<MediaProbe, ProbeError> {
         let output = tokio::time::timeout(
             PROBE_TIMEOUT,
             Command::new(ffprobe)
@@ -194,6 +490,7 @@ impl TranscodeManager {
                     "json",
                     "-show_streams",
                     "-show_format",
+                    "-show_chapters",
                     // Stream info for MKV lives in the header; a 20M budget
                     // made cold starts wait on megabytes of torrent data that
                     // add nothing. These caps bound the worst case tightly.
@@ -209,14 +506,15 @@ impl TranscodeManager {
                 .output(),
         )
         .await
-        .map_err(|_| "probing the source timed out".to_string())?
-        .map_err(|error| format!("could not run ffprobe: {error}"))?;
+        .map_err(|_| ProbeError::TimedOut)?
+        .map_err(|error| ProbeError::Failed(format!("could not run ffprobe: {error}")))?;
 
         if !output.status.success() {
-            return Err("ffprobe could not read the source".into());
+            return Err(ProbeError::Failed("ffprobe could not read the source".into()));
         }
-        let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("unexpected ffprobe output: {error}"))?;
+        let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout).map_err(|error| {
+            ProbeError::Failed(format!("unexpected ffprobe output: {error}"))
+        })?;
 
         let video_codec = parsed
             .streams
@@ -238,11 +536,23 @@ impl TranscodeManager {
             duration_seconds = duration_seconds.unwrap_or(0.0),
             "source probe complete"
         );
+        let chapters = parsed
+            .chapters
+            .iter()
+            .filter_map(|chapter| {
+                Some(Chapter {
+                    start_seconds: chapter.start_time.as_deref()?.parse().ok()?,
+                    end_seconds: chapter.end_time.as_deref()?.parse().ok()?,
+                    title: chapter.tags.title.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
         Ok(MediaProbe {
             video_codec,
             audio_codec: audio.and_then(|stream| stream.codec_name.clone()),
             audio_stream_index: audio.and_then(|stream| stream.index),
             duration_seconds,
+            chapters,
         })
     }
 
@@ -263,6 +573,10 @@ impl TranscodeManager {
         generation: u64,
     ) -> Result<PathBuf, String> {
         let ffmpeg = self.ffmpeg.as_ref().ok_or("ffmpeg is not available")?;
+        // Tests and embedded callers may construct a manager without the
+        // engine startup hook. The sink listener is loopback-only and its
+        // listen operation is idempotent.
+        let _ = self.listen_sink().await?;
         let mut active = self.active.lock().await;
 
         if let Some(job) = active.as_mut() {
@@ -321,13 +635,21 @@ impl TranscodeManager {
         if let Some(mut previous) = active.take() {
             let _ = previous.child.kill().await;
             let _ = tokio::fs::remove_dir_all(&previous.dir).await;
+            let _ = self.remux_sink.remove_job(&previous.nonce).await;
         }
 
-        let job_dir = self.dir.join(sanitize_key(key));
-        let _ = tokio::fs::remove_dir_all(&job_dir).await;
-        tokio::fs::create_dir_all(&job_dir)
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let job_dir = self.remux_sink.begin_job(&nonce, actual_start).await?;
+        let playlist_url = self
+            .remux_sink
+            .put_url(&nonce, "media.m3u8")
             .await
-            .map_err(|error| format!("could not create transcode directory: {error}"))?;
+            .ok_or("remux sink is not listening")?;
+        let segment_url = self
+            .remux_sink
+            .put_url(&nonce, "segment%05d.m4s")
+            .await
+            .ok_or("remux sink is not listening")?;
 
         let mut command = Command::new(ffmpeg);
         command
@@ -377,16 +699,29 @@ impl TranscodeManager {
             .args(["-hls_playlist_type", "event"])
             .args(["-hls_segment_type", "fmp4"])
             .args(["-hls_fmp4_init_filename", "init.mp4"])
+            .args(["-hls_segment_filename", &segment_url])
             .args(["-hls_flags", "independent_segments"])
-            .arg(PLAYLIST_NAME)
+            .args(["-method", "PUT"])
+            .args(["-http_persistent", "0"])
+            .arg(playlist_url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(if cfg!(test) {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(true);
 
-        let child = command
-            .spawn()
-            .map_err(|error| format!("could not start ffmpeg: {error}"))?;
+        let failed_nonce = nonce.clone();
+        let child = command.spawn().map_err(|error| {
+            let sink = self.remux_sink.clone();
+            // The child has not started, so no PUT can race this cleanup.
+            tokio::spawn(async move {
+                let _ = sink.remove_job(&failed_nonce).await;
+            });
+            format!("could not start ffmpeg: {error}")
+        })?;
         tracing::info!(
             target: "remux",
             key = %key,
@@ -399,7 +734,7 @@ impl TranscodeManager {
             dir: job_dir.clone(),
             start_seconds,
             actual_start_seconds: actual_start,
-            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            nonce,
             generation,
             probe: probe.clone(),
             child,
@@ -477,6 +812,13 @@ impl TranscodeManager {
         self.probes.lock().await.get(key).cloned()
     }
 
+    /// True while a prewarm probe is running for `key` — callers that would
+    /// otherwise start a second ffprobe on the same cold file can wait a
+    /// moment and take the warmed result instead.
+    pub async fn is_prewarming(&self, key: &str) -> bool {
+        self.prewarming.lock().await.contains(key)
+    }
+
     /// Stores a probe for later playlist requests.
     pub async fn remember_probe(&self, key: &str, probe: MediaProbe) {
         let mut probes = self.probes.lock().await;
@@ -492,9 +834,11 @@ impl TranscodeManager {
     /// buffering, retrying briefly while the stream endpoint warms up. By the
     /// time the client asks for the playlist the result is usually cached.
     pub async fn prewarm(&self, key: String, input_url: String) {
-        if !self.available() {
+        if !self.available() || self.cache_blocked() {
             return;
         }
+        let mut changed = self.cache_changed.subscribe();
+        let epoch = self.cache_epoch.load(Ordering::Acquire);
         {
             if self.probes.lock().await.contains_key(&key) {
                 return;
@@ -504,17 +848,105 @@ impl TranscodeManager {
                 return;
             }
         }
-
         for attempt in 0..5 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+            if self.cache_blocked() || self.cache_epoch.load(Ordering::Acquire) != epoch {
+                return;
             }
-            if let Ok(probe) = self.probe(&input_url).await {
-                self.remember_probe(&key, probe).await;
+            if attempt > 0 {
+                tokio::select! {
+                    _ = changed.changed() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+            }
+            let result = tokio::select! {
+                _ = changed.changed() => return,
+                result = self.probe(&input_url) => result,
+            };
+            if let Ok(probe) = result {
+                let mut probes = self.probes.lock().await;
+                if self.cache_epoch.load(Ordering::Acquire) == epoch {
+                    if probes.len() >= 16 {
+                        probes.clear();
+                    }
+                    probes.insert(key.clone(), probe);
+                }
                 break;
             }
         }
-        self.prewarming.lock().await.remove(&key);
+        let mut prewarming = self.prewarming.lock().await;
+        if self.cache_epoch.load(Ordering::Acquire) == epoch {
+            prewarming.remove(&key);
+        }
+    }
+
+    /// Stops ffmpeg and removes all remux output before an explicit cache
+    /// clear. This prevents open files and late probe tasks from recreating
+    /// cache data after the API reports success.
+    pub async fn clear_cache(&self) -> Result<(), String> {
+        self.cache_blocked.store(true, Ordering::Release);
+        let epoch = self.cache_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.cache_changed.send_replace(epoch);
+        self.prewarming.lock().await.clear();
+        self.probes.lock().await.clear();
+        let mut active = self.active.lock().await;
+        if let Some(job) = active.as_mut() {
+            if job
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                job.child
+                    .kill()
+                    .await
+                    .map_err(|error| format!("could not stop video conversion: {error}"))?;
+            }
+        }
+        self.remux_sink.clear().await?;
+        active.take();
+        tokio::fs::remove_dir_all(&self.dir)
+            .await
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| format!("could not remove remux cache: {error}"))?;
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .map_err(|error| format!("could not recreate remux directory: {error}"))
+    }
+
+    /// A new torrent request explicitly starts a new cache session after a
+    /// user clear. Existing HLS polls remain blocked until then.
+    pub fn begin_cache_session(&self) {
+        self.cache_blocked.store(false, Ordering::Release);
+    }
+
+    /// Converted output belongs to its torrent and must be evicted with it.
+    pub async fn remove_torrent_output(&self, id: &str, info_hash: &str) -> Result<(), String> {
+        let mut active = self.active.lock().await;
+        let Some(job) = active.as_mut() else {
+            return Ok(());
+        };
+        let torrent = job.key.split(':').next().unwrap_or_default();
+        if torrent != id && torrent != info_hash {
+            return Ok(());
+        }
+        if job
+            .child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            job.child.kill().await.map_err(|error| error.to_string())?;
+        }
+        let nonce = job.nonce.clone();
+        self.remux_sink.remove_job(&nonce).await?;
+        active.take();
+        Ok(())
     }
 
     /// True when the job for `key` can be served without probing or
@@ -604,15 +1036,46 @@ fn job_covers_request(
 /// Fail when the landing cannot be measured: using the requested target as
 /// playlist time zero would corrupt subtitle alignment and saved progress.
 async fn find_keyframe_before(ffprobe: &Path, input_url: &str, target: f64) -> Result<f64, String> {
-    find_keyframe_before_with_timeout(ffprobe, input_url, target, PROBE_TIMEOUT).await
+    // Same cold-swarm case as the source probe: the killed attempt leaves the
+    // pieces it fetched in the cache, so one immediate retry usually lands.
+    match find_keyframe_once(ffprobe, input_url, target, PROBE_TIMEOUT).await {
+        Err(ProbeError::TimedOut) => {
+            tracing::info!(target: "probe", "seek probe timed out; retrying once");
+            find_keyframe_once(ffprobe, input_url, target, PROBE_TIMEOUT).await
+        }
+        result => result,
+    }
+    .map_err(|error| match error {
+        ProbeError::TimedOut => {
+            "probing the seek position timed out; torrent bytes are unavailable".to_string()
+        }
+        ProbeError::Failed(error) => error,
+    })
 }
 
+#[cfg(test)]
 async fn find_keyframe_before_with_timeout(
     ffprobe: &Path,
     input_url: &str,
     target: f64,
     timeout: Duration,
 ) -> Result<f64, String> {
+    find_keyframe_once(ffprobe, input_url, target, timeout)
+        .await
+        .map_err(|error| match error {
+            ProbeError::TimedOut => {
+                "probing the seek position timed out; torrent bytes are unavailable".to_string()
+            }
+            ProbeError::Failed(error) => error,
+        })
+}
+
+async fn find_keyframe_once(
+    ffprobe: &Path,
+    input_url: &str,
+    target: f64,
+    timeout: Duration,
+) -> Result<f64, ProbeError> {
     let from = (target - 20.0).max(0.0);
     let to = target + 0.25;
     let output = tokio::time::timeout(
@@ -629,10 +1092,12 @@ async fn find_keyframe_before_with_timeout(
             .output(),
     )
     .await
-    .map_err(|_| "probing the seek position timed out; torrent bytes are unavailable".to_string())?
-    .map_err(|error| format!("could not run seek ffprobe: {error}"))?;
+    .map_err(|_| ProbeError::TimedOut)?
+    .map_err(|error| ProbeError::Failed(format!("could not run seek ffprobe: {error}")))?;
     if !output.status.success() {
-        return Err("ffprobe could not read the seek position".into());
+        return Err(ProbeError::Failed(
+            "ffprobe could not read the seek position".into(),
+        ));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut best: Option<f64> = None;
@@ -667,13 +1132,9 @@ async fn find_keyframe_before_with_timeout(
             "keyframe scan found no usable landing point"
         );
     }
-    best.ok_or_else(|| "could not measure the keyframe at the seek position".into())
-}
-
-fn sanitize_key(key: &str) -> String {
-    key.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+    best.ok_or_else(|| {
+        ProbeError::Failed("could not measure the keyframe at the seek position".into())
+    })
 }
 
 /// Locates a bundled or system ffmpeg tool. The directory next to the CLI
@@ -737,6 +1198,121 @@ mod tests {
     #[test]
     fn a_different_file_never_reuses_the_job() {
         assert!(!job_covers_request("2:0", 0.0, 1, "4:0", 0.0, Some(1)));
+    }
+
+    mod chapters {
+        use super::super::{chapter_skip_segments, Chapter};
+
+        fn chapter(start: f64, end: f64, title: &str) -> Chapter {
+            Chapter {
+                start_seconds: start,
+                end_seconds: end,
+                title: title.to_owned(),
+            }
+        }
+
+        #[test]
+        fn named_intro_and_credits_are_picked() {
+            // Silo S03E05's real chapter layout.
+            let chapters = [
+                chapter(0.0, 250.333, "Scene 1"),
+                chapter(250.333, 348.125, "Intro"),
+                chapter(348.125, 3092.0, "Scene 2"),
+                chapter(3092.0, 3153.76, "Credits"),
+            ];
+            let (intro, credits) = chapter_skip_segments(&chapters, 3153.76);
+            let intro = intro.expect("intro");
+            assert_eq!(intro.start, 250.333);
+            assert_eq!(intro.end, 348.125);
+            let credits = credits.expect("credits");
+            assert_eq!(credits.start, 3092.0);
+            assert_eq!(credits.end, 3153.76);
+        }
+
+        #[test]
+        fn generic_chapter_names_are_ignored() {
+            let chapters = [
+                chapter(0.0, 300.0, "Chapter 1"),
+                chapter(300.0, 600.0, "Scene 2"),
+                chapter(600.0, 900.0, "Chapter 3"),
+            ];
+            let (intro, credits) = chapter_skip_segments(&chapters, 900.0);
+            assert!(intro.is_none());
+            assert!(credits.is_none());
+        }
+
+        #[test]
+        fn anime_op_ed_labels_match() {
+            let chapters = [
+                chapter(0.0, 90.0, "Prologue"),
+                chapter(90.0, 180.0, "OP"),
+                chapter(180.0, 1300.0, "Part A"),
+                chapter(1300.0, 1390.0, "ED 2"),
+            ];
+            let (intro, credits) = chapter_skip_segments(&chapters, 1400.0);
+            assert_eq!(intro.map(|s| (s.start, s.end)), Some((90.0, 180.0)));
+            assert_eq!(credits.map(|s| (s.start, s.end)), Some((1300.0, 1390.0)));
+        }
+
+        #[test]
+        fn opening_title_sequence_and_closing_match() {
+            let chapters = [
+                chapter(10.0, 100.0, "Opening Titles"),
+                chapter(800.0, 900.0, "Closing"),
+            ];
+            let (intro, credits) = chapter_skip_segments(&chapters, 900.0);
+            assert!(intro.is_some());
+            assert!(credits.is_some());
+        }
+
+        #[test]
+        fn intro_past_the_halfway_mark_is_rejected() {
+            // A chapter named "Intro" two thirds in is a mislabel, not an
+            // actual title sequence.
+            let chapters = [chapter(700.0, 800.0, "Intro")];
+            let (intro, _) = chapter_skip_segments(&chapters, 900.0);
+            assert!(intro.is_none());
+        }
+
+        #[test]
+        fn credits_too_early_are_rejected() {
+            let chapters = [chapter(100.0, 200.0, "Credits")];
+            let (_, credits) = chapter_skip_segments(&chapters, 900.0);
+            assert!(credits.is_none());
+        }
+
+        #[test]
+        fn invalid_ranges_and_values_are_skipped() {
+            let chapters = [
+                chapter(200.0, 100.0, "Intro"), // reversed
+                chapter(f64::NAN, 300.0, "Opening"),
+                chapter(50.0, f64::INFINITY, "Intro"),
+                chapter(10.0, 90.0, "Intro"),
+            ];
+            let (intro, _) = chapter_skip_segments(&chapters, 900.0);
+            assert_eq!(intro.map(|s| (s.start, s.end)), Some((10.0, 90.0)));
+        }
+
+        #[test]
+        fn unknown_duration_still_matches_named_chapters() {
+            let chapters = [
+                chapter(250.0, 348.0, "Intro"),
+                chapter(3000.0, 3100.0, "Credits"),
+            ];
+            let (intro, credits) = chapter_skip_segments(&chapters, 0.0);
+            assert!(intro.is_some());
+            assert!(credits.is_some());
+        }
+
+        #[test]
+        fn first_named_match_wins() {
+            let chapters = [
+                chapter(10.0, 60.0, "Intro"),
+                chapter(70.0, 120.0, "Opening"),
+            ];
+            let (intro, _) = chapter_skip_segments(&chapters, 900.0);
+            assert_eq!(intro.map(|s| (s.start, s.end)), Some((10.0, 60.0)));
+        }
     }
 
     #[cfg(unix)]
@@ -817,6 +1393,66 @@ exec sleep 30"#,
         }
 
         #[tokio::test]
+        async fn evicting_a_torrent_stops_only_its_conversion() {
+            let fixture = Fixture::new();
+            let mut manager = TranscodeManager::new(fixture.0.join("remux"));
+            manager.ffmpeg = Some(fixture.script("ffmpeg", "exec sleep 30"));
+            let probe = MediaProbe {
+                video_codec: Some("h264".into()),
+                audio_codec: Some("aac".into()),
+                audio_stream_index: Some(1),
+                duration_seconds: Some(3000.0),
+                chapters: vec![],
+            };
+            let dir = manager
+                .ensure_job("1:0", "unused", &probe, 0.0, 1)
+                .await
+                .unwrap();
+            std::fs::write(dir.join("segment.m4s"), b"video").unwrap();
+            manager
+                .remove_torrent_output("2", "different")
+                .await
+                .unwrap();
+            assert!(dir.exists());
+            assert!(manager.job_dir("1:0").await.is_some());
+            manager.remove_torrent_output("1", "hash").await.unwrap();
+            assert!(!dir.exists());
+            assert!(manager.job_dir("1:0").await.is_none());
+            assert!(!manager.cache_blocked());
+        }
+
+        #[tokio::test]
+        async fn clearing_cache_cancels_prewarm_and_removes_output() {
+            let fixture = Fixture::new();
+            let mut manager = TranscodeManager::new(fixture.0.join("remux"));
+            manager.ffmpeg = Some(PathBuf::from("unused"));
+            manager.ffprobe = Some(fixture.script(
+                "ffprobe",
+                r#"for input do :; done
+printf '%s' "$$" > "$input"
+exec sleep 30"#,
+            ));
+            let manager = Arc::new(manager);
+            let pid_file = fixture.0.join("pid");
+            std::fs::write(manager.dir().join("leftover.m4s"), b"old video").unwrap();
+            let task_manager = manager.clone();
+            let input = pid_file.to_str().unwrap().to_owned();
+            let task = tokio::spawn(async move { task_manager.prewarm("1:0".into(), input).await });
+            wait_for_file(&pid_file).await;
+            manager.clear_cache().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_process_exits(&pid_file).await;
+            assert_eq!(std::fs::read_dir(manager.dir()).unwrap().count(), 0);
+            assert!(manager.cache_blocked());
+            assert!(manager.probes.lock().await.is_empty());
+            manager.begin_cache_session();
+            assert!(!manager.cache_blocked());
+        }
+
+        #[tokio::test]
         async fn cancelling_source_probe_kills_the_subprocess() {
             let fixture = Fixture::new();
             let mut manager = TranscodeManager::new(fixture.0.join("remux"));
@@ -837,6 +1473,37 @@ exec sleep 30"#,
         }
 
         #[tokio::test]
+        async fn source_probe_reads_named_chapters() {
+            let fixture = Fixture::new();
+            let mut manager = TranscodeManager::new(fixture.0.join("remux"));
+            manager.ffprobe = Some(fixture.script(
+                "ffprobe",
+                r#"cat <<'JSON'
+{"streams":[{"codec_type":"video","codec_name":"h264"},{"codec_type":"audio","codec_name":"aac","index":1}],
+ "format":{"duration":"3153.760"},
+ "chapters":[
+   {"start_time":"0","end_time":"250.333","tags":{"title":"Scene 1"}},
+   {"start_time":"250.333","end_time":"348.125","tags":{"title":"Intro"}},
+   {"start_time":"348.125","end_time":"3092.0","tags":{"title":"Scene 2"}},
+   {"start_time":"3092.0","end_time":"3153.760","tags":{"title":"Credits"}},
+   {"start_time":"not-a-number","end_time":"1","tags":{"title":"Broken"}}
+ ]}
+JSON"#,
+            ));
+            let probe = manager.probe("unused").await.unwrap();
+            assert_eq!(probe.duration_seconds, Some(3153.76));
+            assert_eq!(probe.chapters.len(), 4);
+            assert_eq!(probe.chapters[1].title, "Intro");
+            assert_eq!(probe.chapters[1].start_seconds, 250.333);
+            let (intro, credits) = super::super::chapter_skip_segments(
+                &probe.chapters,
+                probe.duration_seconds.unwrap(),
+            );
+            assert_eq!(intro.map(|s| (s.start, s.end)), Some((250.333, 348.125)));
+            assert_eq!(credits.map(|s| (s.start, s.end)), Some((3092.0, 3153.76)));
+        }
+
+        #[tokio::test]
         async fn stalled_seek_leaves_lock_free_and_cannot_evict_newer_generation() {
             let fixture = Fixture::new();
             let mut manager = TranscodeManager::new(fixture.0.join("remux"));
@@ -854,6 +1521,7 @@ printf '99.0,K_\n'"#,
                 audio_codec: Some("aac".into()),
                 audio_stream_index: Some(1),
                 duration_seconds: Some(3000.0),
+                chapters: vec![],
             };
             let input = fixture.0.join("input").to_str().unwrap().to_owned();
             let slow = tokio::spawn({
@@ -898,6 +1566,122 @@ printf '99.0,K_\n'"#,
                 find_keyframe_before(&valid, "unused", 100.0).await.unwrap(),
                 99.75
             );
+        }
+
+        #[tokio::test]
+        async fn real_ffmpeg_writes_hls_over_private_put_sink() {
+            let Some(ffmpeg) = find_tool("ffmpeg") else {
+                return;
+            };
+            let Some(ffprobe) = find_tool("ffprobe") else {
+                return;
+            };
+            let fixture = Fixture::new();
+            let source = fixture.0.join("source.mp4");
+            let generated = Command::new(&ffmpeg)
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=160x90:rate=5",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=8000",
+                    "-t",
+                    "300",
+                    "-c:v",
+                    "mpeg4",
+                    "-b:v",
+                    "4k",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "8k",
+                    source.to_str().unwrap(),
+                ])
+                .status()
+                .await
+                .unwrap();
+            assert!(generated.success(), "could not create ffmpeg fixture");
+
+            let mut manager = TranscodeManager::new(fixture.0.join("remux"));
+            manager.ffmpeg = Some(ffmpeg);
+            manager.ffprobe = Some(ffprobe);
+            const BUDGET: u64 = 8 * 1024 * 1024;
+            manager.set_budget(BUDGET).await.unwrap();
+            manager
+                .listen_sink()
+                .await
+                .expect("bind local remux test listener");
+            let probe = MediaProbe {
+                video_codec: Some("mpeg4".into()),
+                audio_codec: Some("aac".into()),
+                audio_stream_index: Some(1),
+                duration_seconds: Some(300.0),
+                chapters: vec![],
+            };
+            let dir = manager
+                .ensure_job("fixture:0", source.to_str().unwrap(), &probe, 0.0, 1)
+                .await
+                .unwrap();
+            manager.wait_for_playlist(&dir).await.unwrap();
+            let playlist = std::fs::read_to_string(dir.join(PLAYLIST_NAME)).unwrap();
+            assert!(playlist.contains("#EXTINF:"));
+            assert!(playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+            assert!(dir.join("init.mp4").exists());
+            // The sink applies backpressure when the quota is full of footage
+            // the reader has not taken, exactly like a paused real player.
+            // Mark served segments often enough that quota waits resolve on
+            // the next poll rather than dominating the deadline.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let playlist = std::fs::read_to_string(dir.join(PLAYLIST_NAME)).unwrap_or_default();
+                for line in playlist.lines().filter(|line| line.ends_with(".m4s")) {
+                    let segment = line.rsplit('/').next().unwrap();
+                    let _ = manager.report_segment_served("fixture:0", segment).await;
+                }
+                if playlist.contains("#EXT-X-ENDLIST") {
+                    break;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    let names: Vec<_> = std::fs::read_dir(&dir)
+                        .unwrap()
+                        .flatten()
+                        .map(|e| (e.file_name(), e.metadata().unwrap().len()))
+                        .collect();
+                    panic!("remux stalled: files={names:?}, playlist={playlist}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let allocated = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len().max(1).div_ceil(64 * 1024) * 64 * 1024)
+                .sum::<u64>();
+            assert!(
+                allocated <= BUDGET,
+                "remux output exceeded quota: {allocated} > {BUDGET}"
+            );
+
+            let old_nonce = manager.job_nonce("fixture:0").await.unwrap();
+            let restarted = manager
+                .ensure_job("fixture:0", source.to_str().unwrap(), &probe, 200.0, 2)
+                .await
+                .unwrap();
+            assert_ne!(manager.job_nonce("fixture:0").await.unwrap(), old_nonce);
+            assert!(manager.job_actual_start("fixture:0").await.unwrap() <= 200.0);
+            assert!(manager.job_usable("fixture:0", 0.0, Some(1)).await);
+            assert_eq!(restarted, manager.job_dir("fixture:0").await.unwrap());
+            manager
+                .remove_torrent_output("fixture", "unused")
+                .await
+                .unwrap();
         }
     }
 }

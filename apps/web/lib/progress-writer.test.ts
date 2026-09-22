@@ -22,7 +22,7 @@ test('rapid seeks send the newest position after the in-flight write, without lo
     if (sent.length === 1) await gate;
   });
   void writer.enqueue(update(1800));
-  void writer.enqueue({ ...update(900), sessionStarted: true, creditsStartSeconds: 0 });
+  void writer.enqueue({ ...update(900), sessionStarted: true });
   const drained = writer.enqueue(update(120));
   assert.deepEqual(sent.map((value) => value.positionSeconds), [1800]);
   release();
@@ -30,7 +30,6 @@ test('rapid seeks send the newest position after the in-flight write, without lo
   assert.deepEqual(sent.map((value) => value.positionSeconds), [1800, 120]);
   assert.equal(sent[1]?.watchedDeltaSeconds, 2);
   assert.equal(sent[1]?.sessionStarted, true);
-  assert.equal(sent[1]?.creditsStartSeconds, 0);
 });
 
 test('whenIdle waits for a write that started after the previous drain', async () => {

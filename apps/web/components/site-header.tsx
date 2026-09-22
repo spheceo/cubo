@@ -8,6 +8,7 @@ const LINKS = [
   { href: '/', label: 'Home' },
   { href: '/movies', label: 'Movies' },
   { href: '/tv-shows', label: 'TV Shows' },
+  { href: '/discover', label: 'Discover' },
 ];
 
 export function SiteHeader() {

@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import {
@@ -20,6 +21,7 @@ import {
   setWatchLater,
   type LocalEngineConnection,
 } from '@/lib/local-engine';
+import { LatestRequest } from '@/lib/latest-request';
 import { CoreSettings } from './core-settings';
 
 const STORAGE_KEY = 'cubo.coreEndpoint';
@@ -55,6 +57,14 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
   const [hostedEndpoint, setHostedEndpoint] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [library, setLibrary] = useState<CoreLibrarySnapshot | null>(null);
+  // Library reads can overlap during player teardown/navigation. Only the
+  // newest read may update the UI; otherwise an older snapshot can hide a
+  // progress row that a newer request has already created.
+  const libraryReadRef = useRef(new LatestRequest());
+  // A write must refresh even if another read began while it was in flight,
+  // but an old connection must never refresh the newly selected Core.
+  const connectionEpochRef = useRef(0);
+  const connectionRef = useRef<LocalEngineConnection | null>(null);
   /** A reachable Core that wants a pairing code before it will talk to us. */
   const [pairingEndpoint, setPairingEndpoint] = useState('');
 
@@ -116,28 +126,40 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
   );
 
   useEffect(() => {
+    const epoch = ++connectionEpochRef.current;
+    connectionRef.current = connection;
+    const read = libraryReadRef.current.begin();
     if (!connection) {
       setLibrary(null);
-      return;
+      return () => {
+        libraryReadRef.current.begin();
+      };
     }
-    let cancelled = false;
     void getLibrary(connection)
       .then((snapshot) => {
-        if (!cancelled) setLibrary(snapshot);
+        if (libraryReadRef.current.isCurrent(read)) setLibrary(snapshot);
       })
       .catch(() => {
-        if (!cancelled) setLibrary(null);
+        if (libraryReadRef.current.isCurrent(read)) setLibrary(null);
       });
     return () => {
-      cancelled = true;
+      // Invalidate callbacks from an unmounted/previous connection effect.
+      libraryReadRef.current.begin();
+      if (connectionRef.current === connection && connectionEpochRef.current === epoch) {
+        connectionRef.current = null;
+      }
     };
   }, [connection]);
 
   const refreshLibrary = useCallback(async () => {
+    const read = libraryReadRef.current.begin();
     try {
+      const expectedEpoch = connectionEpochRef.current;
       const active = connection ?? (await connect());
       const snapshot = await getLibrary(active);
-      setLibrary(snapshot);
+      const sameConnection =
+        connectionRef.current === active && connectionEpochRef.current === expectedEpoch;
+      if (sameConnection && libraryReadRef.current.isCurrent(read)) setLibrary(snapshot);
       return snapshot;
     } catch {
       return null;
@@ -146,19 +168,33 @@ export function CoreProvider({ children }: { children: React.ReactNode }) {
 
   const updateWatchLater = useCallback(
     async (item: WatchLaterItem, saved: boolean) => {
+      const mutation = libraryReadRef.current.begin();
       const active = connection ?? (await connect());
+      const epoch = connectionEpochRef.current;
       const snapshot = await setWatchLater(active, item, saved);
-      setLibrary(snapshot);
+      if (libraryReadRef.current.isCurrent(mutation)) setLibrary(snapshot);
+      // A GET that began after this mutation can have read before the write
+      // reached Core. Re-read after the mutation so the final UI is based on
+      // server state, regardless of response order.
+      if (connectionRef.current === active && connectionEpochRef.current === epoch) {
+        void refreshLibrary();
+      }
     },
-    [connection, connect],
+    [connection, connect, refreshLibrary],
   );
 
   const removeFromHistory = useCallback(
     async (key: string) => {
+      const mutation = libraryReadRef.current.begin();
       const active = connection ?? (await connect());
-      setLibrary(await removeHistoryItem(active, key));
+      const epoch = connectionEpochRef.current;
+      const snapshot = await removeHistoryItem(active, key);
+      if (libraryReadRef.current.isCurrent(mutation)) setLibrary(snapshot);
+      if (connectionRef.current === active && connectionEpochRef.current === epoch) {
+        void refreshLibrary();
+      }
     },
-    [connection, connect],
+    [connection, connect, refreshLibrary],
   );
 
   const value = useMemo<CoreContextValue>(

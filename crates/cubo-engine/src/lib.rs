@@ -7,6 +7,10 @@ pub mod engine;
 pub mod logging;
 pub mod pairing;
 pub mod paths;
+pub mod remux_sink;
+pub mod rolling_cache;
+#[cfg(test)]
+mod rolling_cache_integration_tests;
 pub mod store;
 pub mod system;
 pub mod transcode;

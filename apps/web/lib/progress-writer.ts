@@ -14,7 +14,6 @@ export class ProgressWriter {
       ...update,
       watchedDeltaSeconds: previous.watchedDeltaSeconds + update.watchedDeltaSeconds,
       sessionStarted: previous.sessionStarted || update.sessionStarted,
-      creditsStartSeconds: update.creditsStartSeconds ?? previous.creditsStartSeconds,
     } : update;
     this.running ??= this.drain();
     return this.whenIdle();

@@ -8,25 +8,34 @@
 import {
   backdropUrl,
   type MediaType,
+  type SeasonSummary,
+  type Episode,
   type Stream,
   type SubtitleTrack,
 } from '@cubo/core';
 import { IoIosArrowBack } from 'react-icons/io';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { IoClose, IoList } from 'react-icons/io5';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router';
 import { Link } from '@/components/link';
+import { Dropdown } from '@/components/dropdown';
+import { EpisodeRow } from '@/components/episode-list';
 import { apiUrl } from '@/lib/api';
 import { isUpcomingAirDate } from '@/lib/air-date';
 import { queryClient, streamQueries, tmdbQueries } from '@/lib/queries';
 import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
 import { resetWindowScroll } from './scroll-to-top';
+import { watchOrigin } from './watch-origin';
 import { VideoPlayer, type PlayerSubtitle } from './video-player';
 import {
   addMagnet,
   InsufficientStorageError,
   buildMagnet,
   getLibrary,
+  getSkipSegments,
   getSubtitleMatch,
   shipClientLog,
   largestFileIndex,
@@ -34,6 +43,7 @@ import {
   startRemux,
   streamUrl,
   waitUntilLive,
+  type SkipSegments,
   type TorrentProgress,
 } from '@/lib/local-engine';
 import {
@@ -50,17 +60,13 @@ import {
   type CaptionSize,
 } from '@/lib/caption-prefs';
 import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playback';
-import {
-  clearCreditsStart,
-  loadCreditsStart,
-  resolveCreditsStart,
-  saveCreditsStart,
-} from '@/lib/credits-detect';
-import { playbackKey } from '@/lib/library';
+import { historyForEpisode, playbackKey } from '@/lib/library';
+import { resolveNextEpisode } from '@/lib/next-episode';
 import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
 import { isAutomaticSource, rankStreams, streamKey } from '@/lib/stream-select';
 import { ProgressWriter } from '@/lib/progress-writer';
 import { forgetSource, loadSource, preferSource, rememberSource } from '@/lib/source-affinity';
+import { onCacheClear } from '@/lib/cache-events';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
 const AUTO_ATTEMPTS = 3;
@@ -93,7 +99,7 @@ export function WatchScreen({
   originalLanguage,
   season,
   episode,
-  nextEpisode = null,
+  seasons,
 }: {
   mediaType: MediaType;
   mediaId: number;
@@ -108,12 +114,11 @@ export function WatchScreen({
   originalLanguage: string | null;
   season?: number;
   episode?: number;
-  nextEpisode?: { season: number; episode: number } | null;
+  seasons?: SeasonSummary[];
 }) {
   const core = useCore();
   const refreshLibrary = core.refreshLibrary;
   const navigate = useNavigate();
-  const library = core.library;
 
   const [sources, setSources] = useState<Stream[]>([]);
   const [status, setStatus] = useState<Status>('loading');
@@ -136,7 +141,27 @@ export function WatchScreen({
    *  Null until Core computes it; subtitle lookup upgrades itself when it
    *  lands, replacing title-ID-matched tracks with release-exact ones. */
   const [subtitleMatch, setSubtitleMatch] = useState<SubtitleReleaseHint | null>(null);
+  /** Intro/credits windows for the file actually playing — per-source, so a
+   *  fallback switch clears the previous file's timings. */
+  const [skipSegments, setSkipSegments] = useState<SkipSegments | null>(null);
   const [resumeAt, setResumeAt] = useState(0);
+  const [episodesOpen, setEpisodesOpen] = useState(false);
+  const cacheClearingRef = useRef(false);
+
+  useEffect(() => {
+    const stopForCacheClear = (baseUrl: string) => {
+      if (playbackConnection.current?.baseUrl !== baseUrl) return;
+      cacheClearingRef.current = true;
+      playerFlushRef.current?.();
+      startAbortRef.current?.abort();
+      attemptRef.current += 1;
+      setVideoUrl(null);
+      setSeekConverting(false);
+      setStatus('error');
+      setError('Playback stopped to clear storage. Press Retry to start again.');
+    };
+    return onCacheClear(stopForCacheClear);
+  }, []);
 
   // Caption preferences outlive any single title: the viewer's on/off choice,
   // language, and text size follow them to the next movie or episode.
@@ -211,8 +236,6 @@ export function WatchScreen({
   }
   const lastCoreSaveRef = useRef(0);
   const unsavedWatchSeconds = useRef(0);
-  const clearCreditsOnSave = useRef(false);
-  const creditsClearedKey = useRef<string | null>(null);
   const playerFlushRef = useRef<(() => void) | null>(null);
   const claimedReadyKey = useRef<string | null>(null);
   /** Torrent behind the current remux, so seeks can restart its converter. */
@@ -232,19 +255,6 @@ export function WatchScreen({
    *  flushes from overwriting `lastPositionRef` with the pre-seek time. */
   const seekTargetRef = useRef<number | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
-  const storedCreditsStart = resolveCreditsStart(
-    loadCreditsStart(itemKey),
-    library?.history.find((item) => item.key === itemKey)?.creditsStartSeconds,
-  );
-  const knownCreditsStart =
-    creditsClearedKey.current === itemKey ? null : storedCreditsStart;
-  const creditsStartRef = useRef<number | null>(knownCreditsStart);
-  if (creditsClearedKey.current !== itemKey) {
-    creditsStartRef.current = resolveCreditsStart(
-      creditsStartRef.current,
-      knownCreditsStart,
-    );
-  }
 
   useEffect(() => {
     armWatchSession();
@@ -363,6 +373,7 @@ export function WatchScreen({
       activeSourceRef.current = stream;
       setActiveKey(streamKey(stream));
       setSubtitleMatch(null);
+      setSkipSegments(null);
 
       try {
         setStage(STAGE.opening);
@@ -426,6 +437,39 @@ export function WatchScreen({
         void getSubtitleMatch(connection, id, fileIndex).then((match) => {
           if (!stale()) setSubtitleMatch(match);
         });
+
+        // Intro/credits windows: named chapters first inside Core, crowd
+        // APIs after. Fires in parallel with the stream warm-up — playback
+        // never waits on it, and a missing answer just means no skip UI.
+        const segmentQuery = {
+          torrent: String(id),
+          file: fileIndex,
+          type: mediaType,
+          tmdbId: mediaId,
+          imdbId,
+          season: season ?? undefined,
+          episode: episode ?? undefined,
+        };
+        void getSkipSegments(connection, segmentQuery, abort.signal).then(
+          (segments) => {
+            if (stale()) return;
+            setSkipSegments(segments);
+            // A cold file can answer remote-only while its ffprobe is still
+            // in flight — retry once so exact chapter timings get their turn.
+            if (!segments?.sections?.some((s) => s.source === 'chapters')) {
+              const retry = window.setTimeout(() => {
+                void getSkipSegments(connection, segmentQuery, abort.signal).then(
+                  (next) => {
+                    if (!stale() && next) setSkipSegments(next);
+                  },
+                );
+              }, 12_000);
+              abort.signal.addEventListener('abort', () => window.clearTimeout(retry), {
+                once: true,
+              });
+            }
+          },
+        );
 
 
         let url: string;
@@ -601,6 +645,27 @@ export function WatchScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- core.connect is stable for a given endpoint
   }, [mediaType, mediaId, imdbId, season, episode]);
 
+  // Warm the episode list while the stream resolves so the Episodes drawer
+  // opens instantly instead of fetching on click.
+  useEffect(() => {
+    if (mediaType !== 'tv' || season == null) return;
+    void queryClient.prefetchQuery(tmdbQueries.season(mediaId, season));
+  }, [mediaType, mediaId, season]);
+
+  // The credits prompt's "Next episode" target: this season's next aired
+  // episode, else the premiere of the next season that has aired.
+  const currentSeasonEpisodes = useQuery({
+    ...tmdbQueries.season(mediaId, season ?? 0),
+    enabled: mediaType === 'tv' && season != null,
+  });
+  const nextEpisode = useMemo(
+    () =>
+      mediaType === 'tv' && season != null && episode != null
+        ? resolveNextEpisode(seasons, currentSeasonEpisodes.data, season, episode)
+        : null,
+    [mediaType, season, episode, currentSeasonEpisodes.data, seasons],
+  );
+
   useEffect(() => {
     if (!imdbId) return;
     let cancelled = false;
@@ -656,8 +721,6 @@ export function WatchScreen({
         return;
       }
       lastCoreSaveRef.current = now;
-      const creditsStartSeconds = clearCreditsOnSave.current ? 0 : creditsStartRef.current;
-      clearCreditsOnSave.current = false;
       const update = {
         key: itemKey,
         mediaId,
@@ -678,7 +741,6 @@ export function WatchScreen({
         sessionStarted,
         watchHref: `/watch/${mediaType}/${mediaId}${season != null && episode != null ? `?season=${season}&episode=${episode}` : ''}`,
         detailHref: backHref,
-        creditsStartSeconds,
       };
       unsavedWatchSeconds.current = 0;
       saveChainRef.current = progressWriterRef.current!.enqueue(update);
@@ -805,24 +867,37 @@ export function WatchScreen({
     [],
   );
 
-  // Back means BACK — the page the viewer came from, not always the info
-  // page (e.g. Home → Watch should land on Home). Falls back to `backHref`.
+  // Back means "leave the player" — the page the viewer was on before
+  // playback, never the previous episode (episode hops don't touch the
+  // recorded origin). Falls back to the title's info page when the session
+  // started directly on a watch URL.
   const goBack = useCallback(() => {
     void finishPlayback().finally(() => {
-      if (window.history.length > 1) navigate(-1);
-      else navigate(backHref);
+      navigate(watchOrigin() ?? backHref);
       resetWindowScroll();
       requestAnimationFrame(resetWindowScroll);
     });
   }, [navigate, backHref, finishPlayback]);
 
-  const goNextEpisode = useCallback(() => {
+  // The credits prompt's Next episode: flush this episode's progress first,
+  // same as any other way of leaving the player.
+  const goToNextEpisode = useCallback(() => {
     if (!nextEpisode) return;
-    playerFlushRef.current?.();
-    navigate(
-      `/watch/tv/${mediaId}?season=${nextEpisode.season}&episode=${nextEpisode.episode}`,
-    );
-  }, [nextEpisode, mediaId, navigate]);
+    const target = nextEpisode;
+    void finishPlayback().finally(() => {
+      navigate(`/watch/tv/${mediaId}?season=${target.season}&episode=${target.episode}`);
+    });
+  }, [nextEpisode, finishPlayback, navigate, mediaId]);
+
+  // The credits window marks the title watched: persist the playhead at the
+  // end so a movie leaves Continue Watching and a show's resume resolves to
+  // the next episode. Reporting the end is idempotent — the stale-position
+  // guard keeps later ticks at the end too.
+  const markDoneAtCredits = useCallback(() => {
+    const duration = lastDurationRef.current || videoDurationHint || 0;
+    if (duration <= 0) return;
+    savePlaybackProgress(duration, duration, 0, false, true);
+  }, [videoDurationHint, savePlaybackProgress]);
 
   // Once this episode is actually loaded — even if play() never starts —
   // touch its history row so the title button reads Continue Sx Ex.
@@ -860,6 +935,21 @@ export function WatchScreen({
       {videoUrl && status === 'ready' ? (
         <div className="relative min-h-0 flex-1">
           <VideoPlayer
+          topRightControls={mediaType === 'tv' && season != null && episode != null && seasons?.length ? (
+            <PlayerEpisodes
+              showId={mediaId}
+              seasons={seasons}
+              season={season}
+              episode={episode}
+              open={episodesOpen}
+              onOpen={() => setEpisodesOpen(true)}
+              onClose={() => setEpisodesOpen(false)}
+              onNavigate={() => {
+                playerFlushRef.current?.();
+                setEpisodesOpen(false);
+              }}
+            />
+          ) : null}
           src={videoUrl}
           hls={videoIsHls}
           durationHint={videoDurationHint}
@@ -884,46 +974,15 @@ export function WatchScreen({
             if (activeSourceRef.current) rememberSource(itemKey, activeSourceRef.current);
           }}
           flushRef={playerFlushRef}
-          onNextEpisode={nextEpisode ? goNextEpisode : undefined}
-          playbackKey={mediaType === 'tv' ? itemKey : undefined}
-          creditsStartSeconds={mediaType === 'tv' ? knownCreditsStart : null}
-          onCreditsMapped={
-            mediaType === 'tv'
-              ? (seconds) => {
-                  if (seconds == null) {
-                    creditsStartRef.current = null;
-                    creditsClearedKey.current = itemKey;
-                    clearCreditsStart(itemKey);
-                    clearCreditsOnSave.current = true;
-                  } else {
-                    creditsClearedKey.current = null;
-                    creditsStartRef.current = seconds;
-                    if (creditsStartRef.current != null) {
-                      saveCreditsStart(itemKey, creditsStartRef.current);
-                    }
-                  }
-                  const duration = lastDurationRef.current || videoDurationHint;
-                  if (duration && duration > 1) {
-                    savePlaybackProgress(lastPositionRef.current, duration, 0, false, true);
-                  }
-                }
-              : undefined
-          }
-          onCreditsLog={
-            mediaType === 'tv'
-              ? (event, data) => {
-                  const connection = playbackConnection.current;
-                  if (!connection) return;
-                  const level = event.endsWith('_failed') || event.endsWith('_tainted')
-                    ? 'error'
-                    : 'info';
-                  shipClientLog(connection, level, event, data);
-                }
-              : undefined
-          }
+          introWindow={skipSegments?.intro ?? null}
+          creditsWindow={skipSegments?.credits ?? null}
+          onNextEpisode={nextEpisode ? goToNextEpisode : undefined}
+          onCreditsReached={markDoneAtCredits}
+          sections={skipSegments?.sections}
           onSeekIntent={recordSeekIntent}
           onSeekOutside={(target) => void requestRemuxSeek(target)}
           onError={() => {
+            if (cacheClearingRef.current) return;
             // Restarting ffmpeg for a seek kills the current playlist;
             // that looks identical to a dead source and must not fall
             // through to the next torrent at the old resume position.
@@ -973,6 +1032,7 @@ export function WatchScreen({
             }
           }}
           />
+
           {seekConverting ? (
             <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/60">
               <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
@@ -1023,6 +1083,7 @@ export function WatchScreen({
                     <button
                       type="button"
                       onClick={() => {
+                        cacheClearingRef.current = false;
                         failedSourcesRef.current.clear();
                         void start(sources, 0, true);
                       }}
@@ -1045,6 +1106,123 @@ export function WatchScreen({
       )}
 
     </div>
+  );
+}
+
+function PlayerEpisodes({
+  showId,
+  seasons,
+  season,
+  episode,
+  open,
+  onOpen,
+  onClose,
+  onNavigate,
+}: {
+  showId: number;
+  seasons: SeasonSummary[];
+  season: number;
+  episode: number;
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+  onNavigate: () => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLDialogElement>(null);
+  const wasOpenRef = useRef(false);
+  const [selectedSeason, setSelectedSeason] = useState(season);
+  const { library } = useCore();
+  // Ungated: the current season is usually warm from the mount prefetch, and
+  // switching seasons in the drawer fetches that season on demand.
+  const episodes = useQuery(tmdbQueries.season(showId, selectedSeason));
+
+  useEffect(() => setSelectedSeason(season), [season]);
+
+  useEffect(() => {
+    const dialog = drawerRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    if (!open && dialog.open) dialog.close();
+    if (!open && wasOpenRef.current) triggerRef.current?.focus();
+    wasOpenRef.current = open;
+  }, [open]);
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={triggerRef}
+        aria-label="Episodes"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={onOpen}
+        className="pointer-events-auto absolute right-4 top-4 z-20 flex h-10 cursor-pointer w-10 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-md transition-colors hover:bg-black/80 sm:right-6 sm:top-6"
+      >
+        <IoList size={21} />
+      </button>
+      {createPortal(
+        <dialog
+          ref={drawerRef}
+          data-player-episodes
+          onCancel={(event) => { event.preventDefault(); onClose(); }}
+          onClick={(event) => {
+            if (event.target === event.currentTarget && event.clientX < event.currentTarget.getBoundingClientRect().left) onClose();
+          }}
+          className="fixed inset-y-0 left-auto right-0 m-0 h-dvh cursor-auto max-h-none w-full max-w-md overflow-hidden border-0 bg-panel p-0 text-white shadow-[-24px_0_80px_rgba(0,0,0,0.55)] backdrop:bg-black/40"
+          role="dialog"
+          aria-label="Episodes"
+        >
+          <div className="flex items-center justify-between border-b border-white/10 px-5 py-5">
+            <div className="flex min-w-0 items-center gap-3">
+              <h2 className="text-lg font-semibold">Episodes</h2>
+              {seasons.length > 1 ? (
+                <Dropdown
+                  value={selectedSeason}
+                  options={seasons.map((entry) => ({
+                    value: entry.seasonNumber,
+                    label: entry.name || `Season ${entry.seasonNumber}`,
+                  }))}
+                  onChange={setSelectedSeason}
+                  ariaLabel="Season"
+                />
+              ) : null}
+            </div>
+            <button
+              type="button"
+              aria-label="Close episodes"
+              onClick={onClose}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-control hover:bg-control-hover"
+            >
+              <IoClose size={22} />
+            </button>
+          </div>
+          <div className="min-h-0 h-[calc(100%-81px)] overflow-y-auto p-3">
+            {episodes.error ? <p className="px-3 py-4 text-faint">Could not load that season.</p> : null}
+            {episodes.isPending ? <p className="px-3 py-4 text-faint">Loading episodes…</p> : null}
+            <ul className="m-0 list-none space-y-2 p-0">
+              {(episodes.data ?? []).map((entry: Episode) => (
+                <EpisodeRow
+                  key={entry.id}
+                  showId={showId}
+                  episode={entry}
+                  compact
+                  active={entry.seasonNumber === season && entry.episodeNumber === episode}
+                  watched={historyForEpisode(
+                    library?.history,
+                    showId,
+                    entry.seasonNumber,
+                    entry.episodeNumber,
+                  )}
+                  onNavigate={onNavigate}
+                />
+              ))}
+            </ul>
+          </div>
+        </dialog>,
+        document.body,
+      )}
+    </>
   );
 }
 

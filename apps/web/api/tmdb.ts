@@ -10,7 +10,9 @@ const TMDB_BASE = 'https://api.themoviedb.org/3';
 const ALLOWED_PATHS = [
   /^trending\/(movie|tv)\/(day|week)$/,
   /^(movie|tv)\/\d+$/,
+  /^(movie|tv)\/\d+\/(recommendations|similar)$/,
   /^(movie|tv)\/(now_playing|on_the_air|popular|top_rated)$/,
+  /^discover\/(movie|tv)$/,
   /^tv\/\d+\/season\/\d+$/,
   /^search\/(movie|tv|multi)$/,
 ];

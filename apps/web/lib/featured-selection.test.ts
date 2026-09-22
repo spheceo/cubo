@@ -43,6 +43,15 @@ test('titles older than a decade are not featured', () => {
   );
 });
 
+test('poorly rated titles only feature when nothing better is eligible', () => {
+  const acclaimed = title(1);
+  const panned = { ...title(2), voteAverage: 4.5 };
+  const unrated = { ...title(3), voteAverage: 0 };
+  assert.equal(pickFeatured([panned, acclaimed, unrated], [], 0)?.id, 1);
+  assert.equal(pickFeatured([panned, acclaimed, unrated], [], 0.99)?.id, 1);
+  assert.equal(pickFeatured([panned, unrated], [], 0)?.id, 2);
+});
+
 test('a featured title hangs across loads until the hold expires', () => {
   const candidates = [title(1), title(2), title(3)];
   const now = Date.parse('2026-09-10T12:00:00Z');

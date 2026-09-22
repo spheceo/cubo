@@ -9,7 +9,13 @@ import { useEffect, useRef, useState } from 'react';
 import { FaStar } from 'react-icons/fa';
 import { formatNextEpisodeLabel } from '@/lib/air-date';
 import { formatRuntime } from '@/lib/format';
-import { latestHistoryForTitle, playButtonLabel, watchLaterItem } from '@/lib/library';
+import {
+  completedNearEnd,
+  latestHistoryForTitle,
+  playButtonLabel,
+  watchLaterItem,
+} from '@/lib/library';
+import { resolveNextEpisode } from '@/lib/next-episode';
 import { AutoPreview } from './auto-preview';
 import { useCore } from './core-provider';
 import { EpisodeList } from './episode-list';
@@ -35,14 +41,23 @@ export function TitleDetail({
   const { library } = useCore();
   const resume = latestHistoryForTitle(library?.history, details.mediaType, details.id);
   const firstSeason = details.seasons[0]?.seasonNumber ?? 1;
-  const resumeSeason = resume?.season ?? firstSeason;
-  const resumeEpisode = resume?.episode ?? episodes[0]?.episodeNumber ?? 1;
+  // A finished episode's resume points at the next one — credits mark the
+  // episode done, so coming back to the show picks up where it continues.
+  const nextUp =
+    resume != null &&
+    resume.season != null &&
+    resume.episode != null &&
+    completedNearEnd(resume)
+      ? resolveNextEpisode(details.seasons, episodes, resume.season, resume.episode)
+      : null;
+  const resumeSeason = nextUp?.season ?? resume?.season ?? firstSeason;
+  const resumeEpisode = nextUp?.episode ?? episodes[0]?.episodeNumber ?? 1;
   const nextAirs = details.nextEpisode ? formatNextEpisodeLabel(details.nextEpisode) : null;
   const playHref =
     details.mediaType === 'tv'
       ? watchHref(details, resumeSeason, resumeEpisode)
       : watchHref(details);
-  const playLabel = playButtonLabel(details.mediaType, resume, firstSeason);
+  const playLabel = playButtonLabel(details.mediaType, nextUp ?? resume, firstSeason);
 
   return (
     <main className="h-dvh overflow-hidden bg-background text-white">

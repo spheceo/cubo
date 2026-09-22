@@ -210,7 +210,9 @@ pub fn tmdb_allowed(path: &str) -> bool {
     match parts.as_slice() {
         ["trending", "movie" | "tv", "day" | "week"] => true,
         ["movie" | "tv", id] if is_digits(id) => true,
+        ["movie" | "tv", id, "recommendations" | "similar"] if is_digits(id) => true,
         ["movie" | "tv", "now_playing" | "on_the_air" | "popular" | "top_rated"] => true,
+        ["discover", "movie" | "tv"] => true,
         ["tv", id, "season", season] if is_digits(id) && is_digits(season) => true,
         ["search", "movie" | "tv" | "multi"] => true,
         _ => false,
@@ -393,7 +395,13 @@ mod tests {
     fn tmdb_allowlist_matches_the_app() {
         assert!(tmdb_allowed("trending/movie/week"));
         assert!(tmdb_allowed("movie/550"));
+        assert!(tmdb_allowed("movie/550/recommendations"));
+        assert!(tmdb_allowed("tv/1396/similar"));
+        assert!(!tmdb_allowed("movie/550/credits"));
         assert!(tmdb_allowed("tv/1396/season/1"));
+        assert!(tmdb_allowed("discover/movie"));
+        assert!(tmdb_allowed("discover/tv"));
+        assert!(!tmdb_allowed("discover/multi"));
         assert!(tmdb_allowed("search/multi"));
         assert!(!tmdb_allowed("movie/550/credits"));
         assert!(!tmdb_allowed("configuration"));

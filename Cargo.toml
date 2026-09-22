@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.16"
+version = "0.0.17"
 edition = "2021"
 
 [workspace.dependencies]
@@ -25,8 +25,12 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 uuid = { version = "1", features = ["v4"] }
+bytes = "1"
 urlencoding = "2"
 sysinfo = "0.35"
+
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
 
 [profile.release]
 strip = true

@@ -1,5 +1,10 @@
-import { stillUrl, type Episode, type SeasonSummary } from '@cubo/core';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import {
+  stillUrl,
+  type Episode,
+  type LibraryItem,
+  type SeasonSummary,
+} from '@cubo/core';
+import { useQuery } from '@tanstack/react-query';
 import gsap from 'gsap';
 import { useRef, useState } from 'react';
 import { IoCalendarOutline, IoCheckmark, IoClose, IoList } from 'react-icons/io5';
@@ -34,10 +39,9 @@ export function EpisodeList({
       season === initialSeason && initialEpisodes && initialEpisodes.length > 0
         ? initialEpisodes
         : undefined,
-    placeholderData: keepPreviousData,
   });
   const episodes = seasonQuery.data ?? [];
-  const loading = seasonQuery.isFetching && seasonQuery.isPlaceholderData;
+  const loading = seasonQuery.isPending;
   const error = seasonQuery.error ? 'Could not load that season.' : null;
 
   function selectSeason(next: number) {
@@ -146,80 +150,22 @@ export function EpisodeList({
 
           <div className="min-h-0 flex-1 touch-pan-y overflow-y-scroll overscroll-contain p-3 [-webkit-overflow-scrolling:touch] sm:p-5">
             {error ? <p className="px-3 py-4 text-faint">{error}</p> : null}
+            {loading ? <p role="status" className="px-3 py-4 text-faint">Loading episodes…</p> : null}
 
             <ul className={`m-0 list-none space-y-2 p-0 ${loading ? 'opacity-40' : ''}`}>
-              {episodes.map((episode) => {
-                const still = stillUrl(episode.stillPath, 'w300');
-                const airs = formatNextEpisodeLabel(episode);
-                const watched = historyForEpisode(
-                  library?.history,
-                  showId,
-                  episode.seasonNumber,
-                  episode.episodeNumber,
-                );
-                const progress = watched
-                  ? Math.min(1, watched.completed ? 1 : watched.progress)
-                  : 0;
-                return (
-                  <li key={episode.id}>
-                    <Link
-                      href={`/watch/tv/${showId}?season=${episode.seasonNumber}&episode=${episode.episodeNumber}`}
-                      className="group flex gap-4 rounded-xl p-3 transition-colors hover:bg-control"
-                    >
-                      <div className="relative aspect-video w-32 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-surface sm:w-44">
-                        {still ? (
-                          <img
-                            src={still}
-                            alt=""
-                            loading="lazy"
-                            className={`h-full w-full object-cover transition-transform duration-300 group-hover:scale-105 ${
-                              watched?.completed ? 'opacity-70' : ''
-                            }`}
-                          />
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center">
-                            <IoCalendarOutline
-                              size={28}
-                              className="text-white/20"
-                              aria-hidden
-                            />
-                          </div>
-                        )}
-                        {watched?.completed ? (
-                          <div
-                            className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-white"
-                            aria-label="Watched"
-                          >
-                            <IoCheckmark size={15} />
-                          </div>
-                        ) : progress > 0 ? (
-                          <div
-                            className="absolute inset-x-0 bottom-0 h-1 bg-black/45"
-                            aria-hidden
-                          >
-                            <div
-                              className="h-full bg-star"
-                              style={{ width: `${Math.max(4, Math.round(progress * 100))}%` }}
-                            />
-                          </div>
-                        ) : null}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-baseline gap-2">
-                          <span className="text-sm text-faint">E{episode.episodeNumber}</span>
-                          <p className="truncate font-semibold">{episode.name}</p>
-                        </div>
-                        {airs ? (
-                          <p className="mt-1 text-sm text-white/70">{airs}</p>
-                        ) : null}
-                        <p className="mt-2 line-clamp-2 text-sm leading-6 text-white/60">
-                          {episode.overview || 'No description available.'}
-                        </p>
-                      </div>
-                    </Link>
-                  </li>
-                );
-              })}
+              {episodes.map((episode) => (
+                <EpisodeRow
+                  key={episode.id}
+                  showId={showId}
+                  episode={episode}
+                  watched={historyForEpisode(
+                    library?.history,
+                    showId,
+                    episode.seasonNumber,
+                    episode.episodeNumber,
+                  )}
+                />
+              ))}
             </ul>
 
             {!loading && episodes.length === 0 ? (
@@ -229,5 +175,84 @@ export function EpisodeList({
         </section>
       </dialog>
     </>
+  );
+}
+
+/** One episode with its still, watch progress, and air date. Shared by the
+ *  detail-page dialog and the in-player drawer (`compact` for the latter). */
+export function EpisodeRow({
+  showId,
+  episode,
+  watched,
+  active = false,
+  compact = false,
+  onNavigate,
+}: {
+  showId: number;
+  episode: Episode;
+  watched?: LibraryItem;
+  active?: boolean;
+  compact?: boolean;
+  onNavigate?: () => void;
+}) {
+  const still = stillUrl(episode.stillPath, 'w300');
+  const airs = formatNextEpisodeLabel(episode);
+  const progress = watched ? Math.min(1, watched.completed ? 1 : watched.progress) : 0;
+  return (
+    <li>
+      <Link
+        href={`/watch/tv/${showId}?season=${episode.seasonNumber}&episode=${episode.episodeNumber}`}
+        onClick={onNavigate}
+        className={`group flex rounded-xl transition-colors hover:bg-control ${
+          compact ? 'gap-3 p-2.5' : 'gap-4 p-3'
+        } ${active ? 'bg-control' : ''}`}
+      >
+        <div
+          className={`relative aspect-video shrink-0 overflow-hidden rounded-xl border bg-surface ${
+            compact ? 'w-28 border-white/10' : 'w-32 border-white/10 sm:w-44'
+          }`}
+        >
+          {still ? (
+            <img
+              src={still}
+              alt=""
+              loading="lazy"
+              className={`h-full w-full object-cover transition-transform duration-300 group-hover:scale-105 ${
+                watched?.completed ? 'opacity-70' : ''
+              }`}
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center">
+              <IoCalendarOutline size={28} className="text-white/20" aria-hidden />
+            </div>
+          )}
+          {watched?.completed ? (
+            <div
+              className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-white"
+              aria-label="Watched"
+            >
+              <IoCheckmark size={15} />
+            </div>
+          ) : progress > 0 ? (
+            <div className="absolute inset-x-0 bottom-0 h-1 bg-black/45" aria-hidden>
+              <div
+                className="h-full bg-star"
+                style={{ width: `${Math.max(4, Math.round(progress * 100))}%` }}
+              />
+            </div>
+          ) : null}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline gap-2">
+            <span className="text-sm text-faint">E{episode.episodeNumber}</span>
+            <p className="truncate font-semibold">{episode.name}</p>
+          </div>
+          {airs ? <p className="mt-1 text-sm text-white/70">{airs}</p> : null}
+          <p className="mt-2 line-clamp-2 text-sm leading-6 text-white/60">
+            {episode.overview || 'No description available.'}
+          </p>
+        </div>
+      </Link>
+    </li>
   );
 }

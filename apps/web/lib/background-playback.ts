@@ -13,6 +13,7 @@ let timerWorker: Worker | null = null;
 /** True only when we muted to satisfy autoplay policy — never the viewer's mute. */
 let autoplayMuted = false;
 let unlockUnmute: (() => void) | null = null;
+let unlockVideo: HTMLVideoElement | null = null;
 
 function audioContext(): AudioContext | null {
   const Ctor =
@@ -105,6 +106,7 @@ export function isWatchHref(href: string): boolean {
 /** The viewer chose mute — do not treat it as an autoplay unlock. */
 export function cancelAutoplayUnmute(): void {
   autoplayMuted = false;
+  unlockVideo = null;
   if (!unlockUnmute) return;
   window.removeEventListener('pointerdown', unlockUnmute, true);
   window.removeEventListener('keydown', unlockUnmute, true);
@@ -127,7 +129,10 @@ export async function playInBackground(
     try {
       await video.play();
       if (cancelled()) return;
-      if (autoplayMuted && !userMuted()) unmuteWhenPossible(video);
+      if (video.muted && !userMuted()) {
+        autoplayMuted = true;
+        unmuteWhenPossible(video);
+      }
       onResult(false);
       releaseWatchKeepalive();
       return;
@@ -163,17 +168,21 @@ export async function playInBackground(
 /** First click/key after a muted autoplay unlocks sound. */
 function unmuteWhenPossible(video: HTMLVideoElement): void {
   if (!autoplayMuted || !video.muted) return;
-  video.muted = false;
-  if (!video.muted) {
-    cancelAutoplayUnmute();
-    return;
+  if (unlockUnmute && unlockVideo === video) return;
+  if (unlockUnmute) {
+    window.removeEventListener('pointerdown', unlockUnmute, true);
+    window.removeEventListener('keydown', unlockUnmute, true);
   }
-  if (unlockUnmute) return;
+  // Setting muted=false succeeds even when autoplay policy then pauses the
+  // element. Testing the property immediately used to cause an endless
+  // mute → play → unmute → pause loop and accelerated playback in Chrome.
+  // Only a real user interaction should unlock sound after policy fallback.
   const unlock = () => {
     if (!autoplayMuted) return;
-    video.muted = false;
+    if (video.isConnected) video.muted = false;
     cancelAutoplayUnmute();
   };
+  unlockVideo = video;
   unlockUnmute = unlock;
   window.addEventListener('pointerdown', unlock, true);
   window.addEventListener('keydown', unlock, true);

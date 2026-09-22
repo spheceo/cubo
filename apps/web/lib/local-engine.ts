@@ -7,6 +7,7 @@ import type {
   WatchLaterItem,
 } from '@cubo/core';
 import { delayUnthrottled } from '@/lib/background-playback';
+import { announceCacheClear } from './cache-events';
 
 export const CORE_PORT = 8765;
 const DISCOVERY_TIMEOUT_MS = 4_000;
@@ -110,7 +111,6 @@ export interface PlaybackUpdate {
   sessionStarted: boolean;
   watchHref: string;
   detailHref: string;
-  creditsStartSeconds?: number | null;
 }
 
 export interface CacheStatus {
@@ -558,6 +558,125 @@ export async function getSubtitleMatch(
   }
 }
 
+export interface SkipSegmentWindow {
+  /** Absolute seconds into the media where the segment starts. */
+  start: number;
+  /** Absolute end, or null when the segment runs to the end of the file. */
+  end: number | null;
+  /** Where the timing came from: container chapters or a crowdsourced API. */
+  source?: string;
+}
+
+/** One declared section of the media — a container chapter or a
+ *  crowd-sourced window — for the dev timeline overlay. */
+export interface SkipSection {
+  start: number;
+  end: number | null;
+  /** intro | credits | recap | preview | postcredits | chapter */
+  kind: string;
+  label: string;
+  source?: string;
+}
+
+export interface SkipSegments {
+  intro: SkipSegmentWindow | null;
+  credits: SkipSegmentWindow | null;
+  /** Every section Core could classify — powers the dev timeline bands. */
+  sections: SkipSection[];
+}
+
+/** Intro/credits windows for the playing file. Core reads named container
+ *  chapters first, then falls back to TheIntroDB/IntroDB. Returns null when
+ *  nothing is known (or the running Core predates the endpoint) — callers
+ *  should simply hide skip UI rather than treat it as an error. */
+export async function getSkipSegments(
+  engine: LocalEngineConnection,
+  query: {
+    torrent: string;
+    file: number;
+    type: MediaType;
+    tmdbId?: number;
+    imdbId?: string | null;
+    season?: number;
+    episode?: number;
+  },
+  signal?: AbortSignal,
+): Promise<SkipSegments | null> {
+  try {
+    const params = new URLSearchParams({
+      torrent: query.torrent,
+      file: String(query.file),
+      type: query.type,
+    });
+    if (query.tmdbId) params.set('tmdb', String(query.tmdbId));
+    if (query.imdbId) params.set('imdb', query.imdbId);
+    if (query.season) params.set('season', String(query.season));
+    if (query.episode) params.set('episode', String(query.episode));
+    const response = await engineFetch(
+      engine,
+      `/v1/skip-segments?${params}`,
+      { signal },
+    );
+    if (!response.ok) return null;
+    const body = (await response.json()) as {
+      intro?: { start?: number; end?: number | null; source?: string } | null;
+      credits?: { start?: number; end?: number | null; source?: string } | null;
+      sections?: {
+        start?: number;
+        end?: number | null;
+        kind?: string;
+        label?: string;
+        source?: string;
+      }[];
+    };
+    const window = (
+      segment: { start?: number; end?: number | null; source?: string } | null | undefined,
+    ): SkipSegmentWindow | null => {
+      const start = segment?.start;
+      if (typeof start !== 'number' || !Number.isFinite(start) || start < 0) {
+        return null;
+      }
+      const end = segment?.end;
+      return {
+        start,
+        end:
+          typeof end === 'number' && Number.isFinite(end) && end > start
+            ? end
+            : null,
+        source: segment?.source,
+      };
+    };
+    const sections = (body.sections ?? []).flatMap((section): SkipSection[] => {
+      const start = section.start;
+      const kind = section.kind;
+      if (
+        typeof start !== 'number' ||
+        !Number.isFinite(start) ||
+        start < 0 ||
+        typeof kind !== 'string'
+      ) {
+        return [];
+      }
+      const end = section.end;
+      return [
+        {
+          start,
+          end:
+            typeof end === 'number' && Number.isFinite(end) && end > start
+              ? end
+              : null,
+          kind,
+          label: section.label || kind,
+          source: section.source,
+        },
+      ];
+    });
+    return { intro: window(body.intro), credits: window(body.credits), sections };
+  } catch {
+    return null;
+  }
+}
+
 export function hlsPlaylistUrl(
   engine: LocalEngineConnection,
   idOrHash: number | string,
@@ -783,8 +902,9 @@ async function readEngineError(response: Response, fallback: string): Promise<st
 }
 
 export async function clearCache(engine: LocalEngineConnection): Promise<void> {
+  announceCacheClear(engine.baseUrl);
   const response = await engineFetch(engine, '/v1/cache', { method: 'DELETE' });
-  if (!response.ok) throw new Error(`Could not clear the cache (${response.status})`);
+  if (!response.ok) throw new Error(await readEngineError(response, 'Could not clear the cache'));
 }
 
 export async function deleteCacheItem(
@@ -796,7 +916,7 @@ export async function deleteCacheItem(
     `/v1/cache/${encodeURIComponent(String(idOrHash))}`,
     { method: 'DELETE' },
   );
-  if (!response.ok) throw new Error(`Could not remove the cached video (${response.status})`);
+  if (!response.ok) throw new Error(await readEngineError(response, 'Could not remove the cached video'));
 }
 
 function engineFetch(

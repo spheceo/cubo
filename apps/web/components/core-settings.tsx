@@ -6,6 +6,7 @@ import {
   IoSpeedometer,
   IoTrash,
 } from 'react-icons/io5';
+import { useCacheStatus } from '@/lib/use-cache-status';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { Dropdown } from '@/components/dropdown';
 import { FolderPicker } from '@/components/folder-picker';
@@ -16,14 +17,12 @@ import {
   currentOriginCoreEndpoint,
   deleteCacheItem,
   discoverLocalEngine,
-  getCacheStatus,
   getSystemStats,
   normalizeCoreEndpoint,
   pairWithCore,
   PairingRequiredError,
   updateCacheDirectory,
   updateCacheLimit,
-  type CacheStatus,
   type LocalEngineConnection,
   type SystemStats,
 } from '@/lib/local-engine';
@@ -470,8 +469,9 @@ function ConnectionPane({
 
 /** Everything stored on the Core machine: cache budget, folder and contents. */
 function StorageSection({ connection }: { connection: LocalEngineConnection }) {
-  const [cache, setCache] = useState<CacheStatus | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const { data: cache, isPending, refetch } = useCacheStatus(connection);
+  const loaded = !isPending;
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [confirmingDirectory, setConfirmingDirectory] = useState(false);
@@ -480,25 +480,22 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
   const [directoryError, setDirectoryError] = useState<string | null>(null);
 
   const loadCache = useCallback(async () => {
-    try {
-      const next = await getCacheStatus(connection);
-      setCache(next);
-      setDirectoryDraft(next.directory);
-    } catch {
-      setCache(null);
-    } finally {
-      setLoaded(true);
-    }
-  }, [connection]);
+    const result = await refetch({ cancelRefetch: true });
+    if (result.error) setStorageError('Could not refresh storage usage. Please try again.');
+  }, [refetch]);
 
   useEffect(() => {
-    void loadCache();
-  }, [loadCache]);
+    if (cache?.directory) setDirectoryDraft(cache.directory);
+  }, [cache?.directory]);
 
   async function changeLimit(gigabytes: number) {
     setBusy(true);
+    setStorageError(null);
     try {
       await updateCacheLimit(connection, gigabytes * GIGABYTE);
+      await loadCache();
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : 'Could not update storage. Please try again.');
       await loadCache();
     } finally {
       setBusy(false);
@@ -507,8 +504,12 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
 
   async function removeCache(id: string | number) {
     setBusy(true);
+    setStorageError(null);
     try {
       await deleteCacheItem(connection, id);
+      await loadCache();
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : 'Could not update storage. Please try again.');
       await loadCache();
     } finally {
       setBusy(false);
@@ -517,8 +518,12 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
 
   async function removeAllCache() {
     setBusy(true);
+    setStorageError(null);
     try {
       await clearCache(connection);
+      await loadCache();
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : 'Could not update storage. Please try again.');
       await loadCache();
     } finally {
       setBusy(false);
@@ -545,9 +550,9 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
   return (
     <div className="space-y-6">
       <p className="leading-7 text-white/60">
-        Cubo downloads the title you&rsquo;re watching and pauses anything else.
-        10 GB is the recommended cache size. Background downloads also stop
-        when this computer has only 10 GB free.
+        Cubo keeps temporary video files within this limit and makes room as you
+        watch. Recent footage stays available for rewinding; older footage is
+        downloaded again when needed. Clearing the cache stops current playback.
       </p>
 
       <div className="space-y-5 rounded-2xl bg-[#25252570] p-5 backdrop-blur" aria-busy={!loaded}>
@@ -561,7 +566,7 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
             )}
           </div>
           <div className="text-right text-sm text-faint">
-            Maximum
+            Storage limit
             <Dropdown
               value={cache ? Math.round(cache.maxBytes / GIGABYTE) : RECOMMENDED_CACHE_GB}
               options={CACHE_OPTIONS.map((option) => ({
@@ -571,7 +576,7 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
               }))}
               disabled={busy || !cache}
               onChange={(gigabytes) => void changeLimit(gigabytes)}
-              ariaLabel="Maximum cache size"
+              ariaLabel="Cache storage limit"
               className="mt-2"
             />
           </div>
@@ -638,7 +643,7 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
             <button
               type="button"
               onClick={() => setConfirmingClear(true)}
-              disabled={busy || !cache?.itemCount}
+              disabled={busy || !cache || (cache.itemCount === 0 && cache.usedBytes === 0)}
               className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-control px-4 py-2 text-sm text-white transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-35"
             >
               <IoTrash size={15} />
@@ -668,10 +673,12 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
         ) : null}
       </div>
 
+      {storageError ? <p role="alert" className="text-sm text-white/70">{storageError}</p> : null}
+
       {confirmingClear ? (
         <ConfirmDialog
           title="Clear the content cache?"
-          description="All locally cached video will be removed. Titles will need to buffer again the next time you watch them."
+          description="Current downloads and video conversion will stop, and all temporary video files will be removed. Any playing title will need to be reopened. Your watch history stays saved."
           confirmLabel="Clear cache"
           onCancel={() => setConfirmingClear(false)}
           onConfirm={() => {

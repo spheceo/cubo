@@ -15,22 +15,6 @@ export function playbackKey(
   return [mediaType, mediaId, season ?? '-', episode ?? '-'].join(':');
 }
 
-export function nextEpisodeTarget(
-  seasons: { seasonNumber: number; episodeCount: number }[],
-  season: number,
-  episode: number,
-): { season: number; episode: number } | null {
-  const ordered = seasons
-    .filter((entry) => entry.seasonNumber > 0 && entry.episodeCount > 0)
-    .sort((a, b) => a.seasonNumber - b.seasonNumber);
-  const current = ordered.find((entry) => entry.seasonNumber === season);
-  if (current && episode < current.episodeCount) {
-    return { season, episode: episode + 1 };
-  }
-  const following = ordered.find((entry) => entry.seasonNumber > season);
-  return following ? { season: following.seasonNumber, episode: 1 } : null;
-}
-
 export function episodeLabel(season?: number | null, episode?: number | null): string | null {
   if (season == null || episode == null) return null;
   return `S${season} E${episode}`;
@@ -95,14 +79,35 @@ export function latestItemsByTitle(
 
 /** Skip accidental opens (player start at 0, immediate back). */
 export const CONTINUE_WATCHING_MIN_SECONDS = 5;
+export const CONTINUE_WATCHING_COMPLETION_PROGRESS = 0.98;
+export const CONTINUE_WATCHING_COMPLETION_REMAINING_SECONDS = 60;
+
+/** Completion is deliberately based on the absolute tail of the title as
+ * well as its ratio. This keeps a long film visible until its final minute,
+ * and makes old rows with Core's former 90% flag behave sensibly. */
+export function completedNearEnd(item: LibraryItem): boolean {
+  return (
+    item.progress >= CONTINUE_WATCHING_COMPLETION_PROGRESS &&
+    item.durationSeconds - item.positionSeconds <= CONTINUE_WATCHING_COMPLETION_REMAINING_SECONDS
+  );
+}
 
 /** One card per title — always the last season/episode touched. */
 export function continueWatchingItems(
   history: LibraryItem[] | undefined,
   mediaType?: MediaType,
 ): LibraryItem[] {
-  return latestItemsByTitle(history, mediaType)
-    .filter((item) => item.positionSeconds >= CONTINUE_WATCHING_MIN_SECONDS && item.progress < 0.9)
+  // A brief open must not replace a meaningful resume for the same title.
+  // Completion is checked only after grouping so a completed current episode
+  // still suppresses older abandoned episodes.
+  return latestItemsByTitle(
+    (history ?? []).filter((item) => item.positionSeconds >= CONTINUE_WATCHING_MIN_SECONDS),
+    mediaType,
+  )
+    .filter((item) =>
+      item.durationSeconds > 0 &&
+      !completedNearEnd(item),
+    )
     .slice(0, 8);
 }
 

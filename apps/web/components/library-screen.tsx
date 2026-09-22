@@ -1,11 +1,11 @@
 import type { MediaSummary, WatchLaterItem } from '@cubo/core';
 import { MediaCard } from '@cubo/ui';
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { ContinueWatching } from '@/components/continue-watching';
 import { Link } from '@/components/link';
 import { asMediaSummary } from '@/lib/format';
 import { watchHistoryItems } from '@/lib/library';
-import { getCacheStatus, type CacheStatus } from '@/lib/local-engine';
+import { useCacheStatus } from '@/lib/use-cache-status';
 import { useCore } from './core-provider';
 
 const GIGABYTE = 1024 ** 3;
@@ -17,24 +17,11 @@ const GIGABYTE = 1024 ** 3;
  */
 export function LibraryScreen() {
   const core = useCore();
-  const [cache, setCache] = useState<CacheStatus | null>(null);
-
-  const loadCache = useCallback(async () => {
-    if (!core.connection) return;
-    try {
-      setCache(await getCacheStatus(core.connection));
-    } catch {
-      setCache(null);
-    }
-  }, [core.connection]);
+  const { data: cache } = useCacheStatus(core.connection);
 
   useEffect(() => {
     void core.refreshLibrary();
   }, [core.refreshLibrary]);
-
-  useEffect(() => {
-    void loadCache();
-  }, [loadCache]);
 
   if (core.connection && !core.library) {
     return <main className="min-h-dvh bg-background" aria-busy="true" />;

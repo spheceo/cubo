@@ -28,7 +28,7 @@ import {
   MdPictureInPictureAlt,
 } from 'react-icons/md';
 import { IoIosArrowBack } from 'react-icons/io';
-import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type MutableRefObject } from 'react';
 import type { CaptionColor, CaptionSize } from '@/lib/caption-prefs';
 import { CAPTION_COLORS } from '@/lib/caption-prefs';
 import {
@@ -37,17 +37,27 @@ import {
   type FramingMode,
 } from '@/lib/framing-prefs';
 import { cancelAutoplayUnmute, playInBackground } from '@/lib/background-playback';
+import {
+  loadSectionPrefs,
+  saveSectionPrefs,
+  sectionColorMap,
+  SECTION_FALLBACK_COLOR,
+  type SectionKind,
+  type SectionPrefs,
+} from '@/lib/section-prefs';
 import { logoUrl } from '@cubo/core';
 import { findActiveCue, loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
-import { nextEpisodeDue, normalizeCreditsStart, startCreditsMapper, creditsOverlayActive } from '@/lib/credits-detect';
+import { REMUX_HLS_CONFIG } from '@/lib/remux-hls-config';
+import type { SkipSection } from '@/lib/local-engine';
 
 const HIDE_DELAY_MS = 2600;
 const SKIP_SECONDS = 10;
-const AUTO_NEXT_MS = 5_000;
+/** Seconds the Next episode fill takes to complete before auto-advancing. */
+const AUTO_NEXT_MS = 6_000;
 
 type BufferedRange = {
   start: number;
@@ -65,26 +75,6 @@ function timeRangesCover(ranges: TimeRanges, time: number, slack = 0.35): boolea
     }
   }
   return false;
-}
-
-/**
- * TODO(refresh-remux-autoplay): a document reload of /watch must not call
- * play() on its own. In-app Play (Home → Watch) is fine — that click is a
- * user gesture and remuxed HLS starts cleanly. A refresh is not: Core's
- * growing EVENT playlist looks live to hls.js, and unmuted/muted autoplay
- * on reload rushes or snaps toward the converted edge (~2×), then later
- * attempts to pin currentTime fought the player and stuttered in place.
- *
- * Workaround: hold for a Play click after reload. Come back to this when
- * remuxed HLS can start at playlist time 0 at 1× without a gesture.
- * Failed approaches: pending-seek servo, startLoad() (rejoins live edge),
- * wall-clock playhead pin (seeks against itself).
- */
-function isDocumentReload(): boolean {
-  const entry = performance.getEntriesByType('navigation')[0] as
-    | PerformanceNavigationTiming
-    | undefined;
-  return entry?.type === 'reload';
 }
 
 export type PlayerSubtitle = {
@@ -120,12 +110,25 @@ export function VideoPlayer({
   onPlaying,
   onError,
   flushRef,
+  topRightControls,
+  introWindow,
+  creditsWindow,
   onNextEpisode,
-  playbackKey,
-  creditsStartSeconds = null,
-  onCreditsMapped,
-  onCreditsLog,
+  onCreditsReached,
+  sections,
 }: {
+  topRightControls?: ReactNode;
+  /** Detected intro window in absolute source seconds. A Skip intro button
+   *  shows while the playhead is inside it; `end` null means unbounded. */
+  introWindow?: { start: number; end: number | null } | null;
+  /** Detected credits/outro window in absolute source seconds. */
+  creditsWindow?: { start: number; end: number | null } | null;
+  /** Offered during the credits window when a follow-up episode exists. */
+  onNextEpisode?: () => void;
+  /** Fired once when the playhead first enters the credits window. */
+  onCreditsReached?: () => void;
+  /** Every classified section, drawn as colored bands on the scrub bar. */
+  sections?: SkipSection[];
   src: string;
   /** True when `src` is an HLS playlist from Core's remux pipeline. */
   hls?: boolean;
@@ -173,12 +176,6 @@ export function VideoPlayer({
   /** Parent calls this before leaving so progress is snapshotted while the
    *  video element still has a real currentTime. */
   flushRef?: MutableRefObject<(() => void) | null>;
-  /** Shown only after end credits were mapped for this episode. */
-  onNextEpisode?: () => void;
-  playbackKey?: string;
-  creditsStartSeconds?: number | null;
-  onCreditsMapped?: (seconds: number | null) => void;
-  onCreditsLog?: (event: string, data?: Record<string, unknown>) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -196,11 +193,15 @@ export function VideoPlayer({
   /** One-shot local seek (seek-restart catch-up), applied per source. */
   const localSeekApplied = useRef<string | null>(null);
   /** False only when the viewer hit pause — browsers pausing a hidden tab
-   *  must not stick. Seeded true on document reload (see isDocumentReload). */
-  const reloadHoldRef = useRef(isDocumentReload());
-  const userPaused = useRef(reloadHoldRef.current);
+   *  must not stick. A new source starts unpaused. */
+  const userPaused = useRef(false);
   /** Bumps to cancel an in-flight hidden-tab play() retry loop. */
   const playGeneration = useRef(0);
+  /** Prevent a teardown/attach pause from immediately restarting playback. */
+  const sourceReadyRef = useRef(false);
+  /** Absolute source time before which Core has evicted remux segments. */
+  const retainedWindowStartRef = useRef<number | null>(null);
+  const remuxEvictionHandledRef = useRef(false);
 
   // Framing preference is player-global (like a TV picture-size setting):
   // it follows the viewer across titles, so the player owns it directly.
@@ -208,6 +209,26 @@ export function VideoPlayer({
   const pickFraming = useCallback((mode: FramingMode) => {
     setFraming(mode);
     saveFramingPref(mode);
+  }, []);
+
+  // Section markers on the timeline are a viewer pref like framing —
+  // detection and skip actions are unaffected, this only hides the bands.
+  const [sectionPrefs, setSectionPrefs] = useState<SectionPrefs>(() => loadSectionPrefs());
+  const showSections = sectionPrefs.visible;
+  const sectionColors = useMemo(() => sectionColorMap(sectionPrefs), [sectionPrefs]);
+  const toggleSections = useCallback((visible: boolean) => {
+    setSectionPrefs((prev) => {
+      const next = { ...prev, visible };
+      saveSectionPrefs(next);
+      return next;
+    });
+  }, []);
+  const pickSectionColor = useCallback((kind: SectionKind, color: string) => {
+    setSectionPrefs((prev) => {
+      const next = { ...prev, colors: { ...prev.colors, [kind]: color } };
+      saveSectionPrefs(next);
+      return next;
+    });
   }, []);
 
   const goBack = useCallback(() => {
@@ -221,8 +242,7 @@ export function VideoPlayer({
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(true);
   const [blocked, setBlocked] = useState(false);
-  const [heldPaused, setHeldPaused] = useState(() => reloadHoldRef.current);
-  const [reloadHold, setReloadHold] = useState(() => reloadHoldRef.current);
+  const [heldPaused, setHeldPaused] = useState(false);
   /** Absolute time the viewer asked for. Held until the source can actually
    *  sit there, so the needle does not snap back to the converted window. */
   const [pendingSeek, setPendingSeek] = useState<number | null>(null);
@@ -243,10 +263,6 @@ export function VideoPlayer({
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
   const [pipSupported, setPipSupported] = useState(false);
   const [activeCueText, setActiveCueText] = useState<string | null>(null);
-  const [creditsStart, setCreditsStart] = useState<number | null>(
-    normalizeCreditsStart(creditsStartSeconds),
-  );
-  const [watchingCredits, setWatchingCredits] = useState(false);
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
 
@@ -258,14 +274,6 @@ export function VideoPlayer({
   onSeekOutsideRef.current = onSeekOutside;
   const timeOffsetRef = useRef(timeOffset);
   timeOffsetRef.current = timeOffset;
-  const durationRef = useRef(duration);
-  durationRef.current = duration;
-  const creditsStartRef = useRef(creditsStart);
-  creditsStartRef.current = creditsStart;
-  const onCreditsMappedRef = useRef(onCreditsMapped);
-  onCreditsMappedRef.current = onCreditsMapped;
-  const onCreditsLogRef = useRef(onCreditsLog);
-  onCreditsLogRef.current = onCreditsLog;
 
   // Subtitles are rendered by Cubo, not the browser's native track layer:
   // cues are timed against the original file, so they are looked up against
@@ -517,12 +525,6 @@ export function VideoPlayer({
     setHeldPaused(paused);
   }, []);
 
-  const releaseReloadHold = useCallback(() => {
-    if (!reloadHoldRef.current) return;
-    reloadHoldRef.current = false;
-    setReloadHold(false);
-  }, []);
-
   const requestPlay = useCallback((video: HTMLVideoElement) => {
     if (userPaused.current || video.ended) return;
     const generation = ++playGeneration.current;
@@ -578,29 +580,32 @@ export function VideoPlayer({
     setBufferedRanges([]);
     setWaiting(true);
     setBlocked(false);
-    if (!reloadHoldRef.current) markUserPaused(false);
+    markUserPaused(false);
     pendingSeekRef.current = null;
     pendingSeekKickedRef.current = false;
     setPendingSeek(null);
+    retainedWindowStartRef.current = null;
+    remuxEvictionHandledRef.current = false;
   }, [src, hls, durationHint, markUserPaused]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
+    sourceReadyRef.current = false;
     let cancelled = false;
     const start = () => {
-      // Reload hold: wait for Play. Auto-starting remuxed HLS here is the
-      // refresh rush — see isDocumentReload().
-      if (cancelled || userPaused.current || reloadHoldRef.current) return;
+      if (cancelled || userPaused.current) return;
       requestPlay(video);
     };
 
     if (!hls) {
       video.src = src;
+      sourceReadyRef.current = true;
       start();
       return () => {
         cancelled = true;
+        sourceReadyRef.current = false;
         stopPlayLoop();
         video.removeAttribute('src');
       };
@@ -620,20 +625,48 @@ export function VideoPlayer({
         return;
       }
       instance = new Hls({
-        startPosition: 0,
-        lowLatencyMode: false,
-        maxLiveSyncPlaybackRate: 1,
+        ...REMUX_HLS_CONFIG,
+        xhrSetup: (xhr, url) => {
+          if (!url.includes('/media.m3u8')) return;
+          const readWindowStart = () => {
+            if (xhr.readyState < XMLHttpRequest.HEADERS_RECEIVED) return;
+            const value = Number(xhr.getResponseHeader('X-Cubo-Window-Start'));
+            if (Number.isFinite(value) && value >= 0) {
+              retainedWindowStartRef.current = value;
+            }
+          };
+          xhr.addEventListener('readystatechange', readWindowStart);
+        },
       });
       instance.loadSource(src);
       instance.attachMedia(video);
-      instance.on(Hls.Events.MANIFEST_PARSED, start);
+      instance.on(Hls.Events.MANIFEST_PARSED, () => {
+        sourceReadyRef.current = true;
+        start();
+      });
       instance.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) onErrorRef.current();
+        // A retained-window eviction is a same-source remux restart. Let the
+        // owner restart at the current absolute playhead instead of falling
+        // through to source fallback.
+        if (
+          data.response?.code === 410 &&
+          !remuxEvictionHandledRef.current &&
+          onSeekOutsideRef.current
+        ) {
+          remuxEvictionHandledRef.current = true;
+          const absolute =
+            pendingSeekRef.current ?? timeOffsetRef.current + video.currentTime;
+          onSeekOutsideRef.current(absolute);
+          return;
+        }
+        if (!data.fatal) return;
+        onErrorRef.current();
       });
     });
 
     return () => {
       cancelled = true;
+      sourceReadyRef.current = false;
       stopPlayLoop();
       instance?.destroy();
     };
@@ -643,7 +676,7 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
     const resumeIfNeeded = () => {
-      if (reloadHoldRef.current || userPaused.current || !video.paused || video.ended) {
+      if (userPaused.current || !video.paused || video.ended) {
         return;
       }
       requestPlay(video);
@@ -676,60 +709,95 @@ export function VideoPlayer({
   }, [settingsOpen]);
 
   const shownTime = scrubTime ?? pendingSeek ?? timeOffset + currentTime;
-  const showNextEpisode = Boolean(onNextEpisode) && nextEpisodeDue(shownTime, duration, creditsStart);
-  const creditsOverlay = creditsOverlayActive(showNextEpisode, watchingCredits);
-  const keepControls = !creditsOverlay && (settingsOpen || heldPaused || blocked || reloadHold);
-  const creditsOverlayRef = useRef(creditsOverlay);
-  creditsOverlayRef.current = creditsOverlay;
 
+  const [creditsDismissed, setCreditsDismissed] = useState(false);
+  // An intro with no known end cannot be skipped — nothing to offer.
+  const inIntro =
+    introWindow != null &&
+    introWindow.end != null &&
+    shownTime >= introWindow.start &&
+    shownTime < introWindow.end;
+  const inCredits =
+    creditsWindow != null &&
+    shownTime >= creditsWindow.start &&
+    shownTime < (creditsWindow.end ?? Number.POSITIVE_INFINITY);
+  // A dismissed credits prompt re-arms once the playhead leaves the window,
+  // so rewinding back into it offers the actions again.
   useEffect(() => {
-    setCreditsStart(normalizeCreditsStart(creditsStartSeconds));
-    setWatchingCredits(false);
-  }, [creditsStartSeconds, src]);
+    if (!inCredits) setCreditsDismissed(false);
+  }, [inCredits]);
 
+  // The intro skipper gets one standalone reveal per window entry — it shows
+  // on its own when the intro starts, no controls needed. Once the viewer
+  // has raised the chrome inside the window, it binds to the controls:
+  // fades out with them and only comes back on a manual raise.
+  const [introControlsSeen, setIntroControlsSeen] = useState(false);
   useEffect(() => {
-    if (!playbackKey || (!onNextEpisode && !onCreditsMappedRef.current)) return;
-    const video = videoRef.current;
-    if (!video) return;
-    return startCreditsMapper({
-      video,
-      timeOffset: () => timeOffsetRef.current,
-      duration: () => durationRef.current,
-      knownStart: creditsStartRef.current,
-      playbackKey,
-      onMapped: (seconds) => {
-        creditsStartRef.current = seconds;
-        setCreditsStart(seconds);
-        onCreditsMappedRef.current?.(seconds);
-      },
-      onLog: (event, data) => onCreditsLogRef.current?.(event, data),
-    });
-  }, [src, playbackKey, onNextEpisode, creditsStartSeconds]);
+    if (inIntro && controlsVisible) setIntroControlsSeen(true);
+    if (!inIntro) setIntroControlsSeen(false);
+  }, [inIntro, controlsVisible]);
+  const showIntroSkip = inIntro && (controlsVisible || !introControlsSeen);
+
+  // The credits window is a takeover: the skip elements own the frame and
+  // the chrome cannot be raised until the viewer picks Watch credits (or
+  // the window ends). Clicking the video still plays/pauses — only the
+  // controls bar is suppressed.
+  const creditsTakeover = inCredits && !creditsDismissed;
+  const creditsTakeoverRef = useRef(creditsTakeover);
+  creditsTakeoverRef.current = creditsTakeover;
+  const keepControls = !creditsTakeover && (settingsOpen || heldPaused || blocked);
+  useEffect(() => {
+    if (!creditsTakeover) return;
+    if (hideTimer.current) window.clearTimeout(hideTimer.current);
+    setControlsVisible(false);
+  }, [creditsTakeover]);
+
+  // Reaching the credits marks the title watched — a movie leaves Continue
+  // Watching here, an episode counts as done even without the last frame.
+  const onCreditsReachedRef = useRef(onCreditsReached);
+  onCreditsReachedRef.current = onCreditsReached;
+  const creditsMarkedRef = useRef(false);
+  useEffect(() => {
+    if (inCredits && !creditsMarkedRef.current) {
+      creditsMarkedRef.current = true;
+      onCreditsReachedRef.current?.();
+    }
+    if (!inCredits) creditsMarkedRef.current = false;
+  }, [inCredits]);
+
+  // Next episode countdown — the fill sweep doubles as the timer. Pausing
+  // freezes it; completing it auto-advances.
+  const [nextFill, setNextFill] = useState(0);
+  useEffect(() => {
+    if (!creditsTakeover) setNextFill(0);
+  }, [creditsTakeover]);
+  useEffect(() => {
+    if (!creditsTakeover || !onNextEpisode || !playing) return;
+    const step = 100;
+    const interval = window.setInterval(() => {
+      setNextFill((v) => Math.min(1, v + step / AUTO_NEXT_MS));
+    }, step);
+    return () => window.clearInterval(interval);
+  }, [creditsTakeover, onNextEpisode, playing]);
+  useEffect(() => {
+    if (nextFill >= 1 && creditsTakeover) onNextEpisode?.();
+  }, [nextFill, creditsTakeover, onNextEpisode]);
 
   const revealControls = useCallback(() => {
-    if (creditsOverlayRef.current) return;
+    // No chrome during the credits takeover — a click still toggles play,
+    // but only Watch credits gives the controls back.
+    if (creditsTakeoverRef.current) return;
     setControlsVisible(true);
     if (hideTimer.current) window.clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => setControlsVisible(false), HIDE_DELAY_MS);
   }, []);
 
   useEffect(() => {
-    if (creditsOverlay) {
-      if (hideTimer.current) window.clearTimeout(hideTimer.current);
-      setControlsVisible(false);
-      return;
-    }
     if (keepControls) {
       if (hideTimer.current) window.clearTimeout(hideTimer.current);
       setControlsVisible(true);
     }
-  }, [creditsOverlay, keepControls]);
-
-  useEffect(() => {
-    if (!creditsOverlay) return;
-    const timer = window.setTimeout(() => onNextEpisode?.(), AUTO_NEXT_MS);
-    return () => window.clearTimeout(timer);
-  }, [creditsOverlay, onNextEpisode]);
+  }, [keepControls]);
 
   useEffect(
     () => () => {
@@ -787,11 +855,17 @@ export function VideoPlayer({
     };
   }, [reportPlayback]);
 
+  // Pause, back, hide, and unmount all flush on their own — this interval is
+  // the backstop so a crash or killed tab loses at most ~30 s of position.
+  useEffect(() => {
+    const interval = window.setInterval(() => reportPlayback(false, true), 30_000);
+    return () => window.clearInterval(interval);
+  }, [reportPlayback]);
+
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      releaseReloadHold();
       markUserPaused(false);
       requestPlay(video);
     } else {
@@ -799,7 +873,7 @@ export function VideoPlayer({
       stopPlayLoop();
       video.pause();
     }
-  }, [markUserPaused, releaseReloadHold, requestPlay, stopPlayLoop]);
+  }, [markUserPaused, requestPlay, stopPlayLoop]);
 
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
@@ -813,7 +887,6 @@ export function VideoPlayer({
     });
     navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
     navigator.mediaSession.setActionHandler('play', () => {
-      releaseReloadHold();
       markUserPaused(false);
       const video = videoRef.current;
       if (video) requestPlay(video);
@@ -827,7 +900,7 @@ export function VideoPlayer({
       navigator.mediaSession.setActionHandler('play', null);
       navigator.mediaSession.setActionHandler('pause', null);
     };
-  }, [title, subtitle, logoPath, playing, markUserPaused, releaseReloadHold, requestPlay, stopPlayLoop]);
+  }, [title, subtitle, logoPath, playing, markUserPaused, requestPlay, stopPlayLoop]);
 
   /** Seeks to an absolute source position. The needle stays on the requested
    *  time immediately; if that section is not converted yet we wait (or
@@ -847,6 +920,15 @@ export function VideoPlayer({
 
       const local = target - timeOffsetRef.current;
       const seekable = video.seekable;
+      if (
+        hls &&
+        onSeekOutsideRef.current &&
+        retainedWindowStartRef.current != null &&
+        target < retainedWindowStartRef.current - 0.5
+      ) {
+        onSeekOutsideRef.current(target);
+        return;
+      }
       if (hls && onSeekOutsideRef.current && seekable.length > 0) {
         const seekableStart = seekable.start(0);
         const seekableEnd = seekable.end(seekable.length - 1);
@@ -916,6 +998,9 @@ export function VideoPlayer({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
+      // The episode drawer owns keyboard navigation and Escape. Do not let
+      // player shortcuts seek, toggle playback, or navigate back underneath it.
+      if (document.querySelector('dialog[data-player-episodes][open]')) return;
       if (target?.closest('input, select, textarea, [contenteditable="true"]')) {
         return;
       }
@@ -996,10 +1081,11 @@ export function VideoPlayer({
     if (startTimeLocal == null || startTimeLocal < 0.25) return;
     if (localSeekApplied.current === src) return;
     const video = videoRef.current;
-    if (!video || video.seekable.length === 0) return;
+    if (!video || !timeRangesCover(video.seekable, startTimeLocal, 0)) return;
     localSeekApplied.current = src;
-    const seekableEnd = Math.max(0, video.seekable.end(video.seekable.length - 1) - 0.5);
-    video.currentTime = Math.min(startTimeLocal, seekableEnd);
+    // Wait for the requested point rather than claiming a partial jump as
+    // finished while the first segments are still arriving.
+    video.currentTime = startTimeLocal;
   }, [startTimeLocal, src, currentTime]);
 
   function syncBuffered(video: HTMLVideoElement) {
@@ -1059,14 +1145,23 @@ export function VideoPlayer({
       ref={containerRef}
       tabIndex={-1}
       onPointerMove={revealControls}
-      onPointerLeave={() => !keepControls && !creditsOverlay && setControlsVisible(false)}
+      onPointerLeave={() => !keepControls && setControlsVisible(false)}
       className={`group/player relative h-full w-full overflow-hidden bg-black outline-none ${
-        controlsVisible || creditsOverlay ? '' : 'cursor-none'
+        controlsVisible ? '' : 'cursor-none'
       }`}
     >
+      {topRightControls ? (
+        <div
+          className={`pointer-events-none absolute inset-0 z-20 transition-opacity duration-300 ${
+            controlsVisible ? 'opacity-100' : 'invisible opacity-0'
+          }`}
+        >
+          {topRightControls}
+        </div>
+      ) : null}
       <video
         ref={videoRef}
-        autoPlay={!reloadHold}
+        autoPlay
         playsInline
         preload="auto"
         crossOrigin="anonymous"
@@ -1089,8 +1184,8 @@ export function VideoPlayer({
           const video = videoRef.current;
           if (
             video?.isConnected &&
-            !reloadHoldRef.current &&
             !userPaused.current &&
+            sourceReadyRef.current &&
             !video.ended
           ) {
             requestPlay(video);
@@ -1109,7 +1204,7 @@ export function VideoPlayer({
           const video = event.currentTarget;
           syncBuffered(video);
           applyPendingSeek(video);
-          if (!reloadHoldRef.current && !userPaused.current && video.paused) {
+          if (!userPaused.current && video.paused) {
             requestPlay(video);
           }
           if (!video.paused) setWaiting(false);
@@ -1154,7 +1249,7 @@ export function VideoPlayer({
             // a permanently pending resume overlay on some sources.
             pendingSeekKickedRef.current = true;
             video.currentTime = initialTime;
-            if (!reloadHoldRef.current) requestPlay(video);
+            requestPlay(video);
           }
         }}
         onVolumeChange={(event) => {
@@ -1164,13 +1259,13 @@ export function VideoPlayer({
         onError={onError}
       />
 
-      {(waiting || pendingSeek != null) && !blocked && !heldPaused && !reloadHold ? (
+      {(waiting || pendingSeek != null) && !blocked && !heldPaused ? (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
           <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
         </div>
       ) : null}
 
-      {blocked || reloadHold ? (
+      {blocked ? (
         <button
           type="button"
           onClick={togglePlay}
@@ -1181,6 +1276,76 @@ export function VideoPlayer({
             <IoPlay size={34} className="ml-1" />
           </span>
         </button>
+      ) : null}
+
+      {/* Skip elements — intro/outro actions tied to detected windows. They
+          sit at the bottom of the frame and slide up when the chrome is up.
+          The intro skipper reveals itself once on window entry, then binds
+          to the controls. The credits elements are a takeover that keeps the
+          chrome down until a choice is made. */}
+      {inIntro && introWindow?.end != null ? (
+        <div
+          className={`absolute right-4 z-20 transition-[bottom,opacity] duration-300 sm:right-6 ${
+            showIntroSkip
+              ? controlsVisible
+                ? 'bottom-24'
+                : 'bottom-6'
+              : 'pointer-events-none bottom-6 opacity-0'
+          }`}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const end = introWindow?.end;
+              if (end != null) seekToAbsolute(end);
+            }}
+            className="flex cursor-pointer items-center gap-2 rounded-full bg-white px-4 py-2 text-[0.8rem] font-medium text-black transition-colors hover:bg-white/85"
+          >
+            Skip intro
+            <IoPlaySkipForward size={15} aria-hidden />
+          </button>
+        </div>
+      ) : null}
+      {creditsTakeover && creditsWindow ? (
+        <div
+          className={`absolute right-4 z-20 flex items-center gap-3 transition-[bottom] duration-300 sm:right-6 ${
+            controlsVisible ? 'bottom-24' : 'bottom-6'
+          }`}
+        >
+          {onNextEpisode ? (
+            <button
+              type="button"
+              onClick={() => setCreditsDismissed(true)}
+              className="cursor-pointer rounded-full border border-white/30 bg-black/60 px-3.5 py-2 text-[0.8rem] font-medium text-white/90 backdrop-blur-md transition-colors hover:border-white/50 hover:text-white"
+            >
+              Watch credits
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => {
+              if (onNextEpisode) {
+                onNextEpisode();
+                return;
+              }
+              // No follow-up episode — skipping credits runs the file out.
+              const video = videoRef.current;
+              const end = creditsWindow.end ?? (video ? resolveDuration(video) : 0);
+              if (end > 0) seekToAbsolute(end);
+            }}
+            className="relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full bg-white/70 px-4 py-2 text-[0.8rem] font-medium text-black transition-colors"
+          >
+            {onNextEpisode ? (
+              <span
+                aria-hidden
+                className="absolute inset-y-0 left-0 bg-white"
+                style={{ width: `${nextFill * 100}%` }}
+              />
+            ) : null}
+            <span className="relative">{onNextEpisode ? 'Next episode' : 'Skip credits'}</span>
+            <IoPlaySkipForward size={15} className="relative" aria-hidden />
+          </button>
+        </div>
       ) : null}
 
       {/* Top chrome */}
@@ -1204,13 +1369,6 @@ export function VideoPlayer({
         </button>
 
       </div>
-
-      {creditsOverlay ? (
-        <CreditsNextOverlay
-          onNext={() => onNextEpisode?.()}
-          onWatchCredits={() => setWatchingCredits(true)}
-        />
-      ) : null}
 
       {/* Bottom chrome */}
       <div
@@ -1247,7 +1405,7 @@ export function VideoPlayer({
             if (!scrubbing.current) setHoverRatio(null);
           }}
         >
-          <div ref={barRef} className="relative h-[3px] w-full rounded-full bg-white/15">
+          <div ref={barRef} className="relative h-[5px] w-full rounded-full bg-white/15">
             {duration > 0
               ? bufferedRanges.map((range, index) => {
                   const start = Math.max(0, Math.min(1, (range.start + timeOffset) / duration));
@@ -1265,10 +1423,73 @@ export function VideoPlayer({
                   );
                 })
               : null}
+            {/* Section bands sit under the played fill — once the playhead
+                passes a section, the progress bar covers it. Generic chapter
+                markers never draw; only named sections earn a band. */}
+            {showSections && duration > 0
+              ? sections
+                  ?.filter((section) => section.kind !== 'chapter')
+                  .map((section, index) => {
+                    const end = section.end ?? duration;
+                    const left = Math.max(0, Math.min(1, section.start / duration));
+                    const width = Math.max(
+                      0.004,
+                      Math.min(1, Math.min(end, duration) / duration) - left,
+                    );
+                    return (
+                      <span
+                        key={`${section.kind}-${index}`}
+                        aria-hidden="true"
+                        className="absolute inset-y-0 rounded-full"
+                        style={{
+                          left: `${left * 100}%`,
+                          width: `${width * 100}%`,
+                          background:
+                            sectionColors[section.kind as SectionKind] ??
+                            SECTION_FALLBACK_COLOR,
+                        }}
+                      />
+                    );
+                  })
+              : null}
             <div
               className="absolute inset-y-0 left-0 w-full origin-left rounded-full bg-accent will-change-transform"
               style={{ transform: `scaleX(${playedRatio})` }}
             />
+            {/* Hover highlight — repaints the hovered section above the
+                played fill so its color reads even in watched territory.
+                Always mounted so leaving the region fades it back out. */}
+            {showSections && duration > 0
+              ? sections
+                  ?.filter((section) => section.kind !== 'chapter')
+                  .map((section, index) => {
+                    const end = section.end ?? duration;
+                    const left = Math.max(0, Math.min(1, section.start / duration));
+                    const width = Math.max(
+                      0.004,
+                      Math.min(1, Math.min(end, duration) / duration) - left,
+                    );
+                    const hovered =
+                      hoverRatio != null &&
+                      hoverRatio * duration >= section.start &&
+                      hoverRatio * duration < end;
+                    return (
+                      <span
+                        key={`hover-${section.kind}-${index}`}
+                        aria-hidden="true"
+                        className="absolute inset-y-0 rounded-full transition-opacity duration-200"
+                        style={{
+                          left: `${left * 100}%`,
+                          width: `${width * 100}%`,
+                          background:
+                            sectionColors[section.kind as SectionKind] ??
+                            SECTION_FALLBACK_COLOR,
+                          opacity: hovered ? 1 : 0,
+                        }}
+                      />
+                    );
+                  })
+              : null}
             <span
               className="absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent opacity-0 transition-opacity will-change-[left] group-hover/bar:opacity-100"
               style={{ left: `${playedRatio * 100}%` }}
@@ -1276,12 +1497,41 @@ export function VideoPlayer({
           </div>
 
           {hoverRatio !== null && duration ? (
-            <span
-              className="pointer-events-none absolute bottom-7 -translate-x-1/2 rounded-md bg-black/80 px-2 py-1 text-[0.7rem] tabular-nums text-white will-change-[left]"
-              style={{ left: `${hoverRatio * 100}%` }}
-            >
-              {formatTime(hoverRatio * duration)}
-            </span>
+            (() => {
+              const hoverTime = hoverRatio * duration;
+              // Generic chapter markers ("Part 01", "Scene 2") stay unlabeled
+              // — only named sections earn tooltip text, and they win over a
+              // generic band the cursor may also be inside.
+              const section =
+                showSections && sections
+                  ? sections.find(
+                      (entry) =>
+                        entry.kind !== 'chapter' &&
+                        hoverTime >= entry.start &&
+                        hoverTime < (entry.end ?? duration),
+                    )
+                  : undefined;
+              return (
+                <span
+                  className="pointer-events-none absolute bottom-7 z-30 -translate-x-1/2 rounded-md bg-black/80 px-2 py-1 text-[0.7rem] tabular-nums text-white will-change-[left]"
+                  style={{ left: `${hoverRatio * 100}%` }}
+                >
+                  {formatTime(hoverTime)}
+                  {section ? (
+                    <span
+                      className="ml-1.5 font-medium"
+                      style={{
+                        color:
+                          sectionColors[section.kind as SectionKind] ??
+                          SECTION_FALLBACK_COLOR,
+                      }}
+                    >
+                      {section.label}
+                    </span>
+                  ) : null}
+                </span>
+              );
+            })()
           ) : null}
         </div>
 
@@ -1361,6 +1611,10 @@ export function VideoPlayer({
                   onPickCaptionColor={onPickCaptionColor}
                   framing={framing}
                   onPickFraming={pickFraming}
+                  sectionsVisible={showSections}
+                  onToggleSections={toggleSections}
+                  sectionColors={sectionColors}
+                  onPickSectionColor={pickSectionColor}
                 />
               ) : null}
             </div>
@@ -1413,47 +1667,6 @@ export function VideoPlayer({
           </span>
         </div>
       ) : null}
-    </div>
-  );
-}
-
-function CreditsNextOverlay({
-  onNext,
-  onWatchCredits,
-}: {
-  onNext: () => void;
-  onWatchCredits: () => void;
-}) {
-  const [fill, setFill] = useState(false);
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => setFill(true));
-    return () => window.cancelAnimationFrame(frame);
-  }, []);
-
-  return (
-    <div className="pointer-events-auto absolute right-4 bottom-10 z-20 flex items-center gap-3 sm:right-6">
-      <button
-        type="button"
-        onClick={onWatchCredits}
-        className="cursor-pointer rounded-full px-3.5 py-2 text-[0.8rem] font-medium text-white/90 transition-colors hover:text-white"
-      >
-        Watch credits
-      </button>
-      <button
-        type="button"
-        onClick={onNext}
-        className="relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full bg-white px-4 py-2 text-[0.8rem] font-medium text-black"
-      >
-        <span
-          aria-hidden
-          className={`absolute inset-y-0 left-0 bg-black/15 transition-[width] ease-linear ${
-            fill ? 'w-full' : 'w-0'
-          }`}
-          style={{ transitionDuration: `${AUTO_NEXT_MS}ms` }}
-        />
-        <span className="relative">Next Episode</span>
-        <IoPlaySkipForward size={15} className="relative" aria-hidden />
-      </button>
     </div>
   );
 }

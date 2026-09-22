@@ -6,27 +6,46 @@ export interface DropdownOption<T extends string | number> {
   label: string;
 }
 
+type DropdownProps<T extends string | number> = {
+  options: DropdownOption<T>[];
+  disabled?: boolean;
+  ariaLabel: string;
+  className?: string;
+  /** Shown when nothing is selected (multi-select empty state, or a value
+   *  with no matching option). */
+  placeholder?: string;
+} & (
+  | { multiple?: false; value: T; onChange: (value: T) => void }
+  | { multiple: true; value: T[]; onChange: (value: T[]) => void }
+);
+
 /** App-styled replacement for a native <select>: pill trigger, dark floating
- *  panel, arrow-key navigation, Escape/outside-click dismissal. */
+ *  panel, arrow-key navigation, Escape/outside-click dismissal. In `multiple`
+ *  mode options toggle and the panel stays open. */
 export function Dropdown<T extends string | number>({
   value,
   options,
   onChange,
+  multiple = false,
   disabled = false,
   ariaLabel,
+  placeholder,
   className = '',
-}: {
-  value: T;
-  options: DropdownOption<T>[];
-  onChange: (value: T) => void;
-  disabled?: boolean;
-  ariaLabel: string;
-  className?: string;
-}) {
+}: DropdownProps<T>) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const optionRefs = useRef<(HTMLButtonElement | null)[]>([]);
-  const current = options.find((option) => option.value === value);
+  const selected = multiple ? (value as T[]) : null;
+  const current = multiple ? undefined : options.find((option) => option.value === value);
+  const label =
+    selected != null
+      ? selected.length
+        ? options
+            .filter((option) => selected.includes(option.value))
+            .map((option) => option.label)
+            .join(', ')
+        : (placeholder ?? '')
+      : (current?.label ?? placeholder ?? String(value));
 
   useEffect(() => {
     if (!open) return;
@@ -50,9 +69,11 @@ export function Dropdown<T extends string | number>({
 
   useEffect(() => {
     if (!open) return;
-    const selected = options.findIndex((option) => option.value === value);
-    optionRefs.current[selected >= 0 ? selected : 0]?.focus();
-  }, [open, options, value]);
+    const selectedIndex = selected
+      ? options.findIndex((option) => selected.includes(option.value))
+      : options.findIndex((option) => option.value === value);
+    optionRefs.current[selectedIndex >= 0 ? selectedIndex : 0]?.focus();
+  }, [open, options, value, selected]);
 
   function moveFocus(delta: number) {
     const buttons = optionRefs.current.filter(Boolean) as HTMLButtonElement[];
@@ -72,7 +93,7 @@ export function Dropdown<T extends string | number>({
         onClick={() => setOpen((value) => !value)}
         className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-full bg-control px-4 py-2 text-white outline-none transition-colors hover:bg-control-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-white disabled:cursor-default disabled:opacity-40"
       >
-        <span className="truncate">{current?.label ?? String(value)}</span>
+        <span className={`truncate ${!label ? 'text-white/50' : ''}`}>{label}</span>
         <IoChevronDown
           size={15}
           className={`shrink-0 text-white/50 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
@@ -95,7 +116,9 @@ export function Dropdown<T extends string | number>({
           }}
         >
           {options.map((option, index) => {
-            const selected = option.value === value;
+            const isSelected = selected
+              ? selected.includes(option.value)
+              : option.value === value;
             return (
               <button
                 key={option.value}
@@ -104,17 +127,25 @@ export function Dropdown<T extends string | number>({
                 }}
                 type="button"
                 role="option"
-                aria-selected={selected}
+                aria-selected={isSelected}
                 onClick={() => {
+                  if (selected) {
+                    (onChange as (value: T[]) => void)(
+                      isSelected
+                        ? selected.filter((entry) => entry !== option.value)
+                        : [...selected, option.value],
+                    );
+                    return;
+                  }
                   setOpen(false);
-                  if (!selected) onChange(option.value);
+                  if (!isSelected) (onChange as (value: T) => void)(option.value);
                 }}
                 className={`flex w-full cursor-pointer items-center justify-between gap-3 whitespace-nowrap px-4 py-2 text-left text-sm outline-none transition-colors hover:bg-control focus-visible:bg-control ${
-                  selected ? 'text-white' : 'text-white/70'
+                  isSelected ? 'text-white' : 'text-white/70'
                 }`}
               >
                 <span className="truncate">{option.label}</span>
-                {selected ? <IoCheckmark size={15} className="shrink-0 text-accent" /> : null}
+                {isSelected ? <IoCheckmark size={15} className="shrink-0 text-accent" /> : null}
               </button>
             );
           })}

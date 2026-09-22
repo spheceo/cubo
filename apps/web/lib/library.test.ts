@@ -5,7 +5,6 @@ import {
   continueWatchingItems,
   historyForEpisode,
   latestHistoryForTitle,
-  nextEpisodeTarget,
   watchHistoryItems,
 } from './library';
 
@@ -54,22 +53,22 @@ test('episode list progress is the row for that season and episode', () => {
   assert.equal(historyForEpisode([e1, e2], 1, 1, 3), undefined);
 });
 
-test('next episode walks the current season then the next season', () => {
-  const seasons = [
-    { seasonNumber: 1, episodeCount: 8 },
-    { seasonNumber: 2, episodeCount: 8 },
-  ];
-  assert.deepEqual(nextEpisodeTarget(seasons, 1, 7), { season: 1, episode: 8 });
-  assert.deepEqual(nextEpisodeTarget(seasons, 1, 8), { season: 2, episode: 1 });
-  assert.equal(nextEpisodeTarget(seasons, 2, 8), null);
-});
-
 test('continue watching also keeps the last-touched episode of a series', () => {
   const items = continueWatchingItems([
     item({ key: 'tv:1:1:1', mediaId: 1, lastWatchedAt: 1, positionSeconds: 600, progress: 0.4 }),
     item({ key: 'tv:1:1:3', mediaId: 1, lastWatchedAt: 9, positionSeconds: 120, progress: 0.2 }),
   ]);
   assert.deepEqual(items.map((entry) => entry.key), ['tv:1:1:3']);
+});
+
+test('continue watching ignores a brief newer episode open before grouping', () => {
+  const resume = item({
+    key: 'tv:8:1:1', mediaId: 8, lastWatchedAt: 10, positionSeconds: 600, progress: 0.2,
+  });
+  const briefOpen = item({
+    key: 'tv:8:1:2', mediaId: 8, lastWatchedAt: 20, positionSeconds: 2, progress: 0.001,
+  });
+  assert.deepEqual(continueWatchingItems([resume, briefOpen]).map((entry) => entry.key), ['tv:8:1:1']);
 });
 
 test('continue watching includes a title after a few seconds, not half a minute', () => {
@@ -80,8 +79,32 @@ test('continue watching includes a title after a few seconds, not half a minute'
     key: 'tv:3:1:1', mediaId: 3, lastWatchedAt: 21, positionSeconds: 2, progress: 0.001,
   });
   const finished = item({
-    key: 'tv:4:1:1', mediaId: 4, lastWatchedAt: 22, positionSeconds: 3300, progress: 0.95,
+    key: 'tv:4:1:1', mediaId: 4, lastWatchedAt: 22, positionSeconds: 3570, progress: 0.991,
+    durationSeconds: 3600,
   });
   const items = continueWatchingItems([started, bounce, finished]);
   assert.deepEqual(items.map((entry) => entry.key), ['tv:2:1:11']);
+});
+
+test('continue watching excludes completed rows even when the progress flag is stale', () => {
+  const completed = item({
+    key: 'tv:5:1:1', mediaId: 5, lastWatchedAt: 30, positionSeconds: 3570,
+    progress: 0.991, completed: true,
+  });
+  assert.deepEqual(continueWatchingItems([completed]), []);
+});
+
+test('continue watching keeps a 90% row when more than a minute remains', () => {
+  const longTail = item({
+    key: 'movie:7:-:-', mediaType: 'movie', mediaId: 7, lastWatchedAt: 30,
+    positionSeconds: 3420, durationSeconds: 3600, progress: 0.95, completed: true,
+  });
+  assert.deepEqual(continueWatchingItems([longTail]).map((entry) => entry.key), ['movie:7:-:-']);
+});
+
+test('continue watching ignores rows without a known duration', () => {
+  const unknownDuration = item({
+    key: 'tv:6:1:1', mediaId: 6, lastWatchedAt: 30, durationSeconds: 0,
+  });
+  assert.deepEqual(continueWatchingItems([unknownDuration]), []);
 });

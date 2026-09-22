@@ -9,6 +9,9 @@ export interface MediaSummary {
   backdropPath: string | null;
   releaseDate: string;
   voteAverage: number;
+  /** TMDB genre ids — used for client-side filter matching (e.g. related
+   *  picks on Discover). Absent when the provider can't supply them. */
+  genreIds?: number[];
 }
 
 export interface SeasonSummary {
@@ -93,8 +96,6 @@ export interface LibraryItem {
   progressDeviceId?: string | null;
   watchHref: string;
   detailHref: string;
-  /** Absolute seconds where end credits began, mapped while watching. */
-  creditsStartSeconds?: number | null;
 }
 
 export interface WatchLaterItem {
@@ -156,6 +157,10 @@ export interface CuboClient {
       mediaType: MediaType,
       collection: 'popular' | 'top_rated' | 'current',
     ): Promise<MediaSummary[]>;
+    discover(query: DiscoverQuery): Promise<DiscoverPage>;
+    /** Titles related to a given title — TMDB recommendations + similar,
+     *  merged and deduped. Powers "surprise me based on what you watched". */
+    related(mediaType: MediaType, id: number): Promise<MediaSummary[]>;
     details(mediaType: MediaType, id: number): Promise<MediaDetails>;
     season(id: number, seasonNumber: number): Promise<Episode[]>;
     search(query: string): Promise<MediaSummary[]>;
@@ -172,6 +177,85 @@ export interface CuboClient {
       release?: SubtitleReleaseHint | null,
     ): Promise<SubtitleTrack[]>;
   };
+}
+
+export type DiscoverSort = 'popular' | 'rating' | 'newest';
+
+export interface DiscoverQuery {
+  mediaType: MediaType;
+  sortBy?: DiscoverSort;
+  genreIds?: number[];
+  minVote?: number;
+  /** Vote-count floors keep one-vote wonders and empty-rated junk out of
+   *  rating sorts; a ceiling surfaces acclaimed but little-known titles. */
+  minVoteCount?: number;
+  maxVoteCount?: number;
+  yearFrom?: number;
+  yearTo?: number;
+  page?: number;
+}
+
+export interface DiscoverPage {
+  results: MediaSummary[];
+  page: number;
+  totalPages: number;
+}
+
+export interface Genre {
+  id: number;
+  name: string;
+}
+
+/** Canonical TMDB genre ids — stable across years, so they're baked in
+ *  instead of fetched. Cinemeta's `genre=` extra takes names, which this
+ *  table also provides. */
+export const MOVIE_GENRES: Genre[] = [
+  { id: 28, name: 'Action' },
+  { id: 12, name: 'Adventure' },
+  { id: 16, name: 'Animation' },
+  { id: 35, name: 'Comedy' },
+  { id: 80, name: 'Crime' },
+  { id: 99, name: 'Documentary' },
+  { id: 18, name: 'Drama' },
+  { id: 10751, name: 'Family' },
+  { id: 14, name: 'Fantasy' },
+  { id: 36, name: 'History' },
+  { id: 27, name: 'Horror' },
+  { id: 10402, name: 'Music' },
+  { id: 9648, name: 'Mystery' },
+  { id: 10749, name: 'Romance' },
+  { id: 878, name: 'Science Fiction' },
+  { id: 10770, name: 'TV Movie' },
+  { id: 53, name: 'Thriller' },
+  { id: 10752, name: 'War' },
+  { id: 37, name: 'Western' },
+];
+
+export const TV_GENRES: Genre[] = [
+  { id: 10759, name: 'Action & Adventure' },
+  { id: 16, name: 'Animation' },
+  { id: 35, name: 'Comedy' },
+  { id: 80, name: 'Crime' },
+  { id: 99, name: 'Documentary' },
+  { id: 18, name: 'Drama' },
+  { id: 10751, name: 'Family' },
+  { id: 10762, name: 'Kids' },
+  { id: 9648, name: 'Mystery' },
+  { id: 10763, name: 'News' },
+  { id: 10764, name: 'Reality' },
+  { id: 10765, name: 'Sci-Fi & Fantasy' },
+  { id: 10766, name: 'Soap' },
+  { id: 10767, name: 'Talk' },
+  { id: 10768, name: 'War & Politics' },
+  { id: 37, name: 'Western' },
+];
+
+export function genresFor(mediaType: MediaType): Genre[] {
+  return mediaType === 'movie' ? MOVIE_GENRES : TV_GENRES;
+}
+
+function genreNameFor(mediaType: MediaType, id: number): string | null {
+  return genresFor(mediaType).find((genre) => genre.id === id)?.name ?? null;
 }
 
 /** Identifies the EXACT release being played, so subtitle providers can
@@ -192,6 +276,7 @@ export type TmdbListItemRaw = {
   release_date?: string;
   first_air_date?: string;
   vote_average?: number;
+  genre_ids?: number[];
 };
 
 export type TmdbDetailsRaw = TmdbListItemRaw & {
@@ -413,6 +498,9 @@ function cinemetaSummary(
     backdropPath: meta.background ?? null,
     releaseDate: firstYear(meta.releaseInfo),
     voteAverage: Number(meta.imdbRating) || 0,
+    genreIds: (meta.genres ?? [])
+      .map((name) => genresFor(mediaType).find((genre) => genre.name === name)?.id)
+      .filter((id): id is number => id != null),
   };
 }
 
@@ -478,6 +566,7 @@ export function normalizeSummary(item: TmdbListItemRaw, mediaType: MediaType): M
     backdropPath: item.backdrop_path ?? null,
     releaseDate: item.release_date ?? item.first_air_date ?? '',
     voteAverage: item.vote_average ?? 0,
+    genreIds: item.genre_ids,
   };
 }
 
@@ -664,6 +753,50 @@ export function createClient(config?: CuboClientConfig): CuboClient {
           .filter((item) => item.poster_path || item.backdrop_path)
           .map((item) => normalizeSummary(item, mediaType));
       },
+      async discover(query: DiscoverQuery) {
+        const sortBy = query.sortBy ?? 'popular';
+        const dateKey =
+          query.mediaType === 'movie' ? 'primary_release_date' : 'first_air_date';
+        const params = new URLSearchParams({
+          sort_by: {
+            popular: 'popularity.desc',
+            rating: 'vote_average.desc',
+            newest: `${dateKey}.desc`,
+          }[sortBy],
+          include_adult: 'false',
+          page: String(query.page ?? 1),
+        });
+        if (query.genreIds?.length) params.set('with_genres', query.genreIds.join(','));
+        if (query.minVote) params.set('vote_average.gte', String(query.minVote));
+        if (query.minVoteCount) params.set('vote_count.gte', String(query.minVoteCount));
+        if (query.maxVoteCount) params.set('vote_count.lte', String(query.maxVoteCount));
+        if (query.yearFrom) params.set(`${dateKey}.gte`, `${query.yearFrom}-01-01`);
+        if (query.yearTo) params.set(`${dateKey}.lte`, `${query.yearTo}-12-31`);
+        // A rating sort with no vote floor is topped by 10.0/1-vote titles.
+        if (sortBy === 'rating' && !query.minVoteCount) params.set('vote_count.gte', '200');
+        const data = await request<TmdbListResponse & { page?: number; total_pages?: number }>(
+          `/api/tmdb/discover/${query.mediaType}?${params}`,
+        );
+        return {
+          results: (data.results ?? [])
+            .filter((item) => item.poster_path || item.backdrop_path)
+            .map((item) => normalizeSummary(item, query.mediaType)),
+          page: data.page ?? 1,
+          // TMDB caps discover at 500 pages even when more matches exist.
+          totalPages: Math.min(data.total_pages ?? 1, 500),
+        };
+      },
+      async related(mediaType: MediaType, id: number) {
+        const [recommendations, similar] = await Promise.all([
+          request<TmdbListResponse>(`/api/tmdb/${mediaType}/${id}/recommendations`),
+          request<TmdbListResponse>(`/api/tmdb/${mediaType}/${id}/similar`),
+        ]);
+        const seen = new Set<number>();
+        return [...(recommendations.results ?? []), ...(similar.results ?? [])]
+          .filter((item) => (item.poster_path || item.backdrop_path) && item.id !== id)
+          .map((item) => normalizeSummary(item, mediaType))
+          .filter((item) => (seen.has(item.id) ? false : (seen.add(item.id), true)));
+      },
       async search(query: string) {
         const q = encodeURIComponent(query);
         const [movies, shows] = await Promise.all([
@@ -694,6 +827,68 @@ export function createClient(config?: CuboClientConfig): CuboClient {
       // Cinemeta's lean manifest exposes a single ranked catalog, so every
       // collection maps onto it for now.
       return tmdbOverCinemeta.trending(mediaType);
+    },
+    async discover(query: DiscoverQuery) {
+      // Cinemeta's `top` catalog takes only `genre` and `skip` extras, so
+      // rating/year filters and non-popularity sorts run client-side on the
+      // returned page — good enough for the keyless fallback.
+      const pageSize = 20;
+      const page = query.page ?? 1;
+      const genreName =
+        query.genreIds?.length === 1 ? genreNameFor(query.mediaType, query.genreIds[0]) : null;
+      const extras = [
+        genreName ? `genre=${encodeURIComponent(genreName)}` : null,
+        page > 1 ? `skip=${(page - 1) * pageSize}` : null,
+      ]
+        .filter(Boolean)
+        .join('&');
+      const metas = await cinemeta.catalog(query.mediaType, extras || undefined);
+      let items = metas
+        .map((meta) => cinemetaSummary(cinemeta, meta, query.mediaType))
+        .filter(
+          (item): item is MediaSummary => item !== null && Boolean(item.posterPath || item.backdropPath),
+        );
+      if (query.minVote) items = items.filter((item) => item.voteAverage >= query.minVote!);
+      if (query.yearFrom) {
+        items = items.filter((item) => Number(item.releaseDate.slice(0, 4)) >= query.yearFrom!);
+      }
+      if (query.yearTo) {
+        items = items.filter((item) => Number(item.releaseDate.slice(0, 4)) <= query.yearTo!);
+      }
+      const sortBy = query.sortBy ?? 'popular';
+      if (sortBy === 'rating') items = [...items].sort((a, b) => b.voteAverage - a.voteAverage);
+      if (sortBy === 'newest') {
+        items = [...items].sort((a, b) => b.releaseDate.localeCompare(a.releaseDate));
+      }
+      return {
+        results: items.slice(0, pageSize),
+        page,
+        totalPages: metas.length >= pageSize ? page + 1 : page,
+      };
+    },
+    async related(mediaType: MediaType, id: number) {
+      // No recommendations endpoint on Cinemeta — approximate "related" with
+      // catalog titles sharing the watched title's genres.
+      const meta = await cinemeta.meta(mediaType, id);
+      const wanted = new Set(
+        (meta.genres ?? [])
+          .map((name) => genresFor(mediaType).find((genre) => genre.name === name)?.id)
+          .filter((genreId): genreId is number => genreId != null),
+      );
+      const genreName = meta.genres?.[0];
+      const metas = await cinemeta.catalog(
+        mediaType,
+        genreName ? `genre=${encodeURIComponent(genreName)}` : undefined,
+      );
+      return metas
+        .map((entry) => cinemetaSummary(cinemeta, entry, mediaType))
+        .filter(
+          (item): item is MediaSummary =>
+            item !== null &&
+            item.id !== id &&
+            Boolean(item.posterPath || item.backdropPath) &&
+            (item.genreIds ?? []).some((genreId) => wanted.has(genreId)),
+        );
     },
     async details(mediaType: MediaType, id: number) {
       const meta = await cinemeta.meta(mediaType, id);
