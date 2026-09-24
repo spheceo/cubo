@@ -84,7 +84,9 @@
     background: transparent;
   }
 
-  *:not(.no-scrollbar)::-webkit-scrollbar-track {
+  *:not(.no-scrollbar)::-webkit-scrollbar-track,
+  *:not(.no-scrollbar)::-webkit-scrollbar-track-piece,
+  *:not(.no-scrollbar)::-webkit-scrollbar-corner {
     background: transparent;
   }
 
