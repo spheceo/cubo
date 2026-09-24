@@ -79,6 +79,7 @@ import { isAutomaticSource, streamKey } from '@/lib/stream-select';
 import { ProgressWriter } from '@/lib/progress-writer';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
+import { fetchStreams } from '@/lib/stream-cache';
 import { onCacheClear } from '@/lib/cache-events';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
@@ -924,9 +925,11 @@ export function WatchScreen({
       const streamsQuery = streamQueries.streams(mediaType, imdbId, season, episode);
       const warmed = queryClient.getQueryData(streamsQuery.queryKey);
       if (warmed?.length) void queryClient.prefetchQuery(streamsQuery);
+      // Otherwise Torrentio, falling back to this title's last saved list
+      // when it is slow or down.
       const foundPromise = (warmed?.length
         ? Promise.resolve(warmed)
-        : queryClient.fetchQuery(streamsQuery)
+        : fetchStreams(mediaType, imdbId, season, episode)
       ).catch(() => [] as Stream[]);
       const connection = await core.connect().catch(() => null);
       if (cancelled) return;

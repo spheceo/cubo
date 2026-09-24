@@ -10,8 +10,8 @@ import type { MediaType, Stream } from '@cubo/core';
 import { buildMagnet, prefetchSource, type LocalEngineConnection } from './local-engine';
 import { playbackKey } from './library';
 import { supportsHevcRemux } from './media-compatibility';
-import { queryClient, streamQueries } from './queries';
 import { loadSource, preferSource } from './source-affinity';
+import { fetchStreams } from './stream-cache';
 import { isAutomaticSource, rankStreams } from './stream-select';
 
 /** One warm-up per title per window: page revisits and re-renders are free. */
@@ -68,16 +68,12 @@ export async function prefetchTitle(
   if ((recent.get(key) ?? 0) > now - PREFETCH_TTL_MS) return;
   recent.set(key, now);
 
-  const found = await queryClient
-    .fetchQuery(
-      streamQueries.streams(
-        target.mediaType,
-        target.imdbId,
-        target.season ?? undefined,
-        target.episode ?? undefined,
-      ),
-    )
-    .catch(() => [] as Stream[]);
+  const found = await fetchStreams(
+    target.mediaType,
+    target.imdbId,
+    target.season ?? undefined,
+    target.episode ?? undefined,
+  ).catch(() => [] as Stream[]);
   const choice = rankForPlayback(found, loadSource(key), connection, target)[0];
   if (!choice) return;
   prefetchSource(connection, {
