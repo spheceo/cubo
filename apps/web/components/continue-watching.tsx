@@ -1,11 +1,16 @@
 import { backdropUrl, logoUrl, type LibraryItem } from '@cubo/core';
 import gsap from 'gsap';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { IoClose } from 'react-icons/io5';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { Link } from '@/components/link';
 import { continueWatchingItems, episodeLabel } from '@/lib/library';
+import { queryClient, tmdbQueries } from '@/lib/queries';
+import { prefetchTitle } from '@/lib/source-prefetch';
 import { useCore } from './core-provider';
+
+/** How many Continue Watching cards get warmed on page load. */
+const WARM_ITEMS = 3;
 
 function prefersReducedMotion() {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -73,8 +78,40 @@ export function ContinueWatching({
   mediaType?: LibraryItem['mediaType'];
   className?: string;
 }) {
-  const { library, removeFromHistory } = useCore();
+  const { library, removeFromHistory, connection } = useCore();
   const items = continueWatchingItems(library?.history, mediaType);
+
+  // Warm the first few resume targets so "continue" starts at once: Core
+  // fetches metadata, header and probe, then parks each torrent.
+  const warmKeys = items.slice(0, WARM_ITEMS).map((item) => item.key).join('|');
+  useEffect(() => {
+    if (!connection?.sessions || !warmKeys) return;
+    let cancelled = false;
+    const targets = items.slice(0, WARM_ITEMS);
+    void (async () => {
+      for (const item of targets) {
+        if (cancelled) return;
+        const details = await queryClient
+          .fetchQuery(tmdbQueries.details(item.mediaType, item.mediaId))
+          .catch(() => null);
+        if (cancelled || !details) continue;
+        await prefetchTitle(connection, {
+          mediaType: item.mediaType,
+          mediaId: item.mediaId,
+          imdbId: details.imdbId ?? item.imdbId,
+          title: item.title,
+          originalLanguage: details.originalLanguage,
+          season: item.season,
+          episode: item.episode,
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // `items` is rebuilt every render; the joined keys say when it changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection, warmKeys]);
   const sectionRef = useRef<HTMLElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef(new Map<string, HTMLDivElement>());
