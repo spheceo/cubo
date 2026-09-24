@@ -4,6 +4,7 @@ import type { Stream } from '@cubo/core';
 import {
   AUTO_PLAY_MAX_BYTES,
   collectionPackRank,
+  isAutomaticSource,
   isOversizedStream,
   rankStreams,
   seasonPackRank,
@@ -172,4 +173,56 @@ test('a 30 GB remux loses to a normal-sized rip and is not auto-playable', () =>
   assert.equal(isOversizedStream(rip), false);
   const ranked = rankStreams([remux, rip], { transcode: true, hevc: true }, 'en');
   assert.deepEqual(ranked.map((stream) => stream.infoHash), ['rip', 'huge']);
+});
+
+// Release names below are verbatim from Torrentio results for Silo S03.
+const silo = { ...single, quality: '1080p', trackers: [] };
+const hdrezkaDub: Stream = {
+  ...silo,
+  infoHash: 'hdrezka',
+  name: 'Torrentio\nWEB-DL',
+  filename: 'Silo.S03E09.HDrS.WEB-DLRip.mp4',
+  title:
+    'Укрытие / Бункер / Silo [S01-03] (2023-2026) WEB-DLRip-AVC | КПК | HDrezka Studio\nSilo.S03/Silo.S03E09.HDrS.WEB-DLRip.mp4\n👤 19 💾 286.73 MB ⚙️ Rutor\n🇬🇧 / 🇷🇺',
+};
+const chineseHardsub: Stream = {
+  ...silo,
+  infoHash: 'dyg7',
+  filename: '末日地堡.Silo.S03E08.Gray.Goo.1080p.HD中英双字[最新电影www.dyg7.com].mp4',
+  title: 'Silo.S03E08.6v\n👤 8 💾 902.9 MB ⚙️ EXT',
+};
+const englishCzech: Stream = {
+  ...silo,
+  infoHash: 'english',
+  filename: 'Silo_S03E09_Rozloučení.mkv',
+  title: 'Silo S03E09 (EN)[1080p][WEB-DL][HEVC]\n👤 75 💾 2.29 GB ⚙️ EXT\n🇬🇧 / 🇨🇿 / 🇸🇰',
+};
+const russianWithOriginal: Stream = {
+  ...silo,
+  infoHash: 'lostfilm',
+  filename: 'Silo.S03E09.1080p.WEB-DL.LostFilm.Eng.mkv',
+  title:
+    'Укрытие / Бункер / Silo / Сезон: 3 / Серии: 1-10 из 10 [2026 WEB-DL 1080p] MVO (LostFilm) + Original + Sub (Rus Eng)\nSilo.S03E09.1080p.WEB-DL.LostFilm.Eng.mkv\n👤 84 💾 4.99 GB ⚙️ Rutracker\n🇬🇧 / 🇷🇺',
+};
+
+test('a Russian voice-over release is a dub even with a UK flag', () => {
+  assert.equal(isAutomaticSource(hdrezkaDub, 'en'), false);
+  // ...but it is exactly right for a Russian original.
+  assert.equal(isAutomaticSource(hdrezkaDub, 'ru'), true);
+});
+
+test('Chinese burned-in caption rips never auto-play', () => {
+  assert.equal(isAutomaticSource(chineseHardsub, 'en'), false);
+  assert.equal(isAutomaticSource(chineseHardsub, 'zh'), false);
+});
+
+test('a foreign pack that carries the original track stays eligible, below clean releases', () => {
+  assert.equal(isAutomaticSource(russianWithOriginal, 'en'), true);
+  const ranked = rankStreams(
+    [russianWithOriginal, hdrezkaDub, englishCzech],
+    { transcode: true, hevc: true },
+    'en',
+    { season: 3, episode: 9 },
+  ).filter((stream) => isAutomaticSource(stream, 'en'));
+  assert.deepEqual(ranked.map((stream) => stream.infoHash), ['english', 'lostfilm']);
 });

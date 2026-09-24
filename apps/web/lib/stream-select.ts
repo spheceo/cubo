@@ -37,6 +37,33 @@ const DUBBED_AUDIO_RE = /\b(?:dublado|dublada|dublagem|dubbed|dubbing)\b/i;
  *  KORSUB, VOSTFR, "napisy" …). No player setting can remove them, so they
  *  rank with the dubs — last. Soft-sub markers like MULTiSUBS stay fine. */
 const HARDSUB_RE = /\b(?:hc|hard[ ._-]?subs?|\w*subbed|korsubs?|vostfr|napisy)\b/i;
+/** Chinese release sites burn in their subtitle tracks and say so in the
+ *  name: 中英双字 (Chinese + English captions), 中字, 简/繁中, 内嵌. */
+const CJK_HARDSUB_RE = /中英|双字|雙字|中字|[简繁][中体體]|内嵌|內嵌/;
+
+/** Scripts that mark a release made for another audience, and the
+ *  languages written in each. A title in Cyrillic or Chinese is a Russian
+ *  or Chinese release even when Torrentio also stamps 🇬🇧 on it (that flag
+ *  often only means English subtitles are included). */
+const SCRIPT_LANGUAGES: [RegExp, string[]][] = [
+  [/[\u0400-\u04ff]/, ['ru', 'uk', 'bg', 'sr', 'mk', 'be', 'kk']],
+  [/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/, ['zh', 'ja', 'ko', 'cn']],
+  [/[\u0600-\u06ff]/, ['ar', 'fa', 'ur']],
+  [/[\u0590-\u05ff]/, ['he']],
+  [/[\u0e00-\u0e7f]/, ['th']],
+  [/[\u0900-\u097f]/, ['hi', 'mr', 'ne']],
+  [/[\u0370-\u03ff]/, ['el']],
+];
+
+/** Voice-over dubs (multi/dual/single-voice) and the studios that make
+ *  them. Russian/Ukrainian releases lay these over the original audio. */
+const VOICEOVER_RE =
+  /\b(?:[mda]vo|hdrezka|hdrs|lostfilm|newstudio|alexfilm|jaskier|baibako|amedia|coldfilm|tvshows|kerob|kubik)\b|дубляж|многоголос|двухголос|одноголос|кураж|кубик/i;
+const VOICEOVER_LANGUAGES = ['ru', 'uk'];
+
+/** A release that also carries the original track: "+ Original +",
+ *  "Оригинал", "Orig". */
+const ORIGINAL_TRACK_RE = /\b(?:original|orig)\b|оригинал/i;
 
 /** In-theatre captures and pre-release screeners (CAM/CAMRip, TELESYNC/TS,
  *  TELECINE/TC, HDTS/HDTO, SCREENER/DVDSCR …). Torrentio labels these
@@ -98,14 +125,33 @@ function seederBucket(seeders: number | null): number {
   return 0;
 }
 
+/** Made for another language's audience: written in a script the native
+ *  language does not use, or carrying a Russian-style voice-over. */
+function isForeignRelease(hint: string, native: string): boolean {
+  const foreignScript = SCRIPT_LANGUAGES.some(
+    ([script, languages]) => script.test(hint) && !languages.includes(native),
+  );
+  return foreignScript || (VOICEOVER_RE.test(hint) && !VOICEOVER_LANGUAGES.includes(native));
+}
+
 function audioLanguageRank(stream: Stream, nativeLanguage: string | null): number {
   const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
   // Burned-in subtitles ruin a release regardless of its audio language.
-  if (HARDSUB_RE.test(hint)) return 3;
+  if (HARDSUB_RE.test(hint) || CJK_HARDSUB_RE.test(hint)) return 3;
   if (DUBBED_AUDIO_RE.test(hint)) return 3;
   if (!nativeLanguage) return 1;
   const native = nativeLanguage.toLowerCase();
   if (ORIGINAL_AUDIO_RE.test(hint)) return 0;
+
+  const nativeHint = AUDIO_LANGUAGE_HINTS.find(([code]) => code === native);
+  const nativeTag = new RegExp(`[\\[(]${native}[\\])]`, 'i');
+  // A foreign release (Russian voice-over pack, Chinese site rip) only
+  // qualifies when it says it also carries the original track; Core then
+  // picks that track. Otherwise it is a dub, whatever its flags say.
+  const foreign = isForeignRelease(hint, native);
+  const declaresNative =
+    ORIGINAL_TRACK_RE.test(hint) || nativeHint?.[1].test(hint) === true || nativeTag.test(hint);
+  if (foreign && !declaresNative) return 3;
 
   // Flags are authoritative when present: a release flagged only with
   // foreign languages is a dub even if its name carries no language tokens.
@@ -115,10 +161,11 @@ function audioLanguageRank(stream: Stream, nativeLanguage: string | null): numbe
   const flags = flaggedLanguages(hint);
   if (flags.size > 0) {
     if (!flags.has(native)) return 3;
+    if (foreign) return 2;
     return flags.size === 1 ? 0 : 1;
   }
+  if (foreign) return 2;
 
-  const nativeHint = AUDIO_LANGUAGE_HINTS.find(([code]) => code === native);
   if (nativeHint?.[1].test(hint)) return 0;
   if (MULTI_AUDIO_RE.test(hint)) return 2;
   if (AUDIO_LANGUAGE_HINTS.some(([code, pattern]) => code !== native && pattern.test(hint))) {

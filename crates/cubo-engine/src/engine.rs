@@ -35,6 +35,8 @@ use crate::cache;
 use crate::pairing::{PairAttempt, PairingManager};
 use crate::paths::home_dir;
 use crate::rolling_cache::RollingCache;
+use crate::remuxer::RemuxError;
+use crate::session::{CreateSessionRequest, Mode as SessionMode, Phase as SessionPhase, SessionManager};
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
 use crate::system;
 use crate::transcode::{
@@ -101,6 +103,8 @@ struct BridgeState {
     /// device tokens issued to remote (non-loopback) clients.
     pairing: Arc<PairingManager>,
     updater: Arc<UpdateManager>,
+    /// Core-owned playback sessions (the rebuilt playback pipeline).
+    sessions: Arc<SessionManager>,
 }
 
 impl BridgeState {
@@ -243,6 +247,17 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             let transcode = Arc::new(TranscodeManager::new(transcode_dir));
             transcode.set_budget(cached.cache.max_bytes / 4).await?;
             let download_dir = Arc::new(RwLock::new(download_dir));
+            let sessions = SessionManager::new(
+                session.clone(),
+                rqbit_port,
+                transcode.clone(),
+                store.clone(),
+                download_dir.clone(),
+                state_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("sessions"),
+            );
             let allowed_hosts = Arc::new(StdRwLock::new(local_machine_hosts(tailscale_address)));
             let state = BridgeState {
                 rqbit_port,
@@ -261,6 +276,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
                 pairing,
                 updater: Arc::new(UpdateManager::new()),
+                sessions,
             };
             let router = bridge_router(state.clone());
 
@@ -737,6 +753,13 @@ fn bridge_router(state: BridgeState) -> Router {
             get(torrent_subtitle_match),
         )
         .route("/v1/torrents/{id}/hls/{file_index}/{file}", get(hls_file))
+        .route("/v1/sessions", post(create_session))
+        .route("/v1/prefetch", post(prefetch_source))
+        .route("/v1/sessions/{id}", get(session_status).delete(close_session))
+        .route("/v1/sessions/{id}/heartbeat", post(session_heartbeat))
+        .route("/v1/sessions/{id}/close", post(close_session_beacon))
+        .route("/v1/sessions/{id}/stream", get(session_stream))
+        .route("/v1/sessions/{id}/hls/{file}", get(session_hls))
         .route("/v1/skip-segments", get(skip_segments))
         .route("/v1/library", get(library_snapshot))
         .route("/v1/library/progress", post(record_playback))
@@ -903,6 +926,9 @@ async fn health(
         "engineVersion": librqbit::version(),
         "webUrl": state.web_origin,
         "transcode": state.transcode.available(),
+        // Clients use /v1/sessions (full-length playlists, Core-owned
+        // playback state) when this is set.
+        "sessions": true,
         "pairingRequired": !is_local_caller,
     });
     if is_local_caller {
@@ -1237,6 +1263,7 @@ async fn delete_cache_item(
     }
 
     let _cache_operation = state.cache_swap.write().await;
+    state.sessions.close_torrent(&id).await;
 
     // rqbit forgets its torrents when the app restarts, so it deleting the
     // torrent is the happy path, not the source of truth. "Unknown torrent"
@@ -1294,6 +1321,8 @@ async fn clear_cache(State(state): State<BridgeState>, headers: HeaderMap) -> Re
 /// Deletes every torrent rqbit still knows, drops the cache index, and wipes
 /// `download_dir`. Used by explicit clear and by a directory swap.
 async fn empty_cache(state: &BridgeState, download_dir: &std::path::Path) -> Result<(), String> {
+    state.sessions.close_all().await;
+    state.sessions.clear_metadata();
     state.transcode.clear_cache().await?;
     delete_all_torrents(state).await?;
     let download_path = download_dir.to_path_buf();
@@ -1527,6 +1556,13 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         })
         .flatten();
 
+    // The file a live session plays is never evicted: the budget applies to
+    // everything else.
+    let live = state.sessions.live_info_hashes();
+    // Legacy playback has no liveness signal, so it guards recent entries by
+    // time. Sessions say exactly what is playing; a closed one is ordinary
+    // cache immediately.
+    let session_era = state.sessions.ever_used();
     let mut deleted_files: Vec<String> = Vec::new();
     let mut entries = snapshot.cache_entries;
     entries.sort_by_key(|entry| entry.last_accessed_at);
@@ -1535,7 +1571,9 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
             break;
         }
         let id = cache_entry_id(&entry);
-        if cache_entry_is_protected(&entry, now, playing, active_id.as_deref()) {
+        if live.contains(&entry.info_hash)
+            || (!session_era && cache_entry_is_protected(&entry, now, playing, active_id.as_deref()))
+        {
             continue;
         }
         // Delete through rqbit when it still knows the torrent, and always
@@ -1565,7 +1603,7 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
             if used_bytes <= snapshot.cache.max_bytes {
                 break;
             }
-            if entry_in_startup_grace(&entry, now) {
+            if (!session_era && entry_in_startup_grace(&entry, now)) || live.contains(&entry.info_hash) {
                 continue;
             }
             let id = cache_entry_id(&entry);
@@ -1651,8 +1689,24 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     let torrents = rqbit_list_torrents(state).await?;
     let download_dir = state.current_download_dir().await;
     let critical = cache::disk_is_critical(system::volume_free_bytes(&download_dir));
+    if critical {
+        state.sessions.fail_live(
+            "disk_full",
+            "Cubo's cache disk is almost full. Free disk space before trying playback again.",
+        );
+    }
+    // While a session plays, its torrent gets the bandwidth: everything else
+    // pauses. Without sessions, the legacy pipeline's readers need every
+    // torrent running.
+    let live = state.sessions.live_torrent_ids();
+    let sessions_active = !live.is_empty();
+    // A prefetch's warm-up stays parked until someone actually plays it.
+    let parked = state.sessions.parked_torrent_ids();
     for torrent in torrents {
-        if critical {
+        if critical
+            || (sessions_active && !live.contains(&torrent))
+            || (parked.contains(&torrent) && !live.contains(&torrent))
+        {
             let _ = rqbit_pause(state, &torrent).await;
         } else {
             let _ = rqbit_start(state, &torrent).await;
@@ -2895,6 +2949,229 @@ async fn hls_file(
     }
 }
 
+async fn create_session(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSessionRequest>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let download_dir = state.current_download_dir().await;
+    if cache::disk_is_critical(system::volume_free_bytes(&download_dir)) {
+        return bridge_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Cubo's cache disk is almost full. Free disk space before trying playback again."
+                .into(),
+        );
+    }
+    let session = state.sessions.create(request);
+    (StatusCode::CREATED, Json(state.sessions.status(&session))).into_response()
+}
+
+/// Warms a source the viewer is likely to open next (the next episode, the
+/// title on screen) so its session starts in about a second. Returns at once.
+async fn prefetch_source(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSessionRequest>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let download_dir = state.current_download_dir().await;
+    if cache::disk_is_critical(system::volume_free_bytes(&download_dir)) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    state.sessions.prefetch(request);
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn session_status(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    match state.sessions.get(&id) {
+        Some(session) => {
+            session.touch();
+            Json(state.sessions.status(&session)).into_response()
+        }
+        None => bridge_error(StatusCode::NOT_FOUND, "playback session not found".into()),
+    }
+}
+
+async fn close_session(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    state.sessions.close(&id).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `navigator.sendBeacon` cannot set headers, so page unload closes the
+/// session with the token in the query string.
+async fn close_session_beacon(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    if !is_valid_token(&state, &query.token) {
+        return unauthorized();
+    }
+    state.sessions.close(&id).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeartbeatBody {
+    position_seconds: f64,
+    #[serde(default)]
+    playing: bool,
+}
+
+async fn session_heartbeat(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<HeartbeatBody>,
+) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    match state.sessions.get(&id) {
+        Some(session) => {
+            session.heartbeat(body.position_seconds, body.playing);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => bridge_error(StatusCode::NOT_FOUND, "playback session not found".into()),
+    }
+}
+
+/// Direct play: ranged bytes of the session's file.
+async fn session_stream(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_token(&state, &query.token) {
+        return unauthorized();
+    }
+    let Some(session) = state.sessions.get(&id) else {
+        return bridge_error(StatusCode::NOT_FOUND, "playback session not found".into());
+    };
+    if session.mode() != Some(SessionMode::Direct) {
+        return bridge_error(StatusCode::CONFLICT, "this session does not play directly".into());
+    }
+    let Some(url) = state.sessions.source_stream_url(&session) else {
+        return bridge_error(StatusCode::CONFLICT, "playback session is not ready".into());
+    };
+    session.touch();
+    let mut request = state.client.get(url);
+    if let Some(range) = headers.get(RANGE) {
+        request = request.header(RANGE, range);
+    }
+    match request.send().await {
+        Ok(response) => {
+            session.note_media_served();
+            proxy_response(response)
+        }
+        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+/// Remuxed play: the complete VOD playlist, the shared init segment, and
+/// numbered media segments cut at fixed keyframe boundaries.
+async fn session_hls(
+    State(state): State<BridgeState>,
+    Path((id, file)): Path<(String, String)>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    if !is_valid_token(&state, &query.token) {
+        return unauthorized();
+    }
+    let Some(session) = state.sessions.get(&id) else {
+        return bridge_error(StatusCode::NOT_FOUND, "playback session not found".into());
+    };
+    session.touch();
+    let status = state.sessions.status(&session);
+    match status.phase {
+        SessionPhase::Ready => {}
+        SessionPhase::Failed => {
+            let message = status
+                .error
+                .map(|failure| failure.message)
+                .unwrap_or_else(|| "playback session failed".into());
+            return bridge_error(StatusCode::BAD_GATEWAY, message);
+        }
+        SessionPhase::Closed => {
+            return bridge_error(StatusCode::GONE, "playback session closed".into());
+        }
+        _ => {
+            return bridge_error(StatusCode::CONFLICT, "playback session is not ready".into());
+        }
+    }
+    let Some(remuxer) = session.remuxer() else {
+        return bridge_error(StatusCode::CONFLICT, "this session plays directly".into());
+    };
+
+    if file == "media.m3u8" {
+        // Echo the caller's own token, never the session token.
+        let token = urlencoding::encode(&query.token).into_owned();
+        return (
+            [
+                (CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                (HeaderName::from_static("cache-control"), "no-store"),
+            ],
+            remuxer.plan().playlist(&format!("token={token}")),
+        )
+            .into_response();
+    }
+
+    let result = if file == "init.mp4" {
+        remuxer.init_segment(Duration::from_secs(60)).await
+    } else if let Some(index) = file
+        .strip_suffix(".m4s")
+        .and_then(|number| number.parse::<usize>().ok())
+    {
+        let result = remuxer.segment(index, Duration::from_secs(55)).await;
+        if result.is_ok() {
+            session.note_media_served();
+        }
+        result
+    } else {
+        return bridge_error(StatusCode::NOT_FOUND, "unknown playlist file".into());
+    };
+    match result {
+        // A segment URL always names the same stretch of the movie, so
+        // short-lived browser caching is safe (unlike the legacy pipeline,
+        // where restarts reused names for different content).
+        Ok(bytes) => (
+            [
+                (CONTENT_TYPE, "video/mp4"),
+                (HeaderName::from_static("cache-control"), "private, max-age=600"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(RemuxError::TimedOut) => bridge_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the source has not delivered this part yet".into(),
+        ),
+        Err(RemuxError::Closed) => bridge_error(StatusCode::GONE, "playback session closed".into()),
+        Err(RemuxError::Failed(error)) => bridge_error(StatusCode::BAD_GATEWAY, error),
+    }
+}
+
 /// HLS players fetch segment URIs verbatim, so the session token rides along
 /// as a query parameter on every entry — plus the job nonce, which makes each
 /// conversion's segment URLs unique. Seek restarts reuse segment names for
@@ -3322,6 +3599,8 @@ mod tests {
         let transcode_dir = test_dir.join("transcode");
         let pairing = Arc::new(PairingManager::load(&test_dir).expect("load test pairing manager"));
         let pairing_dir = test_dir.clone();
+        let transcode = Arc::new(TranscodeManager::new(transcode_dir));
+        let sessions = crate::session::SessionManager::for_tests(&pairing_dir, transcode.clone(), store.clone()).await;
         let state = BridgeState {
             rqbit_port: 1,
             token: "test-session-token".into(),
@@ -3339,10 +3618,11 @@ mod tests {
             cache_swap: Arc::new(RwLock::new(())),
             disk_pressure: Arc::new(AtomicBool::new(false)),
             store,
-            transcode: Arc::new(TranscodeManager::new(transcode_dir)),
+            transcode,
             subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
             pairing,
             updater: Arc::new(UpdateManager::new()),
+            sessions,
         };
         tokio::spawn(async move {
             let service = bridge_router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -3520,3 +3800,101 @@ mod tests {
 #[cfg(test)]
 #[path = "cache_tests.rs"]
 mod cache_tests;
+
+/// A complete Core (rqbit session + HTTP API, remux, sessions, maintenance
+/// loop, bridge router) on ephemeral loopback ports with DHT and trackers
+/// off — what the soak harness drives. Mirrors `start()` minus Tailscale,
+/// the global engine slot and the persisted DHT socket.
+#[cfg(test)]
+pub(crate) struct TestCore {
+    pub base_url: String,
+    pub token: String,
+}
+
+#[cfg(test)]
+pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64) -> TestCore {
+    let download_dir = root.join("downloads");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    let store = CoreStore::load(root.join("cubo-state.json")).await.unwrap();
+    store.set_cache_limit_unclamped(cache_max_bytes).await;
+    let rolling_cache = RollingCache::new(download_dir.clone(), torrent_budget(cache_max_bytes)).unwrap();
+    let rqbit = Session::new_with_opts(
+        download_dir.clone(),
+        SessionOptions {
+            dht: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            persistence: None,
+            listen: Some(librqbit::ListenerOptions {
+                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }),
+            default_storage_factory: Some(rolling_cache.clone().boxed()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let http_api = HttpApi::new(
+        Api::new(rqbit.clone(), None, None),
+        Some(HttpApiOptions {
+            read_only: false,
+            allow_create: true,
+            ..Default::default()
+        }),
+    );
+    let rqbit_listener = RqbitListener::bind_tcp(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        Default::default(),
+    )
+    .unwrap();
+    let rqbit_port = rqbit_listener.bind_addr().port();
+    tokio::spawn(async move {
+        let _ = http_api.make_http_api_and_run(rqbit_listener, None).await;
+    });
+    let transcode = Arc::new(TranscodeManager::new(root.join("transcode")));
+    transcode.set_budget(cache_max_bytes / 4).await.unwrap();
+    let download_lock = Arc::new(RwLock::new(download_dir.clone()));
+    let sessions = SessionManager::new(
+        rqbit.clone(),
+        rqbit_port,
+        transcode.clone(),
+        store.clone(),
+        download_lock.clone(),
+        root.join("sessions"),
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let bridge_port = listener.local_addr().unwrap().port();
+    let token = "soak-token".to_string();
+    let state = BridgeState {
+        rqbit_port,
+        token: token.clone().into(),
+        client: reqwest::Client::new(),
+        web_origin: None,
+        allowed_hosts: Arc::new(StdRwLock::new(vec![])),
+        bridge_port,
+        download_dir: download_lock,
+        playback_last_ms: Arc::new(AtomicU64::new(0)),
+        cache_swap: Arc::new(RwLock::new(())),
+        rolling_cache,
+        disk_pressure: Arc::new(AtomicBool::new(false)),
+        store: store.clone(),
+        transcode,
+        subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
+        pairing: Arc::new(PairingManager::load(root).unwrap()),
+        updater: Arc::new(UpdateManager::new()),
+        sessions,
+    };
+    let maintenance = state.clone();
+    tokio::spawn(async move { cache_maintenance_loop(maintenance).await });
+    let router = bridge_router(state);
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
+    });
+    TestCore {
+        base_url: format!("http://127.0.0.1:{bridge_port}"),
+        token,
+    }
+}

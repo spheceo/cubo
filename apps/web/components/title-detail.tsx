@@ -16,6 +16,7 @@ import {
   watchLaterItem,
 } from '@/lib/library';
 import { resolveNextEpisode } from '@/lib/next-episode';
+import { prefetchTitle } from '@/lib/source-prefetch';
 import { AutoPreview } from './auto-preview';
 import { useCore } from './core-provider';
 import { EpisodeList } from './episode-list';
@@ -38,7 +39,7 @@ export function TitleDetail({
   const year = details.releaseDate.slice(0, 4);
   const rating = details.voteAverage ? details.voteAverage.toFixed(1) : '';
   const runtime = formatRuntime(details.runtime);
-  const { library } = useCore();
+  const { library, connection } = useCore();
   const resume = latestHistoryForTitle(library?.history, details.mediaType, details.id);
   const firstSeason = details.seasons[0]?.seasonNumber ?? 1;
   // A finished episode's resume points at the next one — credits mark the
@@ -51,13 +52,28 @@ export function TitleDetail({
       ? resolveNextEpisode(details.seasons, episodes, resume.season, resume.episode)
       : null;
   const resumeSeason = nextUp?.season ?? resume?.season ?? firstSeason;
-  const resumeEpisode = nextUp?.episode ?? episodes[0]?.episodeNumber ?? 1;
+  const resumeEpisode = nextUp?.episode ?? resume?.episode ?? episodes[0]?.episodeNumber ?? 1;
   const nextAirs = details.nextEpisode ? formatNextEpisodeLabel(details.nextEpisode) : null;
   const playHref =
     details.mediaType === 'tv'
       ? watchHref(details, resumeSeason, resumeEpisode)
       : watchHref(details);
   const playLabel = playButtonLabel(details.mediaType, nextUp ?? resume, firstSeason);
+
+  // Warm whatever the play button starts, so pressing it is near-instant.
+  const prefetchSeason = details.mediaType === 'tv' ? resumeSeason : null;
+  const prefetchEpisode = details.mediaType === 'tv' ? resumeEpisode : null;
+  useEffect(() => {
+    void prefetchTitle(connection, {
+      mediaType: details.mediaType,
+      mediaId: details.id,
+      imdbId: details.imdbId,
+      title: details.title,
+      originalLanguage: details.originalLanguage,
+      season: prefetchSeason,
+      episode: prefetchEpisode,
+    });
+  }, [connection, details, prefetchSeason, prefetchEpisode]);
 
   return (
     <main className="h-dvh overflow-hidden bg-background text-white">

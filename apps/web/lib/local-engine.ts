@@ -81,6 +81,9 @@ export interface LocalEngineConnection {
   version: string;
   /** True when this Core has ffmpeg and can remux MKV/incompatible-audio sources. */
   transcode: boolean;
+  /** True when Core runs playback sessions (`/v1/sessions`): full-length
+   *  playlists and Core-owned playback state. Older Cores lack it. */
+  sessions?: boolean;
   /** Origin of the Vite/dev UI this Core was started for, when known. */
   webUrl?: string | null;
 }
@@ -188,6 +191,7 @@ async function probeEndpoint(
       version?: string;
       sessionToken?: string;
       transcode?: boolean;
+      sessions?: boolean;
       pairingRequired?: boolean;
       webUrl?: string | null;
     };
@@ -215,6 +219,7 @@ async function probeEndpoint(
       token,
       version: health.version ?? 'unknown',
       transcode: health.transcode === true,
+      sessions: health.sessions === true,
       webUrl: typeof health.webUrl === 'string' && health.webUrl ? health.webUrl : null,
     };
   } finally {
@@ -738,6 +743,173 @@ export async function startRemux(
     // Older Cores don't send the header; assume the seek landed exactly.
     startSeconds: landed,
   };
+}
+
+export type SessionPhase = 'resolving' | 'probing' | 'ready' | 'failed' | 'closed';
+
+export interface PlaybackSessionStatus {
+  id: string;
+  phase: SessionPhase;
+  error?: { code: string; message: string };
+  mode?: 'direct' | 'hls';
+  durationSeconds?: number;
+  torrentId?: number;
+  infoHash?: string;
+  fileIndex?: number;
+  fileName?: string;
+  torrent?: {
+    progressBytes: number;
+    totalBytes: number;
+    downloadMbps: number;
+    peers: number;
+    finished: boolean;
+  };
+  remux?: {
+    segmentsReady: number;
+    starvedSeconds?: number | null;
+    restarts: number;
+  };
+  timeline: {
+    resolvedMs?: number;
+    initializedMs?: number;
+    probedMs?: number;
+    readyMs?: number;
+    firstMediaMs?: number;
+  };
+}
+
+/** A session Core no longer knows — it restarted, or the session expired.
+ *  The source itself is fine; the caller recreates the session. */
+export class SessionGoneError extends Error {}
+
+/** A source Core gave up on (no peers, unsupported codec, stalled swarm). */
+export class SessionFailedError extends Error {
+  code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** Starts a Core-owned playback session for one source. Returns at once;
+ *  poll `waitForSession` until it is ready. */
+export async function createSession(
+  engine: LocalEngineConnection,
+  request: {
+    magnet: string;
+    mediaKey?: string;
+    title?: string;
+    fileIndex?: number | null;
+    resumeSeconds?: number;
+    hevc: boolean;
+  },
+): Promise<PlaybackSessionStatus> {
+  const response = await engineFetch(engine, '/v1/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    const message = await readEngineError(response, 'Cubo Core could not open the stream');
+    if (response.status === 507) throw new InsufficientStorageError(message);
+    throw new Error(message);
+  }
+  return (await response.json()) as PlaybackSessionStatus;
+}
+
+/** Asks Core to warm a source the viewer is likely to open next (metadata,
+ *  file header, probe) without downloading the whole file. Best-effort and
+ *  fire-and-forget: older Cores without the route just 404. */
+export function prefetchSource(
+  engine: LocalEngineConnection,
+  request: {
+    magnet: string;
+    mediaKey?: string;
+    title?: string;
+    fileIndex?: number | null;
+    hevc: boolean;
+  },
+): void {
+  if (!engine.sessions) return;
+  void engineFetch(engine, '/v1/prefetch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  }).catch(() => undefined);
+}
+
+export async function getSession(
+  engine: LocalEngineConnection,
+  id: string,
+  signal?: AbortSignal,
+): Promise<PlaybackSessionStatus> {
+  const response = await engineFetch(engine, `/v1/sessions/${encodeURIComponent(id)}`, { signal });
+  if (response.status === 404) throw new SessionGoneError('The playback session ended.');
+  if (!response.ok) throw new Error(await readEngineError(response, 'Session status failed'));
+  return (await response.json()) as PlaybackSessionStatus;
+}
+
+/** Polls until the session can play. Rejects with `SessionFailedError` when
+ *  Core gives up on the source. */
+export async function waitForSession(
+  engine: LocalEngineConnection,
+  id: string,
+  {
+    signal,
+    onStatus,
+  }: { signal?: AbortSignal; onStatus?: (status: PlaybackSessionStatus) => void } = {},
+): Promise<PlaybackSessionStatus> {
+  for (;;) {
+    signal?.throwIfAborted();
+    const status = await getSession(engine, id, signal);
+    onStatus?.(status);
+    if (status.phase === 'ready') return status;
+    if (status.phase === 'failed' || status.phase === 'closed') {
+      const message = status.error?.message ?? 'The stream failed';
+      if (status.error?.code === 'disk_full') throw new InsufficientStorageError(message);
+      throw new SessionFailedError(status.error?.code ?? 'failed', message);
+    }
+    await delayUnthrottled(250, signal);
+  }
+}
+
+/** Tells Core where the viewer is. Drives how far ahead Core converts and
+ *  keeps the session alive while paused. */
+export async function heartbeatSession(
+  engine: LocalEngineConnection,
+  id: string,
+  positionSeconds: number,
+  playing: boolean,
+): Promise<void> {
+  const response = await engineFetch(engine, `/v1/sessions/${encodeURIComponent(id)}/heartbeat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ positionSeconds, playing }),
+  });
+  if (response.status === 404) throw new SessionGoneError('The playback session ended.');
+}
+
+export function closeSession(engine: LocalEngineConnection, id: string): void {
+  void engineFetch(engine, `/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(
+    () => undefined,
+  );
+}
+
+/** For `navigator.sendBeacon` on page unload (no custom headers there). */
+export function sessionCloseBeaconUrl(engine: LocalEngineConnection, id: string): string {
+  return `${engine.baseUrl}/v1/sessions/${encodeURIComponent(id)}/close?token=${encodeURIComponent(engine.token)}`;
+}
+
+export function sessionMediaUrl(
+  engine: LocalEngineConnection,
+  status: PlaybackSessionStatus,
+): string {
+  const id = encodeURIComponent(status.id);
+  const token = encodeURIComponent(engine.token);
+  return status.mode === 'hls'
+    ? `${engine.baseUrl}/v1/sessions/${id}/hls/media.m3u8?token=${token}`
+    : `${engine.baseUrl}/v1/sessions/${id}/stream?token=${token}`;
 }
 
 /** Index of the file Cubo should play. When rqbit marked a subset

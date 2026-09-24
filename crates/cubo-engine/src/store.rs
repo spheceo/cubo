@@ -343,6 +343,16 @@ impl CoreStore {
         Ok(snapshot)
     }
 
+    /// Sets a budget below the UI minimum so tests can create cache pressure
+    /// with small fixtures.
+    #[cfg(test)]
+    pub async fn set_cache_limit_unclamped(&self, max_bytes: u64) {
+        let _writer = self.persist_lock.lock().await;
+        let mut data = self.data.lock().await;
+        data.cache.max_bytes = max_bytes;
+        let _ = self.persist_locked(data).await;
+    }
+
     pub async fn update_cache_directory(&self, directory: PathBuf) -> Result<CoreData, String> {
         let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
@@ -371,8 +381,12 @@ impl CoreStore {
             entry.torrent_id = torrent_id.or(entry.torrent_id);
             entry.media_key = media_key.or_else(|| entry.media_key.clone());
             entry.title = title.or_else(|| entry.title.clone());
-            if !files.is_empty() {
-                entry.files = files;
+            // A season pack reopened for another episode adds that file;
+            // eviction must still remove every episode it downloaded.
+            for file in files {
+                if !entry.files.contains(&file) {
+                    entry.files.push(file);
+                }
             }
             entry.last_accessed_at = now;
         } else {

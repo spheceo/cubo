@@ -132,6 +132,7 @@ async fn fixture_state(
         .unwrap();
     let transcode = Arc::new(TranscodeManager::new(root.join("transcode")));
     fs::write(transcode.dir().join("segment.m4s"), b"converted").unwrap();
+    let sessions = crate::session::SessionManager::for_tests(root, transcode.clone(), store.clone()).await;
     let state = BridgeState {
         rqbit_port,
         token: "fixture-token".into(),
@@ -149,6 +150,7 @@ async fn fixture_state(
         subtitle_matches: Arc::new(Mutex::new(HashMap::new())),
         pairing: Arc::new(PairingManager::load(root).unwrap()),
         updater: Arc::new(UpdateManager::new()),
+        sessions,
     };
     (state, server)
 }

@@ -196,6 +196,25 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   startup still depends on peer availability. The ffmpeg offset, A/V sync,
   playlist generation, and segment-cache invariants above remain load-bearing.
 
+- Session starts race sources (`raceSessions` in `watch-screen.tsx`): the
+  top pick runs alone for a few seconds, backups join while nothing is
+  visibly downloading, the first ready plays and the rest are closed. Never
+  go back to one-at-a-time attempts behind Core's resolve timeout.
+- Core never re-resolves a known source from the swarm: a torrent rqbit
+  already manages is reused, otherwise saved metadata
+  (`<data>/torrent-meta/<hash>.torrent`) is added from disk. rqbit resolves
+  magnet metadata from peers *before* checking what it manages, so passing
+  a magnet for a known torrent can hang on a fully downloaded file.
+- `POST /v1/prefetch` warms the next episode (last 12 minutes of the
+  current one) and the title page's play target: metadata, header, probe.
+  It then parks the torrent (kept paused by maintenance until a session
+  plays it); sources that close without ever serving media are parked too,
+  so guesses and race losers never download whole files.
+- Foreign-script titles (Cyrillic, CJK, …) and Russian voice-over studios
+  are dubs for other-language originals unless the release says it carries
+  the original track; Chinese burned-in caption markers (中英双字 …) are
+  hardsubs. A 🇬🇧 flag beside other flags proves nothing.
+
 - Featured heroes rotate across eligible catalog titles (last decade only),
   using recent history shared across Home, Movies, and TV. Each page holds
   its choice for several hours across refreshes; never revert to always

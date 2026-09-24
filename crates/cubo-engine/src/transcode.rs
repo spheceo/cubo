@@ -49,6 +49,9 @@ pub struct MediaProbe {
     /// never blindly take `0:a:0`.
     pub audio_stream_index: Option<u32>,
     pub duration_seconds: Option<f64>,
+    /// ffprobe's container name list, e.g. `matroska,webm` or
+    /// `mov,mp4,m4a,3gp,3g2,mj2`.
+    pub format_name: Option<String>,
     /// Container chapters — named ones ("Intro", "Credits", "OP"/"ED") give
     /// exact, provider-independent skip windows.
     pub chapters: Vec<Chapter>,
@@ -202,7 +205,7 @@ impl MediaProbe {
             .is_some_and(|codec| COPYABLE_VIDEO.contains(&codec))
     }
 
-    fn audio_copyable(&self) -> bool {
+    pub fn audio_copyable(&self) -> bool {
         match self.audio_codec.as_deref() {
             None => true,
             Some(codec) => COPYABLE_AUDIO.contains(&codec),
@@ -236,6 +239,7 @@ struct FfprobeChapterTags {
 #[derive(Default, Deserialize)]
 struct FfprobeFormat {
     duration: Option<String>,
+    format_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -445,6 +449,10 @@ impl TranscodeManager {
         self.remux_sink.report_segment_served(&job, file).await
     }
 
+    pub fn ffmpeg_path(&self) -> Option<&Path> {
+        self.ffmpeg.as_deref()
+    }
+
     pub fn available(&self) -> bool {
         self.ffmpeg.is_some() && self.ffprobe.is_some()
     }
@@ -552,6 +560,7 @@ impl TranscodeManager {
             audio_codec: audio.and_then(|stream| stream.codec_name.clone()),
             audio_stream_index: audio.and_then(|stream| stream.index),
             duration_seconds,
+            format_name: parsed.format.format_name.clone(),
             chapters,
         })
     }
@@ -1139,7 +1148,7 @@ async fn find_keyframe_once(
 
 /// Locates a bundled or system ffmpeg tool. The directory next to the CLI
 /// executable is checked first so a release sidecar wins over system installs.
-fn find_tool(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_tool(name: &str) -> Option<PathBuf> {
     let file_name = if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -1402,6 +1411,7 @@ exec sleep 30"#,
                 audio_codec: Some("aac".into()),
                 audio_stream_index: Some(1),
                 duration_seconds: Some(3000.0),
+                format_name: None,
                 chapters: vec![],
             };
             let dir = manager
@@ -1521,6 +1531,7 @@ printf '99.0,K_\n'"#,
                 audio_codec: Some("aac".into()),
                 audio_stream_index: Some(1),
                 duration_seconds: Some(3000.0),
+                format_name: None,
                 chapters: vec![],
             };
             let input = fixture.0.join("input").to_str().unwrap().to_owned();
@@ -1622,6 +1633,7 @@ printf '99.0,K_\n'"#,
                 audio_codec: Some("aac".into()),
                 audio_stream_index: Some(1),
                 duration_seconds: Some(300.0),
+                format_name: None,
                 chapters: vec![],
             };
             let dir = manager

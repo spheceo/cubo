@@ -1,13 +1,13 @@
 /**
- * Cubo's video player. Part of the verified-working playback pipeline
- * (see AGENTS.md) — two properties here are load-bearing:
+ * Cubo's video player. Two source shapes reach it:
  *
- * 1. Remuxed (HLS) sources always play through hls.js, never the native HLS
- *    stack, because native players treat Core's growing playlist as live.
- * 2. All displayed, reported, and sought positions are ABSOLUTE movie time:
- *    a remux playlist starts `timeOffset` seconds into the source, and seeks
- *    outside the converted window hand off to `onSeekOutside` so the owner
- *    can restart the converter at the target.
+ * - Playback sessions (`vod`): Core serves a complete VOD playlist whose
+ *   timestamps are the movie's own, so the player starts at the resume point
+ *   and seeks anywhere with no offset bookkeeping.
+ * - The legacy remux pipeline: a growing EVENT playlist that starts
+ *   `timeOffset` seconds into the source. It must play through hls.js (native
+ *   players treat it as live), every position is offset back to absolute
+ *   movie time, and seeks outside the converted window go to `onSeekOutside`.
  */
 import {
   IoContract,
@@ -52,6 +52,7 @@ import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
 import { REMUX_HLS_CONFIG } from '@/lib/remux-hls-config';
+import { sessionHlsConfig } from '@/lib/session-hls-config';
 import type { SkipSection } from '@/lib/local-engine';
 
 const HIDE_DELAY_MS = 2600;
@@ -87,6 +88,7 @@ export type PlayerSubtitle = {
 export function VideoPlayer({
   src,
   hls = false,
+  vod = false,
   durationHint = null,
   timeOffset = 0,
   title,
@@ -109,6 +111,7 @@ export function VideoPlayer({
   onSeekIntent,
   onPlaying,
   onError,
+  onStall,
   flushRef,
   topRightControls,
   introWindow,
@@ -132,6 +135,9 @@ export function VideoPlayer({
   src: string;
   /** True when `src` is an HLS playlist from Core's remux pipeline. */
   hls?: boolean;
+  /** The HLS playlist is a playback session's complete VOD playlist in
+   *  absolute movie time: start at `initialTime`, seek natively. */
+  vod?: boolean;
   /** Full source duration reported by Core while a growing HLS playlist is incomplete. */
   durationHint?: number | null;
   /** Seconds into the source where this HLS playlist begins (seek restart).
@@ -173,6 +179,8 @@ export function VideoPlayer({
   onSeekIntent?: (absoluteSeconds: number) => void;
   onError: () => void;
   onPlaying?: () => void;
+  /** A mid-playback buffering pause ended (not startup, seeks or pauses). */
+  onStall?: (stall: { positionSeconds: number; durationMs: number }) => void;
   /** Parent calls this before leaving so progress is snapshotted while the
    *  video element still has a real currentTime. */
   flushRef?: MutableRefObject<(() => void) | null>;
@@ -190,6 +198,10 @@ export function VideoPlayer({
   const lastProgressReport = useRef(0);
   const lastProgressWallTime = useRef(0);
   const sessionReported = useRef(false);
+  /** Set by the first `playing` of the current source; stalls before it are
+   *  startup, not interruptions. */
+  const playedSinceSource = useRef(false);
+  const stallRef = useRef<{ startedAt: number; position: number } | null>(null);
   /** One-shot local seek (seek-restart catch-up), applied per source. */
   const localSeekApplied = useRef<string | null>(null);
   /** False only when the viewer hit pause — browsers pausing a hidden tab
@@ -270,6 +282,11 @@ export function VideoPlayer({
   // stable seek helpers never go stale or rerun on unrelated renders.
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+  const onStallRef = useRef(onStall);
+  onStallRef.current = onStall;
+  /** Read once per source by the session hls.js setup (its start position). */
+  const initialTimeRef = useRef(initialTime);
+  initialTimeRef.current = initialTime;
   const onSeekOutsideRef = useRef(onSeekOutside);
   onSeekOutsideRef.current = onSeekOutside;
   const timeOffsetRef = useRef(timeOffset);
@@ -586,7 +603,36 @@ export function VideoPlayer({
     setPendingSeek(null);
     retainedWindowStartRef.current = null;
     remuxEvictionHandledRef.current = false;
+    playedSinceSource.current = false;
+    stallRef.current = null;
   }, [src, hls, durationHint, markUserPaused]);
+
+  // Mid-playback buffering, for diagnostics: a wait that begins while the
+  // source was playing normally. Startup loads, seeks and pauses are not
+  // stalls; a seek that starts during one discards it.
+  useEffect(() => {
+    if (pendingSeek != null || heldPaused) {
+      stallRef.current = null;
+      return;
+    }
+    const video = videoRef.current;
+    if (waiting) {
+      if (video && !stallRef.current && playedSinceSource.current) {
+        stallRef.current = {
+          startedAt: performance.now(),
+          position: timeOffsetRef.current + video.currentTime,
+        };
+      }
+      return;
+    }
+    const stall = stallRef.current;
+    stallRef.current = null;
+    if (!stall) return;
+    const durationMs = performance.now() - stall.startedAt;
+    if (durationMs >= 250) {
+      onStallRef.current?.({ positionSeconds: stall.position, durationMs });
+    }
+  }, [waiting, pendingSeek, heldPaused]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -622,6 +668,35 @@ export function VideoPlayer({
       if (cancelled) return;
       if (!Hls.isSupported()) {
         onErrorRef.current();
+        return;
+      }
+      if (vod) {
+        instance = new Hls(sessionHlsConfig(initialTimeRef.current));
+        instance.loadSource(src);
+        instance.attachMedia(video);
+        instance.on(Hls.Events.MANIFEST_PARSED, () => {
+          sourceReadyRef.current = true;
+          start();
+        });
+        // hls.js already retried the request policy; one more round of
+        // recovery before telling the owner, who asks Core what happened.
+        let networkRecoveries = 0;
+        let mediaRecoveries = 0;
+        instance.on(Hls.Events.ERROR, (_event, data) => {
+          if (!data.fatal || !instance) return;
+          const gone = data.response?.code === 404 || data.response?.code === 410;
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !gone && networkRecoveries < 2) {
+            networkRecoveries += 1;
+            instance.startLoad();
+            return;
+          }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
+            mediaRecoveries += 1;
+            instance.recoverMediaError();
+            return;
+          }
+          onErrorRef.current();
+        });
         return;
       }
       instance = new Hls({
@@ -670,7 +745,7 @@ export function VideoPlayer({
       stopPlayLoop();
       instance?.destroy();
     };
-  }, [src, hls, requestPlay, stopPlayLoop]);
+  }, [src, hls, vod, requestPlay, stopPlayLoop]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1210,6 +1285,7 @@ export function VideoPlayer({
           if (!userPaused.current) setWaiting(true);
         }}
         onPlaying={(event) => {
+          playedSinceSource.current = true;
           syncBuffered(event.currentTarget);
           applyPendingSeek(event.currentTarget);
           setWaiting(false);

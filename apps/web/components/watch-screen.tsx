@@ -1,9 +1,11 @@
 /**
- * Orchestrates a playback session: source ranking, torrent add + buffering,
- * direct-play vs Core remux decision, resume, mid-play source fallback, and
- * seek-restarts of the converter. Part of the verified-working playback
- * pipeline (see AGENTS.md); the ordering of these steps and the absolute-time
- * offset model are deliberate — change with care.
+ * Orchestrates playback: source ranking, resume, and mid-play source
+ * fallback. With a Core that runs playback sessions, Core owns everything
+ * about the chosen source (torrent, file, direct vs remux, conversion
+ * window) and the client only creates the session, heartbeats its position,
+ * and asks Core what went wrong before giving up on a source. Older Cores
+ * use the legacy path (torrent add + growing remux playlist + seek restarts
+ * with absolute-time offsets).
  */
 import {
   backdropUrl,
@@ -32,8 +34,18 @@ import { watchOrigin } from './watch-origin';
 import { VideoPlayer, type PlayerSubtitle } from './video-player';
 import {
   addMagnet,
+  closeSession,
+  createSession,
+  getSession,
+  heartbeatSession,
   InsufficientStorageError,
   buildMagnet,
+  SessionGoneError,
+  sessionCloseBeaconUrl,
+  sessionMediaUrl,
+  waitForSession,
+  type LocalEngineConnection,
+  type PlaybackSessionStatus,
   getLibrary,
   getSkipSegments,
   getSubtitleMatch,
@@ -63,13 +75,23 @@ import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playbac
 import { historyForEpisode, playbackKey } from '@/lib/library';
 import { resolveNextEpisode } from '@/lib/next-episode';
 import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
-import { isAutomaticSource, rankStreams, streamKey } from '@/lib/stream-select';
+import { isAutomaticSource, streamKey } from '@/lib/stream-select';
 import { ProgressWriter } from '@/lib/progress-writer';
-import { forgetSource, loadSource, preferSource, rememberSource } from '@/lib/source-affinity';
+import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
+import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
 import { onCacheClear } from '@/lib/cache-events';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
 const AUTO_ATTEMPTS = 3;
+/** Session starts race sources: how many may run at once, how many are
+ *  tried in total, and how long the leader runs alone before a backup joins. */
+const RACE_CONCURRENCY = 3;
+const RACE_MAX_ATTEMPTS = 5;
+const RACE_STAGGER_MS = 5_000;
+/** A racer pulling the header at least this fast (MiB/s) is left alone. */
+const RACE_HEALTHY_MBPS = 2;
+/** How close to the end the next episode gets warmed. */
+const NEXT_EPISODE_PREFETCH_SECONDS = 12 * 60;
 /** Core writes are coalesced; localStorage is updated on every tick. */
 const CORE_PROGRESS_MS = 5_000;
 /** Bytes that make the buffering stage feel "full" — playback usually starts well before this. */
@@ -85,6 +107,23 @@ const STAGE = {
 };
 
 type Status = 'loading' | 'starting' | 'ready' | 'error';
+
+/** Heartbeat cadence; Core closes sessions it has not heard from in minutes. */
+const HEARTBEAT_MS = 5_000;
+/** Same-source recoveries (Core restarted, player gave up on a healthy
+ *  session) allowed per window before the source counts as failed. */
+const RECOVERY_LIMIT = 3;
+const RECOVERY_WINDOW_MS = 5 * 60_000;
+
+function sessionStage(status: PlaybackSessionStatus): number {
+  if (status.phase === 'resolving') return STAGE.opening;
+  if (status.phase === 'probing') {
+    const bytes = status.torrent?.progressBytes ?? 0;
+    const ratio = Math.min(1, bytes / BUFFER_TARGET_BYTES);
+    return STAGE.buffering + (STAGE.bufferingFull - STAGE.buffering) * ratio;
+  }
+  return STAGE.ready;
+}
 
 export function WatchScreen({
   mediaType,
@@ -126,6 +165,8 @@ export function WatchScreen({
   const [needsCore, setNeedsCore] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoIsHls, setVideoIsHls] = useState(false);
+  /** The source is a Core playback session (complete playlist, absolute time). */
+  const [videoVod, setVideoVod] = useState(false);
   const [videoDurationHint, setVideoDurationHint] = useState<number | null>(null);
   /** Where the current remux playlist begins within the source (seek restart). */
   const [videoTimeOffset, setVideoTimeOffset] = useState(0);
@@ -147,6 +188,23 @@ export function WatchScreen({
   const [resumeAt, setResumeAt] = useState(0);
   const [episodesOpen, setEpisodesOpen] = useState(false);
   const cacheClearingRef = useRef(false);
+  /** The Core playback session currently attached to the player. */
+  const sessionRef = useRef<{ connection: LocalEngineConnection; id: string } | null>(null);
+  const recoveriesRef = useRef<{ key: string; count: number; since: number } | null>(null);
+  /** Startup timeline for the `playback_startup` diagnostic. */
+  const startupRef = useRef<{
+    t0: number;
+    firstStartAt: number | null;
+    readyAt: number | null;
+    session: PlaybackSessionStatus | null;
+    reported: boolean;
+  }>({ t0: 0, firstStartAt: null, readyAt: null, session: null, reported: true });
+
+  const releaseSession = useCallback(() => {
+    const current = sessionRef.current;
+    sessionRef.current = null;
+    if (current) closeSession(current.connection, current.id);
+  }, []);
 
   useEffect(() => {
     const stopForCacheClear = (baseUrl: string) => {
@@ -282,6 +340,9 @@ export function WatchScreen({
     startIndex: number,
     auto: boolean,
     resumeFrom?: number,
+    /** Candidates that arrive later (Torrentio results behind a remembered
+     *  source); they join the race when they land. */
+    more?: Promise<Stream[]>,
   ): Promise<boolean> {
     const attempt = (attemptRef.current += 1);
     const stale = () => attemptRef.current !== attempt || abort.signal.aborted;
@@ -290,10 +351,13 @@ export function WatchScreen({
     startAbortRef.current = abort;
 
     storageBlockedRef.current = false;
+    releaseSession();
+    startupRef.current.firstStartAt ??= performance.now();
     setStatus('starting');
     setError(null);
     setNeedsCore(false);
     setVideoUrl(null);
+    setVideoVod(false);
     setVideoDurationHint(null);
     setVideoTimeOffset(0);
     setVideoStartLocal(null);
@@ -348,6 +412,20 @@ export function WatchScreen({
       return false;
     }
     if (stale()) return false;
+
+    if (connection.sessions) {
+      return raceSessions({
+        connection,
+        list,
+        startIndex,
+        auto,
+        startAtFor: (stream) =>
+          resumeFrom != null ? resume : resumeForSource(resume, savedInfoHash, stream.infoHash),
+        more,
+        abort,
+        stale,
+      });
+    }
 
     const limit = auto ? list.length : startIndex + 1;
     let lastError = 'Could not start playback';
@@ -507,6 +585,8 @@ export function WatchScreen({
         setProgress(1);
         const reveal = () => {
           if (stale()) return false;
+          startupRef.current.readyAt = performance.now();
+          startupRef.current.session = null;
           setVideoUrl(url);
           setVideoIsHls(usesHls);
           setVideoDurationHint(durationHint);
@@ -535,6 +615,270 @@ export function WatchScreen({
     return false;
   }
 
+  /** Session-backed start. Sources race instead of queueing: the best one
+   *  gets a head start, a backup joins every RACE_STAGGER_MS while nothing is
+   *  clearly downloading (and at once when a racer fails), and the first to
+   *  become ready plays. The rest are closed. A dead source costs seconds,
+   *  not Core's resolve timeout. */
+  async function raceSessions({
+    connection,
+    list,
+    startIndex,
+    auto,
+    startAtFor,
+    more,
+    abort,
+    stale,
+  }: {
+    connection: LocalEngineConnection;
+    list: Stream[];
+    startIndex: number;
+    auto: boolean;
+    startAtFor: (stream: Stream) => number;
+    more?: Promise<Stream[]>;
+    abort: AbortController;
+    stale: () => boolean;
+  }): Promise<boolean> {
+    type Racer = {
+      stream: Stream;
+      index: number;
+      sessionId: string | null;
+      status: PlaybackSessionStatus | null;
+      done: boolean;
+      abort: AbortController;
+    };
+    let lastError = 'Could not start playback';
+    const queue: { stream: Stream; index: number }[] = [];
+    const queued = new Set<string>();
+    const enqueue = (stream: Stream, index: number) => {
+      const key = streamKey(stream);
+      if (queued.has(key)) return;
+      if (auto && failedSourcesRef.current.has(stream.infoHash)) return;
+      if (auto && !isAutomaticSource(stream, originalLanguage)) {
+        lastError = 'No suitable original-language source is available.';
+        return;
+      }
+      queued.add(key);
+      queue.push({ stream, index });
+    };
+    const limit = auto ? list.length : startIndex + 1;
+    for (let index = startIndex; index < limit; index += 1) enqueue(list[index], index);
+
+    const maxAttempts = auto ? RACE_MAX_ATTEMPTS : 1;
+    const racers = new Set<Racer>();
+    let launched = 0;
+    let lastLaunch = 0;
+    let moreDone = !auto || !more;
+    let settled = false;
+
+    return new Promise<boolean>((resolve) => {
+      const retire = (racer: Racer) => {
+        racer.done = true;
+        racer.abort.abort();
+        racers.delete(racer);
+        if (racer.sessionId) closeSession(connection, racer.sessionId);
+      };
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearInterval(timer);
+        abort.signal.removeEventListener('abort', onAbort);
+        for (const racer of [...racers]) retire(racer);
+        resolve(result);
+      };
+      const onAbort = () => finish(false);
+      abort.signal.addEventListener('abort', onAbort);
+
+      const launch = () => {
+        if (settled || launched >= maxAttempts) return;
+        const next = queue.shift();
+        if (!next) return;
+        launched += 1;
+        lastLaunch = performance.now();
+        const racer: Racer = {
+          ...next,
+          sessionId: null,
+          status: null,
+          done: false,
+          abort: new AbortController(),
+        };
+        racers.add(racer);
+        void run(racer);
+      };
+
+      const giveUpOrContinue = () => {
+        if (settled || racers.size > 0) return;
+        if (queue.length > 0 && launched < maxAttempts) {
+          launch();
+          return;
+        }
+        if (!moreDone) return;
+        if (!stale()) {
+          setStatus('error');
+          setError(lastError);
+        }
+        finish(false);
+      };
+
+      const run = async (racer: Racer) => {
+        const { stream } = racer;
+        const startAt = startAtFor(stream);
+        try {
+          const created = await createSession(connection, {
+            magnet: buildMagnet(stream),
+            mediaKey: itemKey,
+            title,
+            fileIndex: stream.fileIdx ?? null,
+            resumeSeconds: startAt,
+            hevc: supportsHevcRemux(),
+          });
+          racer.sessionId = created.id;
+          if (racer.done || settled || stale()) {
+            closeSession(connection, created.id);
+            return;
+          }
+          const ready = await waitForSession(connection, created.id, {
+            signal: racer.abort.signal,
+            onStatus: (sessionStatus) => {
+              racer.status = sessionStatus;
+              if (!stale()) setStage(Math.max(targetRef.current, sessionStage(sessionStatus)));
+            },
+          });
+          if (racer.done || settled || stale()) return;
+          racers.delete(racer);
+          racer.done = true;
+          finish(true);
+          attachSession(connection, stream, racer.index, list.length, auto, startAt, ready, abort, stale);
+        } catch (reason) {
+          if (racer.done || settled) return;
+          if (stale() || abort.signal.aborted) {
+            finish(false);
+            return;
+          }
+          retire(racer);
+          lastError = reason instanceof Error ? reason.message : lastError;
+          if (reason instanceof InsufficientStorageError) {
+            storageBlockedRef.current = true;
+            setStatus('error');
+            setError(lastError);
+            finish(false);
+            return;
+          }
+          shipClientLog(connection, 'warn', 'source_unusable', {
+            name: stream.name,
+            source_title: stream.title,
+            error: lastError,
+          });
+          failedSourcesRef.current.add(stream.infoHash);
+          forgetSource(itemKey, stream.infoHash);
+          giveUpOrContinue();
+        }
+      };
+
+      // Backups join while nobody is visibly downloading. A racer already
+      // pulling the file header at a healthy rate is left alone: splitting
+      // its bandwidth would slow the likely winner.
+      const timer = window.setInterval(() => {
+        if (settled || racers.size >= RACE_CONCURRENCY) return;
+        if (performance.now() - lastLaunch < RACE_STAGGER_MS) return;
+        const healthy = [...racers].some(
+          (racer) =>
+            racer.status?.phase === 'probing'
+            && (racer.status.torrent?.downloadMbps ?? 0) >= RACE_HEALTHY_MBPS,
+        );
+        if (!healthy) launch();
+      }, 500);
+
+      if (!moreDone && more) {
+        void more
+          .then((extra) => {
+            extra.forEach((stream, offset) => enqueue(stream, list.length + offset));
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            moreDone = true;
+            giveUpOrContinue();
+          });
+      }
+
+      launch();
+      giveUpOrContinue();
+    });
+  }
+
+  /** Puts a ready session on screen. */
+  function attachSession(
+    connection: LocalEngineConnection,
+    stream: Stream,
+    index: number,
+    total: number,
+    auto: boolean,
+    startAt: number,
+    ready: PlaybackSessionStatus,
+    abort: AbortController,
+    stale: () => boolean,
+  ) {
+    lastPositionRef.current = startAt;
+    setResumeAt(startAt);
+    activeInfoHashRef.current = stream.infoHash;
+    setActiveKey(streamKey(stream));
+    setSubtitleMatch(null);
+    setSkipSegments(null);
+    sessionRef.current = { connection, id: ready.id };
+
+    const fileIndex = ready.fileIndex ?? stream.fileIdx ?? 0;
+    const id = ready.torrentId ?? ready.infoHash ?? '';
+    activeSourceRef.current = { ...stream, fileIdx: fileIndex };
+    shipClientLog(connection, 'info', 'stream_selected', {
+      index,
+      total,
+      auto,
+      resume: startAt || undefined,
+      direct_play: ready.mode === 'direct',
+      name: stream.name,
+      source_title: stream.title,
+      quality: stream.quality,
+      size_bytes: stream.sizeBytes,
+      seeders: stream.seeders,
+      filename: ready.fileName,
+      info_hash: stream.infoHash,
+      session: ready.id,
+    });
+
+    // Release-exact subtitles and intro/credits windows load beside
+    // playback; neither ever delays it.
+    void getSubtitleMatch(connection, id, fileIndex).then((match) => {
+      if (!stale()) setSubtitleMatch(match);
+    });
+    void getSkipSegments(
+      connection,
+      {
+        torrent: String(id),
+        file: fileIndex,
+        type: mediaType,
+        tmdbId: mediaId,
+        imdbId,
+        season: season ?? undefined,
+        episode: episode ?? undefined,
+      },
+      abort.signal,
+    ).then((segments) => {
+      if (!stale()) setSkipSegments(segments);
+    });
+
+    startupRef.current.readyAt = performance.now();
+    startupRef.current.session = ready;
+    setStage(STAGE.ready);
+    setProgress(1);
+    setVideoUrl(sessionMediaUrl(connection, ready));
+    setVideoIsHls(ready.mode === 'hls');
+    setVideoVod(true);
+    setVideoDurationHint(ready.durationSeconds ?? null);
+    setVideoTimeOffset(0);
+    setVideoStartLocal(null);
+    setStatus('ready');
+  }
+
   // `start` closes over fresh state every render; a ref keeps the effect below
   // from restarting playback whenever unrelated state changes.
   const startRef = useRef(start);
@@ -553,30 +897,43 @@ export function WatchScreen({
     setStatus('loading');
     setStage(STAGE.sources);
     setError(null);
+    startupRef.current = {
+      t0: performance.now(),
+      firstStartAt: null,
+      readyAt: null,
+      session: null,
+      reported: false,
+    };
+    recoveriesRef.current = null;
 
     void (async () => {
       // A successful source can start without waiting for Torrentio again.
       // Refresh alternatives in parallel for real mid-play failures.
-      const foundPromise = queryClient.fetchQuery(
-        streamQueries.streams(mediaType, imdbId, season, episode),
+      // A list warmed by the next-episode prefetch is used as is (even if a
+      // few minutes old) so the race starts at once; it refreshes behind.
+      const streamsQuery = streamQueries.streams(mediaType, imdbId, season, episode);
+      const warmed = queryClient.getQueryData(streamsQuery.queryKey);
+      if (warmed?.length) void queryClient.prefetchQuery(streamsQuery);
+      const foundPromise = (warmed?.length
+        ? Promise.resolve(warmed)
+        : queryClient.fetchQuery(streamsQuery)
       ).catch(() => [] as Stream[]);
       const connection = await core.connect().catch(() => null);
       if (cancelled) return;
       const savedSource = loadSource(itemKey);
-      const rank = (found: Stream[], saved: Stream | null) => preferSource(rankStreams(
-        saved ? [saved, ...found.filter((stream) =>
-          stream.infoHash !== saved.infoHash || (stream.fileIdx != null && stream.fileIdx !== saved.fileIdx),
-        )] : found,
-        { transcode: connection?.transcode ?? false, hevc: supportsHevcRemux() },
-        originalLanguage,
-        season != null && episode != null ? { season, episode } : null,
-      ).filter((stream) => isAutomaticSource(stream, originalLanguage)), saved);
+      const rank = (found: Stream[], saved: Stream | null) =>
+        rankForPlayback(found, saved, connection, { originalLanguage, season, episode });
       sourceRefreshRef.current = foundPromise.then((found) => rank(found, savedSource));
       try {
         const preferred = rank([], savedSource);
         if (preferred.length > 0 && connection) {
           setSources(preferred);
-          const started = await startRef.current(preferred, 0, true);
+          // Alternatives join the race as soon as Torrentio answers, so a
+          // remembered source that went dead costs seconds, not a timeout.
+          const alternatives = foundPromise.then((found) =>
+            rank(found.filter((stream) => stream.infoHash !== savedSource?.infoHash), null),
+          );
+          const started = await startRef.current(preferred, 0, true, undefined, alternatives);
           if (cancelled || storageBlockedRef.current) return;
           if (started) {
             void foundPromise.then((found) => {
@@ -641,9 +998,86 @@ export function WatchScreen({
       cancelled = true;
       startAbortRef.current?.abort();
       seekAttemptRef.current += 1;
+      releaseSession();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- core.connect is stable for a given endpoint
   }, [mediaType, mediaId, imdbId, season, episode]);
+
+  // Tell Core where the viewer is: it paces conversion from this and keeps
+  // the session (and its file) alive while the tab is open, even paused.
+  useEffect(() => {
+    if (status !== 'ready' || !videoVod) return;
+    const beat = () => {
+      const session = sessionRef.current;
+      if (!session) return;
+      void heartbeatSession(session.connection, session.id, lastPositionRef.current, true).catch(
+        () => undefined,
+      );
+    };
+    beat();
+    const interval = window.setInterval(beat, HEARTBEAT_MS);
+    return () => window.clearInterval(interval);
+  }, [status, videoVod, videoUrl]);
+
+  // Closing the tab ends the session at once instead of after Core's idle
+  // timeout (a beacon is the only request that survives unload).
+  useEffect(() => {
+    const onPageHide = () => {
+      const session = sessionRef.current;
+      if (!session) return;
+      navigator.sendBeacon(sessionCloseBeaconUrl(session.connection, session.id));
+      sessionRef.current = null;
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
+  }, []);
+
+  const reportFirstFrame = useCallback(() => {
+    const startup = startupRef.current;
+    const connection = playbackConnection.current;
+    if (startup.reported || !connection) return;
+    startup.reported = true;
+    const now = performance.now();
+    const since = (at: number | null) => (at == null ? undefined : Math.round(at - startup.t0));
+    shipClientLog(connection, 'info', 'playback_startup', {
+      total_ms: Math.round(now - startup.t0),
+      first_start_ms: since(startup.firstStartAt),
+      ready_ms: since(startup.readyAt),
+      mode: startup.session?.mode ?? 'legacy',
+      resume: lastPositionRef.current || undefined,
+      core: startup.session?.timeline,
+    });
+  }, []);
+
+  const reportStall = useCallback(
+    (stall: { positionSeconds: number; durationMs: number }) => {
+      const connection = playbackConnection.current;
+      if (!connection) return;
+      const base = {
+        position: Math.round(stall.positionSeconds),
+        duration_ms: Math.round(stall.durationMs),
+      };
+      const session = sessionRef.current;
+      if (!session) {
+        shipClientLog(connection, 'warn', 'playback_stall', { ...base, mode: 'legacy' });
+        return;
+      }
+      void getSession(session.connection, session.id)
+        .then((sessionStatus) => {
+          shipClientLog(connection, 'warn', 'playback_stall', {
+            ...base,
+            mode: sessionStatus.mode,
+            peers: sessionStatus.torrent?.peers,
+            download_mbps: sessionStatus.torrent?.downloadMbps,
+            finished: sessionStatus.torrent?.finished,
+            starved_seconds: sessionStatus.remux?.starvedSeconds ?? undefined,
+            remux_restarts: sessionStatus.remux?.restarts,
+          });
+        })
+        .catch(() => shipClientLog(connection, 'warn', 'playback_stall', base));
+    },
+    [],
+  );
 
   // Warm the episode list while the stream resolves so the Episodes drawer
   // opens instantly instead of fetching on click.
@@ -665,6 +1099,31 @@ export function WatchScreen({
         : null,
     [mediaType, season, episode, currentSeasonEpisodes.data, seasons],
   );
+
+  // Near the end of an episode, warm the next one so "Next episode" starts
+  // at once: its source list, metadata, file header and probe. Checked on a
+  // slow timer from the position refs — no re-render per tick.
+  useEffect(() => {
+    if (status !== 'ready' || !nextEpisode || !imdbId) return;
+    const target = nextEpisode;
+    const timer = window.setInterval(() => {
+      const duration = lastDurationRef.current || videoDurationHint || 0;
+      if (duration <= 0) return;
+      const remaining = duration - lastPositionRef.current;
+      if (remaining > NEXT_EPISODE_PREFETCH_SECONDS) return;
+      window.clearInterval(timer);
+      void prefetchTitle(playbackConnection.current, {
+        mediaType,
+        mediaId,
+        imdbId,
+        title,
+        originalLanguage,
+        season: target.season,
+        episode: target.episode,
+      });
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [status, nextEpisode, imdbId, mediaType, mediaId, title, originalLanguage, videoDurationHint]);
 
   useEffect(() => {
     if (!imdbId) return;
@@ -859,6 +1318,7 @@ export function WatchScreen({
   useEffect(
     () => () => {
       startAbortRef.current?.abort();
+      releaseSession();
       persistLastPlayheadRef.current();
       void (progressWriterRef.current?.whenIdle() ?? Promise.resolve()).then(() => {
         void refreshLibraryRef.current();
@@ -927,6 +1387,90 @@ export function WatchScreen({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [goBack]);
 
+  // A source died mid-play: quietly move down the ranked list and resume
+  // where the viewer was instead of dead-ending on an error.
+  function failOver() {
+    const failedIndex = sources.findIndex(
+      (stream) => streamKey(stream) === activeKey,
+    );
+    const failed = failedIndex >= 0 ? sources[failedIndex] : null;
+    if (failed) {
+      failedSourcesRef.current.add(failed.infoHash);
+      forgetSource(itemKey, failed.infoHash);
+    }
+    if (playbackConnection.current) {
+      shipClientLog(
+        playbackConnection.current,
+        'warn',
+        'source_failed',
+        {
+          failed_name: failed?.name,
+          failed_title: failed?.title,
+          next_index: failedIndex + 1,
+          total: sources.length,
+          resume_at: lastPositionRef.current || undefined,
+        },
+      );
+    }
+    const nextIndex = failedIndex >= 0 ? failedIndex + 1 : 0;
+    if (nextIndex < sources.length) {
+      void start(sources, nextIndex, true, lastPositionRef.current);
+    } else {
+      // A remembered source can fail before its alternatives have
+      // arrived. Wait for that existing lookup before giving up.
+      const attempt = attemptRef.current;
+      void (sourceRefreshRef.current ?? Promise.resolve(sources)).then((available) => {
+        if (attemptRef.current !== attempt || startAbortRef.current?.signal.aborted) return;
+        const alternatives = available.filter((stream) => !failedSourcesRef.current.has(stream.infoHash));
+        if (alternatives.length > 0) {
+          setSources(alternatives);
+          void start(alternatives, 0, true, lastPositionRef.current);
+        } else {
+          setStatus('error');
+          setError('None of the suitable sources could be played in this browser.');
+        }
+      });
+    }
+  }
+
+  // A session-backed player gave up. Ask Core before blaming the source:
+  // Core restarting (session unknown) or a player-side hiccup on a healthy
+  // session resumes the same source in place; only a source Core itself
+  // failed moves down the list.
+  async function recoverSession(session: { connection: LocalEngineConnection; id: string }) {
+    const attempt = attemptRef.current;
+    let sessionStatus: PlaybackSessionStatus | null = null;
+    let gone = false;
+    try {
+      sessionStatus = await getSession(session.connection, session.id);
+    } catch (reason) {
+      gone = reason instanceof SessionGoneError;
+    }
+    if (attemptRef.current !== attempt || sessionRef.current?.id !== session.id) return;
+    shipClientLog(session.connection, 'warn', 'session_error', {
+      gone,
+      phase: sessionStatus?.phase,
+      code: sessionStatus?.error?.code,
+      error: sessionStatus?.error?.message,
+      starved_seconds: sessionStatus?.remux?.starvedSeconds ?? undefined,
+      position: lastPositionRef.current || undefined,
+    });
+    const healthy = gone || sessionStatus?.phase === 'ready';
+    const now = Date.now();
+    const key = activeKey ?? '';
+    const recoveries =
+      recoveriesRef.current?.key === key && now - recoveriesRef.current.since < RECOVERY_WINDOW_MS
+        ? recoveriesRef.current
+        : { key, count: 0, since: now };
+    if (healthy && recoveries.count < RECOVERY_LIMIT) {
+      recoveriesRef.current = { ...recoveries, count: recoveries.count + 1 };
+      const index = sources.findIndex((stream) => streamKey(stream) === activeKey);
+      void start(sources, Math.max(0, index), true, lastPositionRef.current);
+      return;
+    }
+    failOver();
+  }
+
   const backdrop = backdropUrl(backdropPath, 'w780');
   const busy = status === 'loading' || status === 'starting';
 
@@ -952,6 +1496,7 @@ export function WatchScreen({
           ) : null}
           src={videoUrl}
           hls={videoIsHls}
+          vod={videoVod}
           durationHint={videoDurationHint}
           timeOffset={videoTimeOffset}
           title={title}
@@ -967,11 +1512,12 @@ export function WatchScreen({
           onPickCaptionColor={(color: CaptionColor) => updateCaptionPrefs({ color })}
           subtitles={subtitleTracks}
           activeSubtitleId={activeSubtitleId}
-          initialTime={videoIsHls ? 0 : resumeAt}
-          startTimeLocal={videoIsHls ? videoStartLocal : null}
+          initialTime={videoIsHls && !videoVod ? 0 : resumeAt}
+          startTimeLocal={videoIsHls && !videoVod ? videoStartLocal : null}
           onPlaybackProgress={savePlaybackProgress}
           onPlaying={() => {
             if (activeSourceRef.current) rememberSource(itemKey, activeSourceRef.current);
+            reportFirstFrame();
           }}
           flushRef={playerFlushRef}
           introWindow={skipSegments?.intro ?? null}
@@ -980,57 +1526,21 @@ export function WatchScreen({
           onCreditsReached={markDoneAtCredits}
           sections={skipSegments?.sections}
           onSeekIntent={recordSeekIntent}
-          onSeekOutside={(target) => void requestRemuxSeek(target)}
+          onSeekOutside={videoVod ? undefined : (target) => void requestRemuxSeek(target)}
           onError={() => {
             if (cacheClearingRef.current) return;
             // Restarting ffmpeg for a seek kills the current playlist;
             // that looks identical to a dead source and must not fall
             // through to the next torrent at the old resume position.
             if (seekingRef.current || seekTargetRef.current != null) return;
-            // A source died mid-play: quietly move down the ranked list and
-            // resume where the viewer was instead of dead-ending on an error.
-            const failedIndex = sources.findIndex(
-              (stream) => streamKey(stream) === activeKey,
-            );
-            const failed = failedIndex >= 0 ? sources[failedIndex] : null;
-            if (failed) {
-              failedSourcesRef.current.add(failed.infoHash);
-              forgetSource(itemKey, failed.infoHash);
+            const session = sessionRef.current;
+            if (videoVod && session) {
+              void recoverSession(session);
+              return;
             }
-            if (playbackConnection.current) {
-              shipClientLog(
-                playbackConnection.current,
-                'warn',
-                'source_failed',
-                {
-                  failed_name: failed?.name,
-                  failed_title: failed?.title,
-                  next_index: failedIndex + 1,
-                  total: sources.length,
-                  resume_at: lastPositionRef.current || undefined,
-                },
-              );
-            }
-            const nextIndex = failedIndex >= 0 ? failedIndex + 1 : 0;
-            if (nextIndex < sources.length) {
-              void start(sources, nextIndex, true, lastPositionRef.current);
-            } else {
-              // A remembered source can fail before its alternatives have
-              // arrived. Wait for that existing lookup before giving up.
-              const attempt = attemptRef.current;
-              void (sourceRefreshRef.current ?? Promise.resolve(sources)).then((available) => {
-                if (attemptRef.current !== attempt || startAbortRef.current?.signal.aborted) return;
-                const alternatives = available.filter((stream) => !failedSourcesRef.current.has(stream.infoHash));
-                if (alternatives.length > 0) {
-                  setSources(alternatives);
-                  void start(alternatives, 0, true, lastPositionRef.current);
-                } else {
-                  setStatus('error');
-                  setError('None of the suitable sources could be played in this browser.');
-                }
-              });
-            }
+            failOver();
           }}
+          onStall={reportStall}
           />
 
           {seekConverting ? (

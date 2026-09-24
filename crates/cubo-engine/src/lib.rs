@@ -4,15 +4,24 @@
 pub mod cache;
 pub mod catalog;
 pub mod engine;
+pub mod fmp4;
 pub mod logging;
+pub mod mkv_index;
 pub mod pairing;
 pub mod paths;
 pub mod remux_sink;
+pub mod remuxer;
 pub mod rolling_cache;
+pub mod segment_plan;
+pub mod session;
+#[cfg(test)]
+mod soak_tests;
 #[cfg(test)]
 mod rolling_cache_integration_tests;
 pub mod store;
 pub mod system;
+#[cfg(test)]
+mod test_support;
 pub mod transcode;
 pub mod update;
 pub mod web_static;

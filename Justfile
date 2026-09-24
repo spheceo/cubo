@@ -54,3 +54,9 @@ check:
 # Run the Rust workspace tests
 test:
     cargo test
+
+# Playback soak: real Core + local swarm + virtual player, several episodes
+# back to back with seeks. Tune with CUBO_SOAK_SPEED / _EPISODE_SECONDS /
+# _UPLOAD_KBPS (see crates/cubo-engine/src/soak_tests.rs).
+soak:
+    cargo test -p cubo-engine --release playback_soak -- --ignored --nocapture
