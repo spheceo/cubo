@@ -5,13 +5,13 @@
 //! full disk.
 
 /// Bytes Cubo always leaves free on the cache volume.
-pub const DISK_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const DISK_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Pause even the title being watched only when the volume is about to
-/// hit ENOSPC. The 10 GB reserve drives eviction of *other* titles — it
+/// hit ENOSPC. The 1 GiB reserve drives eviction of *other* titles — it
 /// must not starve remux of peers.
 pub const DISK_CRITICAL_BYTES: u64 = 512 * 1024 * 1024;
 
-/// True when the volume has no more than the reserved 10 GB left.
+/// True when the volume has no more than the reserved 1 GiB left.
 /// `None` means the volume could not be identified — that is not pressure.
 pub fn disk_is_tight(free_bytes: Option<u64>) -> bool {
     match free_bytes {
@@ -33,7 +33,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ten_gigabytes_free_is_already_tight() {
+    fn one_gibibyte_free_is_already_tight() {
         assert!(disk_is_tight(Some(DISK_RESERVE_BYTES)));
         assert!(disk_is_tight(Some(DISK_RESERVE_BYTES - 1)));
         assert!(disk_is_tight(Some(0)));

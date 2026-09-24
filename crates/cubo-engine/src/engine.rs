@@ -83,7 +83,7 @@ struct BridgeState {
     bridge_port: u16,
     download_dir: Arc<RwLock<PathBuf>>,
     cache_swap: Arc<RwLock<()>>,
-    /// True while the cache volume has no more than 10 GB free. The web UI
+    /// True while the cache volume has no more than 1 GiB free. The web UI
     /// reads this from /v1/cache and shows a banner; maintenance pauses
     /// background torrents for as long as it stays set.
     disk_pressure: Arc<AtomicBool>,
