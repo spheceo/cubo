@@ -90,6 +90,8 @@ const RACE_MAX_ATTEMPTS = 5;
 const RACE_STAGGER_MS = 5_000;
 /** A racer pulling the header at least this fast (MiB/s) is left alone. */
 const RACE_HEALTHY_MBPS = 2;
+/** A saved position moving back further than this is logged. */
+const BACKWARD_JUMP_LOG_SECONDS = 60;
 /** How close to the end the next episode gets warmed. */
 const NEXT_EPISODE_PREFETCH_SECONDS = 12 * 60;
 /** Core writes are coalesced; localStorage is updated on every tick. */
@@ -1179,6 +1181,17 @@ export function WatchScreen({
         positionSeconds = lastPositionRef.current;
         durationSeconds = lastDurationRef.current || durationSeconds;
       }
+      if (
+        lastPositionRef.current - positionSeconds > BACKWARD_JUMP_LOG_SECONDS
+        && playbackConnection.current
+      ) {
+        shipClientLog(playbackConnection.current, 'warn', 'position_jump_back', {
+          from: Math.round(lastPositionRef.current),
+          to: Math.round(positionSeconds),
+          session_started: sessionStarted,
+          persist_now: persistNow,
+        });
+      }
       lastPositionRef.current = positionSeconds;
       lastDurationRef.current = durationSeconds;
       const progressUpdatedAt = savePlayhead(itemKey, positionSeconds, durationSeconds, activeInfoHashRef.current);
@@ -1233,6 +1246,16 @@ export function WatchScreen({
   );
 
   const recordSeekIntent = useCallback((targetSeconds: number) => {
+    // Big backward moves are logged either way: an explicit one here, any
+    // other in savePlaybackProgress — so a lost place can be told apart
+    // from the viewer rewinding.
+    const from = lastPositionRef.current;
+    if (from - targetSeconds > BACKWARD_JUMP_LOG_SECONDS && playbackConnection.current) {
+      shipClientLog(playbackConnection.current, 'info', 'seek_back', {
+        from: Math.round(from),
+        to: Math.round(targetSeconds),
+      });
+    }
     lastPositionRef.current = targetSeconds;
     if (seekingRef.current || seekTargetRef.current != null) {
       savePlayhead(itemKey, targetSeconds, lastDurationRef.current || videoDurationHint || 0, activeInfoHashRef.current);
