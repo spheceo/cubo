@@ -214,7 +214,9 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   `availableRanges`): torrent pieces on disk mapped to movie time through
   the file's own index (MP4 sample tables, MKV cues). Don't go back to
   `video.buffered` for sessions: for direct MP4s the browser places bytes as
-  if the bitrate were constant, minutes away from the playhead.
+  if the bitrate were constant, minutes away from the playhead. The bar
+  draws only the watchable span from the playhead to the first missing
+  piece (`lib/download-bar.ts`); raw torrent ranges are islands.
 - Foreign-script titles (Cyrillic, CJK, …) and Russian voice-over studios
   are dubs for other-language originals unless the release says it carries
   the original track; Chinese burned-in caption markers (中英双字 …) are

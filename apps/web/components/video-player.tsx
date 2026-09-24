@@ -9,6 +9,7 @@
  *   players treat it as live), every position is offset back to absolute
  *   movie time, and seeks outside the converted window go to `onSeekOutside`.
  */
+import { watchableSpan } from '@/lib/download-bar';
 import {
   IoContract,
   IoExpand,
@@ -183,9 +184,10 @@ export function VideoPlayer({
   onPlaying?: () => void;
   /** A mid-playback buffering pause ended (not startup, seeks or pauses). */
   onStall?: (stall: { positionSeconds: number; durationMs: number }) => void;
-  /** Absolute stretches Core has on disk. When given, the bar draws these
-   *  instead of the browser's buffered ranges: for direct files the browser
-   *  only knows bytes and places them as if the bitrate were constant. */
+  /** Absolute stretches Core has on disk. When given, the bar draws the
+   *  watchable span from the playhead instead of the browser's buffered
+   *  ranges: for direct files the browser only knows bytes and places them
+   *  as if the bitrate were constant. */
   downloadedRanges?: BufferedRange[] | null;
   /** Parent calls this before leaving so progress is snapshotted while the
    *  video element still has a real currentTime. */
@@ -1511,7 +1513,7 @@ export function VideoPlayer({
         >
           <div ref={barRef} className="relative h-[5px] w-full rounded-full bg-white/15">
             {duration > 0
-              ? (downloadedRanges ?? bufferedRanges).map((range, index) => {
+              ? (downloadedRanges ? watchableSpan(downloadedRanges, shownTime) : bufferedRanges).map((range, index) => {
                   const shift = downloadedRanges ? 0 : timeOffset;
                   const start = Math.max(0, Math.min(1, (range.start + shift) / duration));
                   const end = Math.max(start, Math.min(1, (range.end + shift) / duration));
