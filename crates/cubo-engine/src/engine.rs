@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -19,7 +19,6 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use librqbit::http_api::{HttpApi, HttpApiOptions};
-use librqbit::storage::StorageFactoryExt;
 use librqbit::{Api, DhtSessionConfig, Session, SessionOptions};
 use librqbit_dualstack_sockets::TcpListener as RqbitListener;
 use serde::Deserialize;
@@ -34,7 +33,6 @@ use uuid::Uuid;
 use crate::cache;
 use crate::pairing::{PairAttempt, PairingManager};
 use crate::paths::home_dir;
-use crate::rolling_cache::RollingCache;
 use crate::remuxer::RemuxError;
 use crate::session::{CreateSessionRequest, Mode as SessionMode, Phase as SessionPhase, SessionManager};
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
@@ -84,11 +82,7 @@ struct BridgeState {
     allowed_hosts: Arc<StdRwLock<Vec<String>>>,
     bridge_port: u16,
     download_dir: Arc<RwLock<PathBuf>>,
-    /// Last time a viewer was clearly pulling video (progress, buffer poll,
-    /// remux segment). Playlist polls do not count — those continue while paused.
-    playback_last_ms: Arc<AtomicU64>,
     cache_swap: Arc<RwLock<()>>,
-    rolling_cache: RollingCache,
     /// True while the cache volume has no more than 10 GB free. The web UI
     /// reads this from /v1/cache and shows a banner; maintenance pauses
     /// background torrents for as long as it stays set.
@@ -112,14 +106,9 @@ impl BridgeState {
         self.download_dir.read().await.clone()
     }
 
-    fn mark_playback(&self) {
-        self.playback_last_ms
-            .store(store::now_millis(), Ordering::Release);
-    }
-
+    /// Something is playing (or starting) right now.
     fn is_playback_active(&self) -> bool {
-        let last = self.playback_last_ms.load(Ordering::Acquire);
-        last != 0 && store::now_millis().saturating_sub(last) < PLAYBACK_GUARD_MS
+        self.sessions.has_live_sessions()
     }
 }
 
@@ -139,26 +128,10 @@ struct SkipSegmentsQuery {
     season: Option<u32>,
     episode: Option<u32>,
 }
-#[derive(Deserialize)]
-struct HlsQuery {
-    token: String,
-    v: Option<String>,
-    /// Seconds into the source the remux should begin at. Seeking into an
-    /// unconverted region restarts ffmpeg here instead of waiting for it.
-    start: Option<f64>,
-    /// Monotonic seek id from the player. Leftover hls.js polls of a
-    /// previous playlist URL carry an older value and must not restart
-    /// ffmpeg at that stale offset.
-    gen: Option<u64>,
-}
 
-/// Progress ticks every 10s while playing; this window covers a missed tick
-/// plus the pause report so a swap is refused until the viewer actually stops.
-const PLAYBACK_GUARD_MS: u64 = 20_000;
-/// Keep a just-added title on disk (and unpaused) through metadata, remux
-/// probe, and the first segments. The 20 s playback guard expires in the
-/// middle of ffprobe; 3 minutes was still shorter than a cold seek-remux.
-const CACHE_STARTUP_GRACE_MS: u64 = 600_000;
+/// Untracked files written this recently are never reclaimed: they may
+/// belong to a title that is just starting.
+const UNTRACKED_GRACE: Duration = Duration::from_secs(600);
 
 static ENGINE: OnceCell<Engine> = OnceCell::const_new();
 
@@ -179,13 +152,11 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             let pairing = Arc::new(PairingManager::load(&crate::paths::data_dir())?);
             let default_dir = download_dir;
             let mut download_dir = resolve_startup_download_dir(&store, default_dir.clone()).await;
-            let cached = store.cache_snapshot().await;
-            // rqbit sessions are not restored, so leftover files are dead
-            // weight — but only inside a folder Cubo owns: the default cache
-            // location, a folder carrying our claim marker, or an empty
-            // folder we can claim now. A custom folder that picked up foreign
-            // files since it was selected is left untouched; the engine falls
-            // back to the default instead of deleting user data.
+            // Only use a folder Cubo owns: the default cache location, a
+            // folder carrying our claim marker, or an empty folder we can
+            // claim now. A custom folder that picked up foreign files since
+            // it was selected is left untouched; the engine falls back to the
+            // default instead of touching user data.
             if !paths_match(&download_dir, &default_dir) && !cache_dir_is_claimed(&download_dir)? {
                 tracing::warn!(
                     target: "engine",
@@ -195,15 +166,20 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 tokio::fs::create_dir_all(&default_dir).await.map_err(|e| e.to_string())?;
                 download_dir = default_dir;
             }
-            let cleanup_dir = download_dir.clone();
-            tokio::task::spawn_blocking(move || wipe_dir_contents(&cleanup_dir))
-                .await.map_err(|e| e.to_string())??;
+            // Downloads survive restarts: sessions re-add a source from its
+            // saved metadata and rqbit's saved piece records, so a title
+            // watched yesterday reopens from disk. Torrent ids are
+            // per-process, so the cache index forgets them (entries are then
+            // addressed by info hash) along with entries whose files are gone.
             let _ = std::fs::write(download_dir.join(CACHE_CLAIM), b"");
-            store.clear_cache_entries().await?;
-            let rolling_cache =
-                RollingCache::new(download_dir.clone(), torrent_budget(cached.cache.max_bytes))
-                    .map_err(|e| e.to_string())?;
-            let session = open_rqbit_session(download_dir.clone(), rolling_cache.clone()).await?;
+            // Do not remove the previous Core's piece store here: an older
+            // installed Core may still be using this shared data directory.
+            store.reconcile_cache_entries_after_restart().await?;
+            let data_root = state_path
+                .parent()
+                .unwrap_or(download_dir.as_path())
+                .to_path_buf();
+            let session = open_rqbit_session(download_dir.clone(), data_root.join("piece-state")).await?;
 
             let api = Api::new(session.clone(), None, None);
             let http_api = HttpApi::new(
@@ -238,14 +214,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                     .filter_map(|listener| listener.local_addr().ok())
                     .collect::<Vec<_>>(),
             ));
-            // Remux output stays next to Cubo state, not inside the (movable)
-            // torrent cache. A directory swap must not relocate ffmpeg jobs.
-            let transcode_dir = state_path
-                .parent()
-                .unwrap_or(download_dir.as_path())
-                .join("transcode");
-            let transcode = Arc::new(TranscodeManager::new(transcode_dir));
-            transcode.set_budget(cached.cache.max_bytes / 4).await?;
+            let transcode = Arc::new(TranscodeManager::new());
             let download_dir = Arc::new(RwLock::new(download_dir));
             let sessions = SessionManager::new(
                 session.clone(),
@@ -267,9 +236,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 allowed_hosts: allowed_hosts.clone(),
                 bridge_port,
                 download_dir: download_dir.clone(),
-                playback_last_ms: Arc::new(AtomicU64::new(0)),
                 cache_swap: Arc::new(RwLock::new(())),
-                rolling_cache,
                 disk_pressure: Arc::new(AtomicBool::new(false)),
                 store,
                 transcode,
@@ -370,21 +337,14 @@ enum BindAttempt {
     Failed(String),
 }
 
-/// Persist already owns the DHT UDP port saved in rqbit's `dht.json`.
-/// A second Core (`just dev` while persist is up) must not steal that
-/// socket or overwrite the routing table.
-fn torrent_budget(total: u64) -> u64 {
-    total / 4 * 3
-}
-
 async fn open_rqbit_session(
     download_dir: PathBuf,
-    rolling_cache: RollingCache,
+    piece_state_dir: PathBuf,
 ) -> Result<Arc<Session>, String> {
     match Session::new_with_opts(
         download_dir.clone(),
         SessionOptions {
-            default_storage_factory: Some(rolling_cache.clone().boxed()),
+            bitv_folder: Some(piece_state_dir.clone()),
             ..Default::default()
         },
     )
@@ -399,7 +359,7 @@ async fn open_rqbit_session(
             Session::new_with_opts(
                 download_dir,
                 SessionOptions {
-                    default_storage_factory: Some(rolling_cache.boxed()),
+                    bitv_folder: Some(piece_state_dir),
                     dht: Some(DhtSessionConfig {
                         port: Some(0),
                         persistence: None,
@@ -745,14 +705,10 @@ fn bridge_router(state: BridgeState) -> Router {
         .route("/v1/pair", post(pair_device))
         .route("/v1/system", get(system_stats))
         .route("/v1/folders", get(list_folders).post(create_folder))
-        .route("/v1/torrents", post(add_torrent))
-        .route("/v1/torrents/{id}/stats", get(torrent_stats))
-        .route("/v1/torrents/{id}/stream/{file_index}", get(stream_torrent))
         .route(
             "/v1/torrents/{id}/files/{file_index}/subtitle-match",
             get(torrent_subtitle_match),
         )
-        .route("/v1/torrents/{id}/hls/{file_index}/{file}", get(hls_file))
         .route("/v1/sessions", post(create_session))
         .route("/v1/prefetch", post(prefetch_source))
         .route("/v1/sessions/{id}", get(session_status).delete(close_session))
@@ -1067,9 +1023,6 @@ async fn record_playback(
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
-    if update.session_started || update.watched_delta_seconds > 0.0 {
-        state.mark_playback();
-    }
     // Ticks arrive every ~10 s; echoing the whole library back each time
     // serialized hundreds of items for a response nobody reads.
     match state.store.record_playback(update).await {
@@ -1123,36 +1076,16 @@ async fn update_cache_settings(
         return unauthorized();
     }
     let _swap = state.cache_swap.write().await;
-    let previous = state.store.cache_snapshot().await.cache.max_bytes;
     let next = update
         .max_bytes
         .clamp(1024 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
-    // Shrinking is admitted only after both stores can honour the new cap.
-    // A busy conversion never silently exceeds the setting shown in the UI.
-    if next < previous {
-        if let Err(error) = state.transcode.set_budget(next / 4).await {
-            return bridge_error(StatusCode::CONFLICT, error);
-        }
-        if let Err(error) = state.rolling_cache.set_limit(torrent_budget(next)) {
-            let _ = state.transcode.set_budget(previous / 4).await;
-            return bridge_error(StatusCode::CONFLICT, error.to_string());
-        }
-    }
     match state.store.update_cache_limit(next).await {
         Ok(snapshot) => {
-            if next >= previous {
-                let _ = state.transcode.set_budget(next / 4).await;
-                if let Err(error) = state.rolling_cache.set_limit(torrent_budget(next)) {
-                    return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-                }
-            }
+            // A lower cap takes effect on the next maintenance pass, which
+            // never evicts what a live session is playing.
             Json(snapshot.cache).into_response()
         }
-        Err(error) => {
-            let _ = state.transcode.set_budget(previous / 4).await;
-            let _ = state.rolling_cache.set_limit(torrent_budget(previous));
-            bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error)
-        }
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
 
@@ -1208,9 +1141,6 @@ async fn update_cache_directory(
             // its contents are Cubo's.
             let _ = std::fs::write(new_dir.join(CACHE_CLAIM), b"");
             *state.download_dir.write().await = new_dir.clone();
-            if let Err(error) = state.rolling_cache.reset(new_dir.clone()) {
-                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-            }
             tracing::info!(
                 target: "engine",
                 from = %old_dir.display(),
@@ -1233,11 +1163,10 @@ async fn cache_status(State(state): State<BridgeState>, headers: HeaderMap) -> R
     }
     let snapshot = state.store.cache_snapshot().await;
     let download_dir = state.current_download_dir().await;
-    let transcode_dir = state.transcode.dir().to_path_buf();
     let free_bytes = system::volume_free_bytes(&download_dir);
     let tight = cache::disk_is_tight(free_bytes);
     state.disk_pressure.store(tight, Ordering::Release);
-    match cache_size(download_dir.clone(), transcode_dir).await {
+    match cache_size(download_dir.clone()).await {
         Ok(used_bytes) => Json(json!({
             "usedBytes": used_bytes,
             "maxBytes": snapshot.cache.max_bytes,
@@ -1291,9 +1220,7 @@ async fn delete_cache_item(
         })
         .map(|entry| entry.info_hash.as_str())
         .unwrap_or(&id);
-    if let Err(error) = state.transcode.remove_torrent_output(&id, info_hash).await {
-        return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-    }
+    state.sessions.forget_pieces(info_hash);
     let download_dir = state.current_download_dir().await;
     if let Err(error) = remove_entry_files(&download_dir, &entry_files).await {
         return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
@@ -1323,27 +1250,16 @@ async fn clear_cache(State(state): State<BridgeState>, headers: HeaderMap) -> Re
 async fn empty_cache(state: &BridgeState, download_dir: &std::path::Path) -> Result<(), String> {
     state.sessions.close_all().await;
     state.sessions.clear_metadata();
-    state.transcode.clear_cache().await?;
+    state.transcode.clear_cache().await;
     delete_all_torrents(state).await?;
     let download_path = download_dir.to_path_buf();
     tokio::task::spawn_blocking(move || wipe_dir_contents(&download_path))
         .await
         .map_err(|error| error.to_string())??;
-    if cache_size(
-        download_dir.to_path_buf(),
-        state.transcode.dir().to_path_buf(),
-    )
-    .await?
-        != 0
-    {
-        return Err("Some temporary video files could not be cleared. Please try again.".into());
+    if cache_size(download_dir.to_path_buf()).await? != 0 {
+        return Err("Some video files could not be cleared. Please try again.".into());
     }
     state.store.clear_cache_entries().await?;
-    state
-        .rolling_cache
-        .reset(download_dir.to_path_buf())
-        .map_err(|e| e.to_string())?;
-    state.playback_last_ms.store(0, Ordering::Release);
     Ok(())
 }
 
@@ -1476,8 +1392,8 @@ fn cache_root_of(
     Some(download_dir.join(first))
 }
 
-/// Marker written into folders Cubo owns. Startup wipes the cache folder
-/// wholesale, so it must never run on a folder that could hold user files.
+/// Marker written into folders Cubo owns. Clearing the cache wipes its
+/// contents, so it must never run on a folder that could hold user files.
 const CACHE_CLAIM: &str = ".cubo-cache";
 
 /// A folder is safe to wipe when it carries our claim marker (Cubo owns its
@@ -1533,36 +1449,20 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     let _cache_operation = state.cache_swap.read().await;
     let snapshot = state.store.cache_snapshot().await;
     let download_dir = state.current_download_dir().await;
-    let transcode_dir = state.transcode.dir().to_path_buf();
     let free_bytes = system::volume_free_bytes(&download_dir);
     let mut tight = cache::disk_is_tight(free_bytes);
     state.disk_pressure.store(tight, Ordering::Release);
 
-    let mut used_bytes = cache_size(download_dir.clone(), transcode_dir.clone()).await?;
+    let mut used_bytes = cache_size(download_dir.clone()).await?;
     let over_budget = used_bytes > snapshot.cache.max_bytes;
     if !over_budget && !tight {
         return Ok(());
     }
 
-    let playing = state.is_playback_active();
-    let now = store::now_millis();
-    let active_id = playing
-        .then(|| {
-            snapshot
-                .cache_entries
-                .iter()
-                .max_by_key(|entry| entry.last_accessed_at)
-                .map(cache_entry_id)
-        })
-        .flatten();
-
     // The file a live session plays is never evicted: the budget applies to
-    // everything else.
+    // everything else, least recently used first. A closed session's file
+    // is ordinary cache.
     let live = state.sessions.live_info_hashes();
-    // Legacy playback has no liveness signal, so it guards recent entries by
-    // time. Sessions say exactly what is playing; a closed one is ordinary
-    // cache immediately.
-    let session_era = state.sessions.ever_used();
     let mut deleted_files: Vec<String> = Vec::new();
     let mut entries = snapshot.cache_entries;
     entries.sort_by_key(|entry| entry.last_accessed_at);
@@ -1570,57 +1470,22 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         if used_bytes <= snapshot.cache.max_bytes && !tight {
             break;
         }
-        let id = cache_entry_id(&entry);
-        if live.contains(&entry.info_hash)
-            || (!session_era && cache_entry_is_protected(&entry, now, playing, active_id.as_deref()))
-        {
+        if live.contains(&entry.info_hash) {
             continue;
         }
+        let id = cache_entry_id(&entry);
         // Delete through rqbit when it still knows the torrent, and always
         // remove the recorded files — after a restart only the files exist.
         if rqbit_delete(state, &id).await.is_ok() {
-            state
-                .transcode
-                .remove_torrent_output(&id, &entry.info_hash)
-                .await?;
+            state.sessions.forget_pieces(&entry.info_hash);
             if let Err(error) = remove_entry_files(&download_dir, &entry.files).await {
                 tracing::warn!(target: "engine", error = %error, id, "cache eviction could not remove files");
                 continue;
             }
             deleted_files.extend(entry.files.iter().cloned());
             state.store.remove_cache_entry(&id).await?;
-            used_bytes = cache_size(download_dir.clone(), transcode_dir.clone()).await?;
+            used_bytes = cache_size(download_dir.clone()).await?;
             tight = cache::disk_is_tight(system::volume_free_bytes(&download_dir));
-        }
-    }
-
-    // Playback finished (or never started): the last title can go too if it
-    // still blows the budget — except a title still inside the startup
-    // grace, which has not had time to produce segments yet.
-    if !playing && used_bytes > snapshot.cache.max_bytes {
-        let leftover = state.store.cache_snapshot().await.cache_entries;
-        for entry in leftover {
-            if used_bytes <= snapshot.cache.max_bytes {
-                break;
-            }
-            if (!session_era && entry_in_startup_grace(&entry, now)) || live.contains(&entry.info_hash) {
-                continue;
-            }
-            let id = cache_entry_id(&entry);
-            if rqbit_delete(state, &id).await.is_ok() {
-                state
-                    .transcode
-                    .remove_torrent_output(&id, &entry.info_hash)
-                    .await?;
-                if let Err(error) = remove_entry_files(&download_dir, &entry.files).await {
-                    tracing::warn!(target: "engine", error = %error, id, "cache eviction could not remove files");
-                    continue;
-                }
-                deleted_files.extend(entry.files.iter().cloned());
-                state.store.remove_cache_entry(&id).await?;
-                used_bytes = cache_size(download_dir.clone(), transcode_dir.clone()).await?;
-                tight = cache::disk_is_tight(system::volume_free_bytes(&download_dir));
-            }
         }
     }
 
@@ -1628,32 +1493,36 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
     if !deleted_files.is_empty() {
         let remaining = state.store.cache_snapshot().await.cache_entries;
         remove_deleted_torrent_trees(&download_dir, &deleted_files, &remaining).await;
-        // Directory cleanup can remove sparse siblings and remux output can
-        // finish between the first scan and deletion. Reconcile from disk
+        // Directory cleanup can remove sparse siblings. Reconcile from disk
         // instead of trusting estimated freed bytes.
-        used_bytes = cache_size(download_dir.clone(), transcode_dir.clone()).await?;
+        used_bytes = cache_size(download_dir.clone()).await?;
     }
 
-    if used_bytes <= snapshot.cache.max_bytes {
-        return Ok(());
-    }
-    if playing
-        || state
-            .store
-            .cache_snapshot()
-            .await
-            .cache_entries
-            .iter()
-            .any(|entry| entry_in_startup_grace(entry, now))
-    {
+    if used_bytes <= snapshot.cache.max_bytes || state.sessions.has_live_sessions() {
         return Ok(());
     }
 
-    // Still over: untracked leftovers (downloaded before file paths were
-    // recorded). Skip files written during the startup grace so a just-
-    // started title is not reclaimed out from under ffmpeg.
+    // Still over with nothing playing: untracked leftovers (files the index
+    // never recorded). Never remove a root still in the cache index, even if
+    // rqbit refused to delete it. Recently written files are skipped.
+    let tracked_roots: HashSet<PathBuf> = state
+        .store
+        .cache_snapshot()
+        .await
+        .cache_entries
+        .iter()
+        .flat_map(|entry| &entry.files)
+        .filter_map(|file| {
+            std::path::Path::new(file)
+                .strip_prefix(&download_dir)
+                .ok()?
+                .components()
+                .next()
+                .map(|component| download_dir.join(component))
+        })
+        .collect();
     let max_bytes = snapshot.cache.max_bytes;
-    tokio::task::spawn_blocking(move || reclaim_untracked(&download_dir, max_bytes))
+    tokio::task::spawn_blocking(move || reclaim_untracked(&download_dir, max_bytes, &tracked_roots))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -1665,26 +1534,10 @@ fn cache_entry_id(entry: &store::CacheEntry) -> String {
         .unwrap_or_else(|| entry.info_hash.clone())
 }
 
-fn entry_in_startup_grace(entry: &store::CacheEntry, now: u64) -> bool {
-    now.saturating_sub(entry.last_accessed_at) < CACHE_STARTUP_GRACE_MS
-}
-
-fn cache_entry_is_protected(
-    entry: &store::CacheEntry,
-    now: u64,
-    playing: bool,
-    active_id: Option<&str>,
-) -> bool {
-    if entry_in_startup_grace(entry, now) {
-        return true;
-    }
-    let id = cache_entry_id(entry);
-    playing && active_id == Some(id.as_str())
-}
-
-/// Rolling storage requests only pieces near an open reader. Keep those
-/// readers alive regardless of which tab most recently updated the library.
-/// Pausing remains an emergency guard for a nearly full system volume.
+/// Which torrents may download. While a session plays, its torrent gets the
+/// bandwidth and everything else pauses; with nothing playing, cached titles
+/// finish in the background. Prefetch warm-ups stay parked, and everything
+/// pauses when the disk is nearly full.
 async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     let torrents = rqbit_list_torrents(state).await?;
     let download_dir = state.current_download_dir().await;
@@ -1695,9 +1548,6 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
             "Cubo's cache disk is almost full. Free disk space before trying playback again.",
         );
     }
-    // While a session plays, its torrent gets the bandwidth: everything else
-    // pauses. Without sessions, the legacy pipeline's readers need every
-    // torrent running.
     let live = state.sessions.live_torrent_ids();
     let sessions_active = !live.is_empty();
     // A prefetch's warm-up stays parked until someone actually plays it.
@@ -1715,12 +1565,17 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     Ok(())
 }
 
-fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String> {
+fn reclaim_untracked(
+    dir: &std::path::Path,
+    max_bytes: u64,
+    tracked_roots: &HashSet<PathBuf>,
+) -> Result<(), String> {
     let mut used_bytes = directory_size(dir).map_err(|error| error.to_string())?;
     let mut items: Vec<(std::path::PathBuf, std::time::SystemTime)> = std::fs::read_dir(dir)
         .map_err(|error| error.to_string())?
         .flatten()
-        .filter(|entry| entry.file_name() != ".cubo-pieces")
+        .filter(|entry| entry.file_name() != CACHE_CLAIM && entry.file_name() != ".cubo-pieces")
+        .filter(|entry| !tracked_roots.contains(&entry.path()))
         .filter_map(|entry| {
             let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
             Some((entry.path(), modified))
@@ -1728,7 +1583,7 @@ fn reclaim_untracked(dir: &std::path::Path, max_bytes: u64) -> Result<(), String
         .collect();
     items.sort_by_key(|(_, modified)| *modified);
     let grace_floor = std::time::SystemTime::now()
-        .checked_sub(Duration::from_millis(CACHE_STARTUP_GRACE_MS))
+        .checked_sub(UNTRACKED_GRACE)
         .unwrap_or(std::time::UNIX_EPOCH);
 
     for (path, modified) in items {
@@ -1785,13 +1640,11 @@ async fn delete_all_torrents(state: &BridgeState) -> Result<(), String> {
     }
 }
 
-async fn cache_size(download_dir: PathBuf, transcode_dir: PathBuf) -> Result<u64, String> {
-    tokio::task::spawn_blocking(move || {
-        Ok::<u64, std::io::Error>(directory_size(&download_dir)? + directory_size(&transcode_dir)?)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
+async fn cache_size(download_dir: PathBuf) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || directory_size(&download_dir))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
 }
 
 async fn rqbit_list_torrents(state: &BridgeState) -> Result<Vec<String>, String> {
@@ -1823,25 +1676,6 @@ async fn rqbit_pause(state: &BridgeState, id: &str) -> Result<(), String> {
 
 async fn rqbit_start(state: &BridgeState, id: &str) -> Result<(), String> {
     rqbit_action(state, id, "start").await
-}
-
-/// Playback and remux read through rqbit's stream endpoint. If the
-/// maintainer paused this torrent, ffmpeg sits on a socket that never
-/// receives pieces — unpause and refresh the playback guard first.
-async fn ensure_torrent_running(state: &BridgeState, id: &str) -> Result<(), String> {
-    let download_dir = state.current_download_dir().await;
-    if cache::disk_is_critical(system::volume_free_bytes(&download_dir)) {
-        let _ = rqbit_pause(state, id).await;
-        return Err(
-            "Cubo's cache disk is almost full. Free disk space before trying playback again."
-                .into(),
-        );
-    }
-    state.mark_playback();
-    if let Err(error) = rqbit_start(state, id).await {
-        tracing::debug!(target: "engine", error = %error, id, "could not start torrent");
-    }
-    Ok(())
 }
 
 async fn rqbit_action(state: &BridgeState, id: &str, action: &str) -> Result<(), String> {
@@ -2033,290 +1867,9 @@ fn to_client_message(message: TungsteniteMessage) -> Option<AxumMessage> {
     }
 }
 
-/// `only_files` and `only_files_regex` are mutually exclusive in rqbit.
-/// Prefer a Torrentio file index; otherwise match SxxEyy inside a pack.
-fn rqbit_add_url(
-    rqbit_port: u16,
-    download_dir: &std::path::Path,
-    file_index: Option<usize>,
-    episode_regex: Option<String>,
-) -> String {
-    let mut url = format!(
-        "http://127.0.0.1:{}/torrents?overwrite=true&output_folder={}",
-        rqbit_port,
-        urlencoding::encode(&download_dir.to_string_lossy())
-    );
-    if let Some(index) = file_index {
-        url.push_str(&format!("&only_files={index}"));
-    } else if let Some(regex) = episode_regex {
-        url.push_str(&format!(
-            "&only_files_regex={}",
-            urlencoding::encode(&regex)
-        ));
-    }
-    url
-}
-
-/// `tv:236235:2:1` → filename regex for S02E01 / 2x01. Movies and
-/// incomplete keys (`tv:123:-:-`) produce nothing.
-fn episode_file_regex(media_key: Option<&str>) -> Option<String> {
-    let key = media_key?;
-    let mut parts = key.split(':');
-    let kind = parts.next()?;
-    if !kind.eq_ignore_ascii_case("tv") {
-        return None;
-    }
-    let _id = parts.next()?;
-    let season: u32 = parts.next()?.parse().ok()?;
-    let episode: u32 = parts.next()?.parse().ok()?;
-    if season == 0 || episode == 0 {
-        return None;
-    }
-    Some(format!(
-        r"(?i)(?:s0*{season}[ ._\-]?e0*{episode}|{season}x0*{episode})(?:\D|$)"
-    ))
-}
-
-async fn add_torrent(
-    State(state): State<BridgeState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !is_authorized(&state, &headers) {
-        return unauthorized();
-    }
-
-    // Do not let a clear or cache-folder swap race rqbit's directory setup.
-    let _cache_operation = state.cache_swap.read().await;
-
-    let download_dir = state.current_download_dir().await;
-    if cache::disk_is_critical(system::volume_free_bytes(&download_dir)) {
-        return bridge_error(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Cubo's cache disk is almost full. Free disk space before trying playback again."
-                .into(),
-        );
-    }
-
-    let media_key = headers
-        .get("x-cubo-media-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let title = headers
-        .get("x-cubo-title")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| urlencoding::decode(value).ok())
-        .map(|value| value.into_owned());
-    let file_index = headers
-        .get("x-cubo-file-index")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-
-    match state
-        .client
-        .post(rqbit_add_url(
-            state.rqbit_port,
-            &download_dir,
-            file_index,
-            episode_file_regex(media_key.as_deref()),
-        ))
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            let status = response.status();
-            let response_headers = response.headers().clone();
-            let bytes = match response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(error) => return bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
-            };
-
-            if status.is_success() {
-                state.transcode.begin_cache_session();
-                // Cover the gap before the first segment marks playback, so
-                // the 5s maintainer does not pause this torrent on add.
-                state.mark_playback();
-                let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
-                let torrent_id = parsed
-                    .as_ref()
-                    .and_then(|value| value.get("id"))
-                    .and_then(serde_json::Value::as_u64);
-                let info_hash = parsed
-                    .as_ref()
-                    .and_then(|value| {
-                        value
-                            .get("info_hash")
-                            .or_else(|| value.pointer("/details/info_hash"))
-                    })
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                if !info_hash.is_empty() {
-                    tracing::info!(
-                        target: "engine",
-                        torrent_id = torrent_id.unwrap_or(0),
-                        info_hash = %info_hash,
-                        media_key = media_key.as_deref().unwrap_or("-"),
-                        title = title.as_deref().unwrap_or("-"),
-                        "torrent added"
-                    );
-                    // Record absolute file paths so cache deletion keeps
-                    // working after restarts, when rqbit no longer knows the
-                    // torrent but the files are still on disk.
-                    let output_folder = parsed
-                        .as_ref()
-                        .and_then(|value| {
-                            value
-                                .get("output_folder")
-                                .or_else(|| value.pointer("/details/output_folder"))
-                        })
-                        .and_then(serde_json::Value::as_str);
-                    let files = match output_folder {
-                        Some(folder) => parsed
-                            .as_ref()
-                            .and_then(|value| value.pointer("/details/files"))
-                            .and_then(serde_json::Value::as_array)
-                            .map(|files| {
-                                files
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(index, file)| {
-                                        if let Some(wanted) = file_index {
-                                            return *index == wanted;
-                                        }
-                                        file.get("included")
-                                            .and_then(serde_json::Value::as_bool)
-                                            .unwrap_or(true)
-                                    })
-                                    .filter_map(|(_, file)| {
-                                        file.get("name").and_then(serde_json::Value::as_str)
-                                    })
-                                    .map(|name| {
-                                        std::path::Path::new(folder)
-                                            .join(name)
-                                            .to_string_lossy()
-                                            .into_owned()
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default(),
-                        None => Vec::new(),
-                    };
-                    if let Err(error) = state
-                        .store
-                        .touch_cache(torrent_id, info_hash.clone(), media_key, title, files)
-                        .await
-                    {
-                        tracing::warn!(target: "engine", error = %error, "could not update cache index");
-                    }
-                }
-
-                // Apply the existing one-active-download policy now; a
-                // fallback should not leave the previous swarm writing until
-                // the next maintenance tick.
-                let download_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = apply_download_window(&download_state).await {
-                        tracing::warn!(target: "engine", error = %error, "could not pause background downloads after add");
-                    }
-                });
-
-                // MKV files can only play through the remux pipeline, which
-                // needs an ffprobe first. Warm it now, in parallel with the
-                // torrent buffering, so the playlist request doesn't pay for
-                // it serially. (Direct-play MP4s never need a probe.)
-                if !info_hash.is_empty() {
-                    let torrent_key = torrent_id
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| info_hash.clone());
-                    let largest_mkv = parsed
-                        .as_ref()
-                        .and_then(|value| value.pointer("/details/files"))
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|files| {
-                            let is_mkv = |file: &serde_json::Value| {
-                                file.get("name")
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|name| name.to_ascii_lowercase().ends_with(".mkv"))
-                            };
-                            if let Some(index) =
-                                file_index.filter(|&index| files.get(index).is_some_and(is_mkv))
-                            {
-                                return Some(index);
-                            }
-                            files
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, file)| {
-                                    file.get("included")
-                                        .and_then(serde_json::Value::as_bool)
-                                        .unwrap_or(true)
-                                        && is_mkv(file)
-                                })
-                                .max_by_key(|(_, file)| {
-                                    file.get("length").and_then(serde_json::Value::as_u64)
-                                })
-                                .map(|(index, _)| index)
-                        });
-                    if let Some(file_index) = largest_mkv {
-                        let key = format!("{torrent_key}:{file_index}");
-                        let input_url = format!(
-                            "http://127.0.0.1:{}/torrents/{torrent_key}/stream/{file_index}",
-                            state.rqbit_port
-                        );
-                        let transcode = state.transcode.clone();
-                        tokio::spawn(async move {
-                            transcode.prewarm(key, input_url).await;
-                        });
-                    }
-                }
-            }
-
-            let mut builder = Response::builder().status(status);
-            if let Some(content_type) = response_headers.get(CONTENT_TYPE) {
-                builder = builder.header(CONTENT_TYPE, content_type);
-            }
-            builder.body(Body::from(bytes)).unwrap_or_else(|error| {
-                bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-            })
-        }
-        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
-    }
-}
-
-async fn torrent_stats(
-    State(state): State<BridgeState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if !is_authorized(&state, &headers) {
-        return unauthorized();
-    }
-    // Buffering polls this until the torrent is live — treat that as watching
-    // so a directory swap cannot yank the files out from under a start,
-    // and unpause if the maintainer already stopped peers.
-    if let Err(error) = ensure_torrent_running(&state, &id).await {
-        return bridge_error(StatusCode::INSUFFICIENT_STORAGE, error);
-    }
-
-    match state
-        .client
-        .get(format!(
-            "http://127.0.0.1:{}/torrents/{id}/stats/v1",
-            state.rqbit_port
-        ))
-        .send()
-        .await
-    {
-        Ok(response) => proxy_response(response),
-        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
-    }
-}
-
 /// Skip windows for the playing file: named container chapters first (exact,
 /// free, per-release), then TheIntroDB and IntroDB crowd data to fill gaps.
-/// Chapters come from the same probe the remux path already runs, so this is
+/// Chapters come from the probe the playback session already ran, so this is
 /// usually a cache hit by the time the player asks.
 async fn skip_segments(
     State(state): State<BridgeState>,
@@ -2335,23 +1888,6 @@ async fn skip_segments(
     let probe = 'probe: {
         if let Some(probe) = state.transcode.cached_probe(&key).await {
             break 'probe Some(probe);
-        }
-        // MKV adds trigger a prewarm probe while the torrent buffers; give an
-        // in-flight one a moment instead of racing a second ffprobe against
-        // the same cold pieces.
-        for _ in 0..15 {
-            if !state.transcode.is_prewarming(&key).await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Some(probe) = state.transcode.cached_probe(&key).await {
-                break 'probe Some(probe);
-            }
-        }
-        if state.transcode.is_prewarming(&key).await {
-            // Still probing cold pieces — don't double the work; the remote
-            // fallback below answers instead.
-            break 'probe None;
         }
         let input_url = format!(
             "http://127.0.0.1:{}/torrents/{}/stream/{}",
@@ -2593,33 +2129,6 @@ async fn fill_remote_skip_segments(
     sections
 }
 
-async fn stream_torrent(
-    State(state): State<BridgeState>,
-    Path((id, file_index)): Path<(String, usize)>,
-    Query(query): Query<StreamQuery>,
-    headers: HeaderMap,
-) -> Response {
-    if !is_valid_token(&state, &query.token) {
-        return unauthorized();
-    }
-    if let Err(error) = ensure_torrent_running(&state, &id).await {
-        return bridge_error(StatusCode::INSUFFICIENT_STORAGE, error);
-    }
-
-    let mut request = state.client.get(format!(
-        "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
-        state.rqbit_port
-    ));
-    if let Some(range) = headers.get(RANGE) {
-        request = request.header(RANGE, range);
-    }
-
-    match request.send().await {
-        Ok(response) => proxy_response(response),
-        Err(error) => bridge_error(StatusCode::BAD_GATEWAY, error.to_string()),
-    }
-}
-
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SubtitleMatchInfo {
@@ -2762,191 +2271,6 @@ async fn read_stream_range(
         return Err(format!("stream range read failed ({})", response.status()));
     }
     response.bytes().await.map_err(|error| error.to_string())
-}
-
-/// Serves the remux pipeline for one torrent file. `media.m3u8` starts (or
-/// reuses) the ffmpeg job and returns the playlist with the session token
-/// appended to every segment URI; any other name serves a segment from disk.
-async fn hls_file(
-    State(state): State<BridgeState>,
-    Path((id, file_index, file)): Path<(String, usize, String)>,
-    Query(query): Query<HlsQuery>,
-) -> Response {
-    if !is_valid_token(&state, &query.token) {
-        return unauthorized();
-    }
-    let _cache_operation = state.cache_swap.read().await;
-    if state.transcode.cache_blocked() {
-        return bridge_error(
-            StatusCode::CONFLICT,
-            "Cache was cleared. Reopen the title to start a new playback session.".into(),
-        );
-    }
-    if let Err(error) = ensure_torrent_running(&state, &id).await {
-        return bridge_error(StatusCode::INSUFFICIENT_STORAGE, error);
-    }
-    if !state.transcode.available() {
-        return bridge_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "ffmpeg is not available on this Core".into(),
-        );
-    }
-    let key = format!("{id}:{file_index}");
-    let start = query.start.unwrap_or(0.0).max(0.0);
-
-    if file == "media.m3u8" {
-        // hls.js polls this URL every few seconds while the playlist grows.
-        // A running job's playlist is served straight from disk — probing the
-        // source again here blocked every poll behind a fresh ffprobe.
-        // `gen` distinguishes a real seek restart from a leftover poll of
-        // the previous `start=` URL (which must not kill the new remux).
-        if !state.transcode.job_usable(&key, start, query.gen).await {
-            let input_url = format!(
-                "http://127.0.0.1:{}/torrents/{id}/stream/{file_index}",
-                state.rqbit_port
-            );
-            // Seek restarts and prewarmed torrents reuse a cached probe; only
-            // a cold file pays for ffprobe here, and the result is remembered.
-            let probe = match state.transcode.cached_probe(&key).await {
-                Some(probe) => probe,
-                None => match state.transcode.probe(&input_url).await {
-                    Ok(probe) => {
-                        state.transcode.remember_probe(&key, probe.clone()).await;
-                        probe
-                    }
-                    Err(error) => return bridge_error(StatusCode::BAD_GATEWAY, error),
-                },
-            };
-            if !probe.video_copyable() {
-                return bridge_error(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    format!(
-                        "video codec {} cannot be converted quickly",
-                        probe.video_codec.as_deref().unwrap_or("unknown")
-                    ),
-                );
-            }
-            if let Err(error) = state
-                .transcode
-                .ensure_job(&key, &input_url, &probe, start, query.gen.unwrap_or(0))
-                .await
-            {
-                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-            }
-        }
-
-        let Some(job_dir) = state.transcode.job_dir(&key).await else {
-            return bridge_error(StatusCode::NOT_FOUND, "no conversion is running".into());
-        };
-        if let Err(error) = state.transcode.wait_for_playlist(&job_dir).await {
-            return bridge_error(StatusCode::GATEWAY_TIMEOUT, error);
-        }
-        let duration = state.transcode.job_duration(&key).await;
-        let actual_start = state.transcode.job_actual_start(&key).await;
-        let nonce = state.transcode.job_nonce(&key).await.unwrap_or_default();
-
-        let content = match read_growing_playlist(&job_dir.join("media.m3u8")).await {
-            Ok(content) => {
-                state
-                    .transcode
-                    .remember_playlist(&key, content.clone())
-                    .await;
-                Some(content)
-            }
-            Err(error) => {
-                // Prefer the last good playlist over a 404 — hls.js recovers
-                // a missing EVENT playlist by jumping to the live edge.
-                if let Some(cached) = state.transcode.last_playlist(&key).await {
-                    tracing::debug!(target: "engine", error = %error, "playlist read missed a rewrite; serving last good");
-                    Some(cached)
-                } else {
-                    tracing::debug!(target: "engine", error = %error, "playlist read missed a rewrite");
-                    None
-                }
-            }
-        };
-        let Some(content) = content else {
-            return bridge_error(StatusCode::SERVICE_UNAVAILABLE, "playlist not ready".into());
-        };
-
-        let mut response = (
-            [
-                (CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-                (HeaderName::from_static("cache-control"), "no-store"),
-            ],
-            // Echo back the token the caller authorized with — never
-            // the session token, which a paired device must not see.
-            rewrite_playlist(&content, &query.token, &nonce),
-        )
-            .into_response();
-        if let Some(duration) = duration {
-            if let Ok(value) = HeaderValue::from_str(&duration.to_string()) {
-                response
-                    .headers_mut()
-                    .insert(HeaderName::from_static("x-cubo-duration"), value);
-            }
-        }
-        if let Some(actual_start) = actual_start {
-            if let Ok(value) = HeaderValue::from_str(&format!("{actual_start:.3}")) {
-                response
-                    .headers_mut()
-                    .insert(HeaderName::from_static("x-cubo-start"), value);
-            }
-        }
-        if let Some(start) = state.transcode.retained_start(&key).await {
-            if let Ok(value) = HeaderValue::from_str(&format!("{start:.3}")) {
-                response
-                    .headers_mut()
-                    .insert(HeaderName::from_static("x-cubo-window-start"), value);
-            }
-        }
-        return response;
-    }
-
-    // Segment fetches stop when the player is paused; playlist polls do not.
-    state.mark_playback();
-
-    // Segment names come from ffmpeg; refuse anything that could escape the
-    // job directory.
-    if file.contains('/') || file.contains('\\') || file.contains("..") {
-        return bridge_error(StatusCode::BAD_REQUEST, "invalid segment name".into());
-    }
-    let Some(_job_dir) = state.transcode.job_dir(&key).await else {
-        return bridge_error(StatusCode::NOT_FOUND, "no conversion is running".into());
-    };
-    if let Some(nonce) = query.v.as_deref() {
-        if state.transcode.job_nonce(&key).await.as_deref() != Some(nonce) {
-            return bridge_error(StatusCode::GONE, "conversion has been replaced".into());
-        }
-    }
-    match state.transcode.read_sink_file(&key, &file).await {
-        Ok(bytes) => {
-            if let Err(error) = state.transcode.report_segment_served(&key, &file).await {
-                tracing::debug!(%error, "could not advance remux retention window");
-            }
-            let content_type = if file.ends_with(".mp4") {
-                "video/mp4"
-            } else if file.ends_with(".m4s") {
-                "video/iso.segment"
-            } else {
-                "application/octet-stream"
-            };
-            // Seek restarts reuse segment names in a fresh job; a cached
-            // response from the previous offset would splice wrong video in.
-            (
-                [
-                    (CONTENT_TYPE, content_type),
-                    (HeaderName::from_static("cache-control"), "no-store"),
-                ],
-                bytes,
-            )
-                .into_response()
-        }
-        Err(_) => bridge_error(
-            StatusCode::GONE,
-            "segment expired; restart this source at the requested time".into(),
-        ),
-    }
 }
 
 async fn create_session(
@@ -3179,28 +2503,6 @@ async fn session_hls(
     }
 }
 
-/// HLS players fetch segment URIs verbatim, so the session token rides along
-/// as a query parameter on every entry — plus the job nonce, which makes each
-/// conversion's segment URLs unique. Seek restarts reuse segment names for
-/// different content, and a cached response from a previous job would splice
-/// mismatched audio/video into playback.
-fn rewrite_playlist(content: &str, token: &str, nonce: &str) -> String {
-    let params = format!("token={token}&v={nonce}");
-    content
-        .lines()
-        .map(|line| {
-            if line.starts_with("#EXT-X-MAP") {
-                line.replace("URI=\"init.mp4\"", &format!("URI=\"init.mp4?{params}\""))
-            } else if !line.starts_with('#') && !line.trim().is_empty() {
-                format!("{line}?{params}")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn is_authorized(state: &BridgeState, headers: &HeaderMap) -> bool {
     headers
         .get(AUTHORIZATION)
@@ -3328,21 +2630,6 @@ fn bridge_error(status: StatusCode, message: String) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
-/// ffmpeg rewrites `media.m3u8` in place as it appends segments. A poll that
-/// hits the file while it is empty or missing is not a server fault.
-async fn read_growing_playlist(path: &std::path::Path) -> Result<String, String> {
-    let mut last = String::from("playlist not ready");
-    for _ in 0..8 {
-        match tokio::fs::read_to_string(path).await {
-            Ok(content) if content.contains("#EXTINF") => return Ok(content),
-            Ok(_) => last = "playlist empty".into(),
-            Err(error) => last = error.to_string(),
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    Err(last)
-}
-
 fn proxy_response(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -3395,29 +2682,7 @@ mod tests {
     use axum::http::header::ORIGIN;
 
     #[test]
-    fn episode_regex_matches_tv_keys_only() {
-        assert!(episode_file_regex(None).is_none());
-        assert!(episode_file_regex(Some("movie:550:-:-")).is_none());
-        assert!(episode_file_regex(Some("tv:236235:-:-")).is_none());
-        let regex = episode_file_regex(Some("tv:236235:2:1")).expect("tv episode");
-        assert!(regex.contains("s0*2"));
-        assert!(regex.contains("e0*1"));
-        assert!(regex.contains("2x0*1"));
-        let url = rqbit_add_url(1, std::path::Path::new("/tmp/cache"), Some(4), Some(regex));
-        assert!(url.contains("only_files=4"));
-        assert!(!url.contains("only_files_regex"));
-        let url = rqbit_add_url(
-            1,
-            std::path::Path::new("/tmp/cache"),
-            None,
-            episode_file_regex(Some("tv:1:3:9")),
-        );
-        assert!(url.contains("only_files_regex="));
-        assert!(!url.contains("only_files="));
-    }
-
-    #[test]
-    fn startup_wipe_only_runs_on_claimed_folders() {
+    fn only_use_claimed_cache_directories() {
         let root = std::env::temp_dir().join(format!("cubo-claim-{}", Uuid::new_v4()));
         let foreign = root.join("foreign");
         std::fs::create_dir_all(&foreign).unwrap();
@@ -3603,10 +2868,9 @@ mod tests {
         let store = CoreStore::load(test_dir.join("state.json"))
             .await
             .expect("load test store");
-        let transcode_dir = test_dir.join("transcode");
         let pairing = Arc::new(PairingManager::load(&test_dir).expect("load test pairing manager"));
         let pairing_dir = test_dir.clone();
-        let transcode = Arc::new(TranscodeManager::new(transcode_dir));
+        let transcode = Arc::new(TranscodeManager::new());
         let sessions = crate::session::SessionManager::for_tests(&pairing_dir, transcode.clone(), store.clone()).await;
         let state = BridgeState {
             rqbit_port: 1,
@@ -3615,13 +2879,7 @@ mod tests {
             web_origin: Some(format!("http://127.0.0.1:{web_port}").into()),
             allowed_hosts: Arc::new(StdRwLock::new(vec!["kenobi.test".into()])),
             bridge_port: port,
-            rolling_cache: RollingCache::new(
-                test_dir.clone(),
-                torrent_budget(store.cache_snapshot().await.cache.max_bytes),
-            )
-            .unwrap(),
             download_dir: Arc::new(RwLock::new(test_dir)),
-            playback_last_ms: Arc::new(AtomicU64::new(0)),
             cache_swap: Arc::new(RwLock::new(())),
             disk_pressure: Arc::new(AtomicBool::new(false)),
             store,
@@ -3654,7 +2912,7 @@ mod tests {
             .contains("shared Cubo frontend"));
 
         let preflight = client
-            .request(Method::OPTIONS, format!("{base_url}/v1/torrents"))
+            .request(Method::OPTIONS, format!("{base_url}/v1/sessions"))
             .header(ORIGIN, "http://localhost:4200")
             .header("access-control-request-method", "POST")
             .header(
@@ -3753,9 +3011,9 @@ mod tests {
         }
 
         let unauthorized = client
-            .post(format!("{base_url}/v1/torrents"))
+            .post(format!("{base_url}/v1/sessions"))
             .header(ORIGIN, "http://localhost:4200")
-            .body("magnet:?xt=urn:btih:test")
+            .json(&json!({"magnet": "magnet:?xt=urn:btih:test", "hevc": false}))
             .send()
             .await
             .expect("unauthorized response");
@@ -3824,7 +3082,6 @@ pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64
     std::fs::create_dir_all(&download_dir).unwrap();
     let store = CoreStore::load(root.join("cubo-state.json")).await.unwrap();
     store.set_cache_limit_unclamped(cache_max_bytes).await;
-    let rolling_cache = RollingCache::new(download_dir.clone(), torrent_budget(cache_max_bytes)).unwrap();
     let rqbit = Session::new_with_opts(
         download_dir.clone(),
         SessionOptions {
@@ -3836,7 +3093,7 @@ pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64
                 listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
                 ..Default::default()
             }),
-            default_storage_factory: Some(rolling_cache.clone().boxed()),
+            bitv_folder: Some(root.join("piece-state")),
             ..Default::default()
         },
     )
@@ -3859,8 +3116,7 @@ pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64
     tokio::spawn(async move {
         let _ = http_api.make_http_api_and_run(rqbit_listener, None).await;
     });
-    let transcode = Arc::new(TranscodeManager::new(root.join("transcode")));
-    transcode.set_budget(cache_max_bytes / 4).await.unwrap();
+    let transcode = Arc::new(TranscodeManager::new());
     let download_lock = Arc::new(RwLock::new(download_dir.clone()));
     let sessions = SessionManager::new(
         rqbit.clone(),
@@ -3881,9 +3137,7 @@ pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64
         allowed_hosts: Arc::new(StdRwLock::new(vec![])),
         bridge_port,
         download_dir: download_lock,
-        playback_last_ms: Arc::new(AtomicU64::new(0)),
         cache_swap: Arc::new(RwLock::new(())),
-        rolling_cache,
         disk_pressure: Arc::new(AtomicBool::new(false)),
         store: store.clone(),
         transcode,

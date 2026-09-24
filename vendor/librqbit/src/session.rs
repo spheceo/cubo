@@ -430,6 +430,10 @@ pub struct SessionOptions {
     /// Enable fastresume, to restore state quickly after restart.
     pub fastresume: bool,
 
+    /// Cubo: keep have-pieces bitfields in this folder (by info hash) even
+    /// without `persistence`, so re-added torrents skip the full hash check.
+    pub bitv_folder: Option<PathBuf>,
+
     /// Turn on to dump session contents into a file periodically, so that on next start
     /// all remembered torrents will continue where they left off.
     pub persistence: Option<SessionPersistenceConfig>,
@@ -488,6 +492,7 @@ impl Default for SessionOptions {
             bind_device_name: None,
             disable_trackers: false,
             fastresume: false,
+            bitv_folder: None,
             persistence: None,
             peer_id: None,
             listen: None,
@@ -676,7 +681,16 @@ impl Session {
                         let p = Arc::new(PostgresSessionStorage::new(connection_string).await?);
                         make_result!(p)
                     }
-                    None => Ok((None, Arc::new(NonPersistentBitVFactory {}))),
+                    None => match &opts.bitv_folder {
+                        Some(folder) => Ok((
+                            None,
+                            Arc::new(crate::bitv_factory::FolderBitVFactory::new(
+                                folder.clone(),
+                                spawner,
+                            )),
+                        )),
+                        None => Ok((None, Arc::new(NonPersistentBitVFactory {}))),
+                    },
                 }
             }
 

@@ -845,6 +845,21 @@ async fn reopening_a_downloaded_source_needs_no_swarm() {
         .json(reqwest::Method::DELETE, &format!("/v1/sessions/{first_id}"), None)
         .await;
 
+    let hash = torrent.magnet.rsplit(':').next().unwrap();
+    let piece_record = core_root.join("piece-state").join(format!("{hash}.bitv"));
+    let saved = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&piece_record) {
+                if bytes.iter().any(|byte| *byte != 0) {
+                    break true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(matches!(saved, Ok(true)), "piece record was not persisted");
+
     let (ready, reopened) = open_session(&client, json!({ "magnet": torrent.magnet, "hevc": false })).await;
     assert!(reopened < Duration::from_secs(5), "reopen took {reopened:?}");
 

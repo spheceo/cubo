@@ -88,12 +88,6 @@ export interface LocalEngineConnection {
   webUrl?: string | null;
 }
 
-export interface AddedTorrent {
-  id: number | null;
-  infoHash: string;
-  files: { name: string; length: number; included?: boolean }[];
-}
-
 export interface PlaybackUpdate {
   key: string;
   mediaId: number;
@@ -400,137 +394,6 @@ export function buildMagnet(stream: Stream): string {
 /** Local storage pressure affects every source; trying another torrent cannot fix it. */
 export class InsufficientStorageError extends Error {}
 
-export async function addMagnet(
-  engine: LocalEngineConnection,
-  magnet: string,
-  metadata?: { mediaKey?: string; title?: string; fileIndex?: number | null },
-): Promise<AddedTorrent> {
-  const headers = new Headers({ 'Content-Type': 'text/plain' });
-  if (metadata?.mediaKey) headers.set('X-Cubo-Media-Key', metadata.mediaKey);
-  if (metadata?.title) headers.set('X-Cubo-Title', encodeURIComponent(metadata.title));
-  if (metadata?.fileIndex != null && Number.isFinite(metadata.fileIndex)) {
-    headers.set('X-Cubo-File-Index', String(metadata.fileIndex));
-  }
-  const response = await engineFetch(engine, '/v1/torrents', {
-    method: 'POST',
-    headers,
-    body: magnet,
-  });
-  if (!response.ok) {
-    // rqbit's error body says WHY (metadata timeout, parse failure, …) —
-    // far more useful than a bare status code.
-    let detail = '';
-    try {
-      const body = (await response.json()) as {
-        human_readable?: string;
-        error?: string;
-      };
-      detail = body.human_readable ?? body.error ?? '';
-    } catch {
-      // Non-JSON body; fall back to the status code.
-    }
-    const ErrorType = response.status === 507 ? InsufficientStorageError : Error;
-    throw new ErrorType(
-      detail
-        ? `Cubo core rejected the stream: ${detail}`
-        : `Cubo core rejected the stream (${response.status})`,
-    );
-  }
-
-  const data = (await response.json()) as {
-    id?: number | null;
-    info_hash?: string;
-    details?: {
-      info_hash?: string;
-      files?: { name: string; length: number; included?: boolean }[];
-    };
-  };
-  return {
-    id: data.id ?? null,
-    infoHash: data.info_hash ?? data.details?.info_hash ?? '',
-    files: data.details?.files ?? [],
-  };
-}
-
-export interface TorrentProgress {
-  /** Bytes verified so far, across the whole torrent. */
-  downloadedBytes: number;
-  totalBytes: number;
-  /** Human readable download speed from the engine, when it reports one. */
-  speed: string | null;
-  peers: number | null;
-}
-
-type TorrentStatsRaw = {
-  state?: string;
-  error?: string | null;
-  progress_bytes?: number;
-  total_bytes?: number;
-  live?: {
-    download_speed?: { human_readable?: string };
-    snapshot?: { peer_stats?: { live?: number } };
-  } | null;
-};
-
-function toProgress(stats: TorrentStatsRaw): TorrentProgress {
-  return {
-    downloadedBytes: stats.progress_bytes ?? 0,
-    totalBytes: stats.total_bytes ?? 0,
-    speed: stats.live?.download_speed?.human_readable ?? null,
-    peers: stats.live?.snapshot?.peer_stats?.live ?? null,
-  };
-}
-
-export async function waitUntilLive(
-  engine: LocalEngineConnection,
-  idOrHash: number | string,
-  {
-    timeoutMs = 90_000,
-    onProgress,
-    signal,
-  }: {
-    timeoutMs?: number;
-    onProgress?: (progress: TorrentProgress) => void;
-    /** Stops the polling loop the moment the caller navigates away or
-     *  switches sources — otherwise an abandoned start keeps hitting Core
-     *  twice a second for up to a minute. */
-    signal?: AbortSignal;
-  } = {},
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  const id = encodeURIComponent(String(idOrHash));
-
-  for (;;) {
-    signal?.throwIfAborted();
-    const response = await engineFetch(engine, `/v1/torrents/${id}/stats`, { signal });
-    if (response.status === 507) {
-      throw new InsufficientStorageError(
-        await readEngineError(response, 'Free disk space before trying playback again.'),
-      );
-    }
-    if (!response.ok) throw new Error(`Cubo core status failed (${response.status})`);
-    const stats = (await response.json()) as TorrentStatsRaw;
-    onProgress?.(toProgress(stats));
-    // `paused` is not ready — the cache maintainer pauses background
-    // torrents, and treating that as success sent remux/ffprobe at a
-    // torrent that would never fetch more pieces.
-    if (stats.state === 'live') return;
-    if (stats.state === 'error') throw new Error(stats.error ?? 'The stream failed');
-    if (Date.now() > deadline) throw new Error('The stream took too long to start');
-    await delayUnthrottled(500, signal);
-  }
-}
-
-export function streamUrl(
-  engine: LocalEngineConnection,
-  idOrHash: number | string,
-  fileIndex: number,
-): string {
-  const id = encodeURIComponent(String(idOrHash));
-  const token = encodeURIComponent(engine.token);
-  return `${engine.baseUrl}/v1/torrents/${id}/stream/${fileIndex}?token=${token}`;
-}
-
 /** Release-matching data for external subtitles (OpenSubtitles hash, exact
  *  size and filename), computed by Core through rqbit's ranged stream — the
  *  tail chunk may be pulled from peers on demand. Null when Core cannot
@@ -680,69 +543,6 @@ export async function getSkipSegments(
   } catch {
     return null;
   }
-}
-
-export function hlsPlaylistUrl(
-  engine: LocalEngineConnection,
-  idOrHash: number | string,
-  fileIndex: number,
-  startSeconds = 0,
-  generation?: number,
-): string {
-  const id = encodeURIComponent(String(idOrHash));
-  const token = encodeURIComponent(engine.token);
-  const start = startSeconds > 0 ? `&start=${startSeconds.toFixed(3)}` : '';
-  const gen = generation && generation > 0 ? `&gen=${generation}` : '';
-  return `${engine.baseUrl}/v1/torrents/${id}/hls/${fileIndex}/media.m3u8?token=${token}${start}${gen}`;
-}
-
-/** Kicks off (and validates) the Core-side remux for one torrent file,
- *  optionally starting `startSeconds` into it (seek restart). The first
- *  playlist request blocks until ffmpeg produces playable segments, so a
- *  success here means the returned URL is immediately watchable.
- *
- *  Returns `startSeconds`: where the playlist ACTUALLY begins in the source.
- *  ffmpeg's input seek lands on the keyframe at/before the requested spot,
- *  so this can be a few seconds earlier — callers must use it (never the
- *  request) as their absolute-time offset, or subtitles and reported
- *  positions drift after every seek restart. */
-export async function startRemux(
-  engine: LocalEngineConnection,
-  idOrHash: number | string,
-  fileIndex: number,
-  startSeconds = 0,
-  generation?: number,
-): Promise<{ url: string; durationSeconds: number | null; startSeconds: number }> {
-  const url = hlsPlaylistUrl(engine, idOrHash, fileIndex, startSeconds, generation);
-  const response = await coreFetch(url);
-  if (!response.ok) {
-    let detail = 'This source could not be converted for the browser.';
-    try {
-      const body = (await response.json()) as { error?: unknown };
-      if (typeof body.error === 'string') detail = body.error;
-    } catch {
-      // Keep the generic message for non-JSON error bodies.
-    }
-    const ErrorType = response.status === 507 ? InsufficientStorageError : Error;
-    throw new ErrorType(detail);
-  }
-  const duration = Number(response.headers.get('X-Cubo-Duration'));
-  const actualStart = Number(response.headers.get('X-Cubo-Start'));
-  const landed =
-    Number.isFinite(actualStart) && actualStart >= 0 ? actualStart : startSeconds;
-  // A leftover poll of an older playlist URL used to restart ffmpeg at the
-  // beginning while this request asked for minutes in. Adopting that header
-  // as the absolute origin puts the playhead at ~0 while the picture is
-  // hours later — refuse it so the caller can retry or keep the last job.
-  if (startSeconds > 60 && landed < 1) {
-    throw new Error('The converter restarted at the beginning instead of the requested time.');
-  }
-  return {
-    url,
-    durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
-    // Older Cores don't send the header; assume the seek landed exactly.
-    startSeconds: landed,
-  };
 }
 
 export type SessionPhase = 'resolving' | 'probing' | 'ready' | 'failed' | 'closed';
@@ -920,23 +720,6 @@ export function sessionMediaUrl(
   return status.mode === 'hls'
     ? `${engine.baseUrl}/v1/sessions/${id}/hls/media.m3u8?token=${token}`
     : `${engine.baseUrl}/v1/sessions/${id}/stream?token=${token}`;
-}
-
-/** Index of the file Cubo should play. When rqbit marked a subset
- *  `included` (season-pack `only_files`), pick among those so a 26 GB pack
- *  does not resolve to a different episode's file. */
-export function largestFileIndex(
-  files: { length: number; included?: boolean }[],
-): number {
-  const preferIncluded = files.some((file) => file.included === true);
-  let largest = -1;
-  for (let index = 0; index < files.length; index += 1) {
-    if (preferIncluded && files[index].included !== true) continue;
-    if (largest < 0 || files[index].length > files[largest].length) {
-      largest = index;
-    }
-  }
-  return largest < 0 ? 0 : largest;
 }
 
 export async function getLibrary(

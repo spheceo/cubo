@@ -412,6 +412,21 @@ impl CoreStore {
         self.persist_locked(data).await
     }
 
+    /// After a restart: torrent ids belonged to the previous process, so
+    /// entries fall back to their info hash; entries whose files are all
+    /// gone are dropped.
+    pub async fn reconcile_cache_entries_after_restart(&self) -> Result<(), String> {
+        let _writer = self.persist_lock.lock().await;
+        let mut data = self.data.lock().await;
+        data.cache_entries.retain(|entry| {
+            entry.files.iter().any(|file| std::path::Path::new(file).exists())
+        });
+        for entry in data.cache_entries.iter_mut() {
+            entry.torrent_id = None;
+        }
+        self.persist_locked(data).await
+    }
+
     pub async fn clear_cache_entries(&self) -> Result<(), String> {
         let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;

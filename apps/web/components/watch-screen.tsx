@@ -1,11 +1,9 @@
 /**
  * Orchestrates playback: source ranking, resume, and mid-play source
- * fallback. With a Core that runs playback sessions, Core owns everything
+ * fallback. Core owns everything
  * about the chosen source (torrent, file, direct vs remux, conversion
  * window) and the client only creates the session, heartbeats its position,
- * and asks Core what went wrong before giving up on a source. Older Cores
- * use the legacy path (torrent add + growing remux playlist + seek restarts
- * with absolute-time offsets).
+ * and asks Core what went wrong before giving up on a source.
  */
 import {
   backdropUrl,
@@ -33,7 +31,6 @@ import { resetWindowScroll } from './scroll-to-top';
 import { watchOrigin } from './watch-origin';
 import { VideoPlayer, type BufferedRange, type PlayerSubtitle } from './video-player';
 import {
-  addMagnet,
   closeSession,
   createSession,
   getSession,
@@ -50,19 +47,10 @@ import {
   getSkipSegments,
   getSubtitleMatch,
   shipClientLog,
-  largestFileIndex,
   recordPlayback,
-  startRemux,
-  streamUrl,
-  waitUntilLive,
   type SkipSegments,
-  type TorrentProgress,
 } from '@/lib/local-engine';
-import {
-  isBrowserPlayableFilename,
-  isRemuxableFilename,
-  supportsHevcRemux,
-} from '@/lib/media-compatibility';
+import { supportsHevcRemux } from '@/lib/media-compatibility';
 import {
   loadCaptionPrefs,
   preferredSubtitleId,
@@ -83,7 +71,6 @@ import { fetchStreams } from '@/lib/stream-cache';
 import { onCacheClear } from '@/lib/cache-events';
 import type { SubtitleReleaseHint } from '@cubo/core';
 
-const AUTO_ATTEMPTS = 3;
 /** Session starts race sources: how many may run at once, how many are
  *  tried in total, and how long the leader runs alone before a backup joins. */
 const RACE_CONCURRENCY = 3;
@@ -168,15 +155,7 @@ export function WatchScreen({
   const [needsCore, setNeedsCore] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoIsHls, setVideoIsHls] = useState(false);
-  /** The source is a Core playback session (complete playlist, absolute time). */
-  const [videoVod, setVideoVod] = useState(false);
   const [videoDurationHint, setVideoDurationHint] = useState<number | null>(null);
-  /** Where the current remux playlist begins within the source (seek restart). */
-  const [videoTimeOffset, setVideoTimeOffset] = useState(0);
-  /** Playlist-local jump that makes up the gap between the keyframe ffmpeg
-   *  landed on and the exact position the viewer requested. */
-  const [videoStartLocal, setVideoStartLocal] = useState<number | null>(null);
-  const [seekConverting, setSeekConverting] = useState(false);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [subtitleTracks, setSubtitleTracks] = useState<PlayerSubtitle[]>([]);
@@ -219,7 +198,6 @@ export function WatchScreen({
       startAbortRef.current?.abort();
       attemptRef.current += 1;
       setVideoUrl(null);
-      setSeekConverting(false);
       setStatus('error');
       setError('Playback stopped to clear storage. Press Retry to start again.');
     };
@@ -301,22 +279,6 @@ export function WatchScreen({
   const unsavedWatchSeconds = useRef(0);
   const playerFlushRef = useRef<(() => void) | null>(null);
   const claimedReadyKey = useRef<string | null>(null);
-  /** Torrent behind the current remux, so seeks can restart its converter. */
-  const remuxContext = useRef<{
-    connection: Awaited<ReturnType<typeof core.connect>>;
-    id: number | string;
-    fileIndex: number;
-  } | null>(null);
-  const seekAttemptRef = useRef(0);
-  /** Incremented on every remux kickoff so leftover hls.js polls of the
-   *  previous playlist URL cannot restart ffmpeg at the old offset. */
-  const remuxGenRef = useRef(0);
-  /** True from the moment a remux seek is requested until the old player
-   *  has unmounted — killing ffmpeg looks like a fatal HLS error. */
-  const seekingRef = useRef(false);
-  /** Absolute target of an in-flight remux seek; blocks stale progress
-   *  flushes from overwriting `lastPositionRef` with the pre-seek time. */
-  const seekTargetRef = useRef<number | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
 
   useEffect(() => {
@@ -363,12 +325,7 @@ export function WatchScreen({
     setNeedsCore(false);
     setVideoUrl(null);
     setDownloadedRanges(null);
-    setVideoVod(false);
     setVideoDurationHint(null);
-    setVideoTimeOffset(0);
-    setVideoStartLocal(null);
-    setSeekConverting(false);
-    remuxContext.current = null;
     setProgress(0);
     setStage(STAGE.core);
 
@@ -378,6 +335,9 @@ export function WatchScreen({
     try {
       connection = await core.connect();
       if (stale()) return false;
+      if (!connection.sessions) {
+        throw new Error('This web build needs an updated Cubo Core. Start the development Core and reconnect.');
+      }
       playbackConnection.current = connection;
       if (resumeFrom == null) {
         const local = loadPlayhead(itemKey);
@@ -419,206 +379,17 @@ export function WatchScreen({
     }
     if (stale()) return false;
 
-    if (connection.sessions) {
-      return raceSessions({
-        connection,
-        list,
-        startIndex,
-        auto,
-        startAtFor: (stream) =>
-          resumeFrom != null ? resume : resumeForSource(resume, savedInfoHash, stream.infoHash),
-        more,
-        abort,
-        stale,
-      });
-    }
-
-    const limit = auto ? list.length : startIndex + 1;
-    let lastError = 'Could not start playback';
-    let attempts = 0;
-
-    for (let index = startIndex; index < limit; index += 1) {
-      const stream = list[index];
-      if (auto && failedSourcesRef.current.has(stream.infoHash)) continue;
-      if (auto && !isAutomaticSource(stream, originalLanguage)) {
-        lastError = 'No suitable original-language source is available.';
-        continue;
-      }
-      if (auto && attempts >= AUTO_ATTEMPTS) break;
-      attempts += 1;
-
-      const startAt =
-        resumeFrom != null
-          ? resume
-          : resumeForSource(resume, savedInfoHash, stream.infoHash);
-      lastPositionRef.current = startAt;
-      setResumeAt(startAt);
-      activeInfoHashRef.current = stream.infoHash;
-      activeSourceRef.current = stream;
-      setActiveKey(streamKey(stream));
-      setSubtitleMatch(null);
-      setSkipSegments(null);
-
-      try {
-        setStage(STAGE.opening);
-        const added = await addMagnet(connection, buildMagnet(stream), {
-          mediaKey: itemKey,
-          title,
-          fileIndex: stream.fileIdx,
-        });
-        if (stale()) return false;
-
-        const fileIndex = stream.fileIdx ?? largestFileIndex(added.files);
-        activeSourceRef.current = { ...stream, fileIdx: fileIndex };
-        const filename = added.files[fileIndex]?.name ?? stream.filename ?? '';
-        const hint = `${stream.name} ${stream.title}`;
-        const direct = isBrowserPlayableFilename(filename, hint);
-        if (
-          !direct &&
-          !(connection.transcode && isRemuxableFilename(filename, hint, supportsHevcRemux()))
-        ) {
-          throw new Error('This source uses video or audio the browser cannot play.');
-        }
-
-        const id = added.id ?? added.infoHash;
-        if (id === null || id === '') throw new Error('Cubo Core did not return a torrent ID');
-
-
-        shipClientLog(
-          connection,
-          'info',
-          'stream_selected',
-          {
-            index,
-            total: list.length,
-            auto,
-            resume: startAt || undefined,
-            direct_play: direct,
-            name: stream.name,
-            source_title: stream.title,
-            quality: stream.quality,
-            size_bytes: stream.sizeBytes,
-            seeders: stream.seeders,
-            filename: filename || undefined,
-            info_hash: stream.infoHash,
-          },
-        );
-
-        setStage(STAGE.buffering);
-        await waitUntilLive(connection, id, {
-          signal: abort.signal,
-          onProgress: (stats) => {
-            if (stale()) return false;
-            setStage(bufferingTarget(stats));
-          },
-        });
-        if (stale()) return false;
-
-        // rqbit is now live; hashing during checksum validation returns 500.
-        // Compute the release hash in the background — it may pull the file's
-        // tail from peers and take a while. When it lands, the subtitle
-        // effect refetches with an exact-release match.
-        void getSubtitleMatch(connection, id, fileIndex).then((match) => {
-          if (!stale()) setSubtitleMatch(match);
-        });
-
-        // Intro/credits windows: named chapters first inside Core, crowd
-        // APIs after. Fires in parallel with the stream warm-up — playback
-        // never waits on it, and a missing answer just means no skip UI.
-        const segmentQuery = {
-          torrent: String(id),
-          file: fileIndex,
-          type: mediaType,
-          tmdbId: mediaId,
-          imdbId,
-          season: season ?? undefined,
-          episode: episode ?? undefined,
-        };
-        void getSkipSegments(connection, segmentQuery, abort.signal).then(
-          (segments) => {
-            if (stale()) return;
-            setSkipSegments(segments);
-            // A cold file can answer remote-only while its ffprobe is still
-            // in flight — retry once so exact chapter timings get their turn.
-            if (!segments?.sections?.some((s) => s.source === 'chapters')) {
-              const retry = window.setTimeout(() => {
-                void getSkipSegments(connection, segmentQuery, abort.signal).then(
-                  (next) => {
-                    if (!stale() && next) setSkipSegments(next);
-                  },
-                );
-              }, 12_000);
-              abort.signal.addEventListener('abort', () => window.clearTimeout(retry), {
-                once: true,
-              });
-            }
-          },
-        );
-
-
-        let url: string;
-        let usesHls = false;
-        let durationHint: number | null = null;
-        let timeOffset = 0;
-        let localJump: number | null = null;
-        if (direct) {
-          url = streamUrl(connection, id, fileIndex);
-        } else {
-          // Core remuxes the file into browser-friendly HLS; the call returns
-          // once the first segments are playable. The playlist actually
-          // begins where ffmpeg's input seek landed (the keyframe at/before
-          // `resume`) — that measured offset is what keeps absolute times
-          // truthful; the local jump closes any gap up to the exact spot.
-          setStage(STAGE.buffering);
-          const remux = await startRemux(
-            connection,
-            id,
-            fileIndex,
-            startAt,
-            ++remuxGenRef.current,
-          );
-          url = remux.url;
-          durationHint = remux.durationSeconds;
-          usesHls = true;
-          timeOffset = remux.startSeconds;
-          localJump = startAt - timeOffset;
-          if (localJump < 0.25) localJump = null;
-          if (stale()) return false;
-          remuxContext.current = { connection, id, fileIndex };
-        }
-
-        setStage(STAGE.ready);
-        setProgress(1);
-        const reveal = () => {
-          if (stale()) return false;
-          startupRef.current.readyAt = performance.now();
-          startupRef.current.session = null;
-          setVideoUrl(url);
-          setVideoIsHls(usesHls);
-          setVideoDurationHint(durationHint);
-          setVideoTimeOffset(timeOffset);
-          setVideoStartLocal(localJump);
-          setStatus('ready');
-        };
-        // Attach as soon as the source is ready; loader animation must not
-        // delay the first media request.
-        reveal();
-        return true;
-      } catch (reason) {
-        if (stale() || abort.signal.aborted) return false;
-        lastError = reason instanceof Error ? reason.message : lastError;
-        if (reason instanceof InsufficientStorageError) {
-          storageBlockedRef.current = true;
-          break;
-        }
-        failedSourcesRef.current.add(stream.infoHash);
-        forgetSource(itemKey, stream.infoHash);
-      }
-    }
-
-    setStatus('error');
-    setError(lastError);
-    return false;
+    return raceSessions({
+      connection,
+      list,
+      startIndex,
+      auto,
+      startAtFor: (stream) =>
+        resumeFrom != null ? resume : resumeForSource(resume, savedInfoHash, stream.infoHash),
+      more,
+      abort,
+      stale,
+    });
   }
 
   /** Session-backed start. Sources race instead of queueing: the best one
@@ -883,10 +654,7 @@ export function WatchScreen({
     setProgress(1);
     setVideoUrl(sessionMediaUrl(connection, ready));
     setVideoIsHls(ready.mode === 'hls');
-    setVideoVod(true);
     setVideoDurationHint(ready.durationSeconds ?? null);
-    setVideoTimeOffset(0);
-    setVideoStartLocal(null);
     setStatus('ready');
   }
 
@@ -1010,7 +778,6 @@ export function WatchScreen({
     return () => {
       cancelled = true;
       startAbortRef.current?.abort();
-      seekAttemptRef.current += 1;
       releaseSession();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- core.connect is stable for a given endpoint
@@ -1019,7 +786,7 @@ export function WatchScreen({
   // Tell Core where the viewer is: it paces conversion from this and keeps
   // the session (and its file) alive while the tab is open, even paused.
   useEffect(() => {
-    if (status !== 'ready' || !videoVod) return;
+    if (status !== 'ready') return;
     const beat = () => {
       const session = sessionRef.current;
       if (!session) return;
@@ -1032,7 +799,7 @@ export function WatchScreen({
     beat();
     const interval = window.setInterval(beat, HEARTBEAT_MS);
     return () => window.clearInterval(interval);
-  }, [status, videoVod, videoUrl]);
+  }, [status, videoUrl]);
 
   // Closing the tab ends the session at once instead of after Core's idle
   // timeout (a beacon is the only request that survives unload).
@@ -1058,7 +825,7 @@ export function WatchScreen({
       total_ms: Math.round(now - startup.t0),
       first_start_ms: since(startup.firstStartAt),
       ready_ms: since(startup.readyAt),
-      mode: startup.session?.mode ?? 'legacy',
+      mode: startup.session?.mode,
       resume: lastPositionRef.current || undefined,
       core: startup.session?.timeline,
     });
@@ -1074,7 +841,7 @@ export function WatchScreen({
       };
       const session = sessionRef.current;
       if (!session) {
-        shipClientLog(connection, 'warn', 'playback_stall', { ...base, mode: 'legacy' });
+        shipClientLog(connection, 'warn', 'playback_stall', base);
         return;
       }
       void getSession(session.connection, session.id)
@@ -1172,10 +939,7 @@ export function WatchScreen({
       sessionStarted: boolean,
       persistNow = false,
     ) => {
-      // A remux seek's old player still reports time (and flushes on
-      // src swap); that must not overwrite the seek target.
-      if (seekingRef.current || seekTargetRef.current != null) return;
-      // Unmount / src teardown often reports timeOffset+0. That must not
+      // Unmount / source teardown can report zero. That must not
       // rewind the last trusted playhead we already persisted. A session
       // start at 0 after resume still needs to reach Core — keep the
       // stored playhead instead of dropping the tick.
@@ -1249,9 +1013,7 @@ export function WatchScreen({
   );
 
   const recordSeekIntent = useCallback((targetSeconds: number) => {
-    // Big backward moves are logged either way: an explicit one here, any
-    // other in savePlaybackProgress — so a lost place can be told apart
-    // from the viewer rewinding.
+    // Record intentional rewinds before the asynchronous seek starts.
     const from = lastPositionRef.current;
     if (from - targetSeconds > BACKWARD_JUMP_LOG_SECONDS && playbackConnection.current) {
       shipClientLog(playbackConnection.current, 'info', 'seek_back', {
@@ -1260,71 +1022,8 @@ export function WatchScreen({
       });
     }
     lastPositionRef.current = targetSeconds;
-    if (seekingRef.current || seekTargetRef.current != null) {
-      savePlayhead(itemKey, targetSeconds, lastDurationRef.current || videoDurationHint || 0, activeInfoHashRef.current);
-    } else {
-      savePlaybackProgress(targetSeconds, lastDurationRef.current || videoDurationHint || 0, 0, false, true);
-    }
+    savePlaybackProgress(targetSeconds, lastDurationRef.current || videoDurationHint || 0, 0, false, true);
   }, [itemKey, savePlaybackProgress, videoDurationHint]);
-
-  // A seek outside the converted window restarts ffmpeg at the target and
-  // swaps in the new playlist. Last request wins if the viewer keeps seeking.
-  const requestRemuxSeek = useCallback(async (targetSeconds: number) => {
-    const context = remuxContext.current;
-    if (!context) return;
-    const attempt = (seekAttemptRef.current += 1);
-    lastPositionRef.current = targetSeconds;
-    seekTargetRef.current = targetSeconds;
-    seekingRef.current = true;
-    setSeekConverting(true);
-    try {
-      const remux = await startRemux(
-        context.connection,
-        context.id,
-        context.fileIndex,
-        targetSeconds,
-        ++remuxGenRef.current,
-      );
-      if (seekAttemptRef.current !== attempt) return;
-      // The restarted converter begins at its own landing keyframe — adopt
-      // it as the new absolute origin, then close the gap locally.
-      setVideoTimeOffset(remux.startSeconds);
-      const gap = targetSeconds - remux.startSeconds;
-      setVideoStartLocal(gap >= 0.25 ? gap : null);
-      setVideoUrl(remux.url);
-      shipClientLog(
-        context.connection,
-        'info',
-        'remux_seek',
-        {
-          requested: targetSeconds,
-          landed_at: remux.startSeconds,
-          local_jump: gap >= 0.25 ? gap : 0,
-        },
-      );
-    } catch (reason) {
-      // The converter could not restart there; playback continues in place.
-      shipClientLog(
-        context.connection,
-        'warn',
-        'remux_seek_failed',
-        {
-          requested: targetSeconds,
-          error: reason instanceof Error ? reason.message : undefined,
-        },
-      );
-    } finally {
-      if (seekAttemptRef.current === attempt) setSeekConverting(false);
-    }
-  }, []);
-
-  // Drop the seek guards only after React has unmounted the old player —
-  // its HLS fatal error and progress flush run in that commit's cleanups.
-  useEffect(() => {
-    if (seekConverting) return;
-    seekingRef.current = false;
-    seekTargetRef.current = null;
-  }, [seekConverting]);
 
   const persistLastPlayhead = useCallback(() => {
     playerFlushRef.current?.();
@@ -1532,9 +1231,7 @@ export function WatchScreen({
           ) : null}
           src={videoUrl}
           hls={videoIsHls}
-          vod={videoVod}
           durationHint={videoDurationHint}
-          timeOffset={videoTimeOffset}
           title={title}
           subtitle={subtitle}
           logoPath={logoPath}
@@ -1548,10 +1245,9 @@ export function WatchScreen({
           onPickCaptionColor={(color: CaptionColor) => updateCaptionPrefs({ color })}
           subtitles={subtitleTracks}
           activeSubtitleId={activeSubtitleId}
-          initialTime={videoIsHls && !videoVod ? 0 : resumeAt}
-          startTimeLocal={videoIsHls && !videoVod ? videoStartLocal : null}
+          initialTime={resumeAt}
           onPlaybackProgress={savePlaybackProgress}
-          downloadedRanges={videoVod ? downloadedRanges : null}
+          downloadedRanges={downloadedRanges}
           onPlaying={() => {
             if (activeSourceRef.current) rememberSource(itemKey, activeSourceRef.current);
             reportFirstFrame();
@@ -1563,15 +1259,10 @@ export function WatchScreen({
           onCreditsReached={markDoneAtCredits}
           sections={skipSegments?.sections}
           onSeekIntent={recordSeekIntent}
-          onSeekOutside={videoVod ? undefined : (target) => void requestRemuxSeek(target)}
           onError={() => {
             if (cacheClearingRef.current) return;
-            // Restarting ffmpeg for a seek kills the current playlist;
-            // that looks identical to a dead source and must not fall
-            // through to the next torrent at the old resume position.
-            if (seekingRef.current || seekTargetRef.current != null) return;
             const session = sessionRef.current;
-            if (videoVod && session) {
+            if (session) {
               void recoverSession(session);
               return;
             }
@@ -1580,11 +1271,6 @@ export function WatchScreen({
           onStall={reportStall}
           />
 
-          {seekConverting ? (
-            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/60">
-              <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
-            </div>
-          ) : null}
         </div>
       ) : (
         <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-6">
@@ -1771,11 +1457,6 @@ function PlayerEpisodes({
       )}
     </>
   );
-}
-
-function bufferingTarget(stats: TorrentProgress): number {
-  const ratio = Math.min(1, stats.downloadedBytes / BUFFER_TARGET_BYTES);
-  return STAGE.buffering + (STAGE.bufferingFull - STAGE.buffering) * ratio;
 }
 
 function prepareSubtitles(tracks: SubtitleTrack[]): PlayerSubtitle[] {

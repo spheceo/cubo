@@ -5,13 +5,13 @@ import { gsap } from 'gsap';
 import { useEffect, useRef, useState } from 'react';
 import { queryClient, streamQueries } from '@/lib/queries';
 import {
-  addMagnet,
   buildMagnet,
-  largestFileIndex,
-  streamUrl,
-  waitUntilLive,
+  closeSession,
+  createSession,
+  sessionMediaUrl,
+  waitForSession,
+  type LocalEngineConnection,
 } from '@/lib/local-engine';
-import { isBrowserPlayableFilename } from '@/lib/media-compatibility';
 import { previewStart } from '@/lib/preview-start';
 import { rankPreviewStreams } from '@/lib/stream-select';
 import { onCacheClear } from '@/lib/cache-events';
@@ -140,12 +140,18 @@ export function AutoPreview({
     let cancelled = false;
     const abort = new AbortController();
     let previewCore: string | null = null;
+    let previewSession: { connection: LocalEngineConnection; id: string } | null = null;
+    const releaseSession = () => {
+      if (previewSession) closeSession(previewSession.connection, previewSession.id);
+      previewSession = null;
+    };
     const unsubscribe = onCacheClear((baseUrl) => {
       if (previewCore && previewCore !== baseUrl) return;
       cancelled = true;
       abort.abort();
       videoRef.current?.pause();
       videoRef.current?.removeAttribute('src');
+      releaseSession();
       setPreviewUrl(null);
       setPreviewActive(false);
     });
@@ -160,12 +166,12 @@ export function AutoPreview({
         const [connection, streams] = await Promise.all([
           connect(),
           queryClient.fetchQuery(
-          streamQueries.streams(
-            item.mediaType,
-            item.imdbId as string,
-            target?.season,
-            target?.episode,
-          ),
+            streamQueries.streams(
+              item.mediaType,
+              item.imdbId as string,
+              target?.season,
+              target?.episode,
+            ),
           ),
         ]);
         previewCore = connection.baseUrl;
@@ -176,27 +182,30 @@ export function AutoPreview({
         )[0];
         if (!source || cancelled) return;
 
-        const added = await addMagnet(connection, buildMagnet(source), {
+        const created = await createSession(connection, {
+          magnet: buildMagnet(source),
           mediaKey: `${item.mediaType}:${item.id}${
             target ? `:${target.season}:${target.episode}` : ''
           }`,
           title: item.title,
-          fileIndex: source.fileIdx,
+          fileIndex: source.fileIdx ?? null,
+          hevc: false,
         });
-        if (cancelled) return;
-
-        const fileIndex = source.fileIdx ?? largestFileIndex(added.files);
-        const filename = added.files[fileIndex]?.name ?? source.filename ?? '';
-        if (!isBrowserPlayableFilename(filename, `${source.name} ${source.title}`)) return;
-
-        const torrentId = added.id ?? added.infoHash;
-        if (torrentId === null || torrentId === '') return;
-        await waitUntilLive(connection, torrentId, {
-          timeoutMs: 90_000,
-          signal: abort.signal,
-        });
-        if (!cancelled) setPreviewUrl(streamUrl(connection, torrentId, fileIndex));
+        previewSession = { connection, id: created.id };
+        if (cancelled) {
+          releaseSession();
+          return;
+        }
+        const ready = await waitForSession(connection, created.id, { signal: abort.signal });
+        // Previews use native direct play; Core-owned HLS sessions are for the
+        // full player, where hls.js handles the playlist and conversion pace.
+        if (cancelled || ready.mode !== 'direct') {
+          releaseSession();
+          return;
+        }
+        setPreviewUrl(sessionMediaUrl(connection, ready));
       } catch {
+        releaseSession();
         // Artwork remains the complete fallback when Core or a preview source is unavailable.
       }
     }
@@ -211,6 +220,7 @@ export function AutoPreview({
       window.clearTimeout(idle);
       videoRef.current?.pause();
       videoRef.current?.removeAttribute('src');
+      releaseSession();
     };
   }, [connect, item.mediaType, item.id, item.imdbId]);
 

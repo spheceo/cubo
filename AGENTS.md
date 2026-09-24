@@ -2,65 +2,39 @@
 
 ## Playback pipeline status: WORKING — do not casually change
 
-As of 2026-08-20 the streaming, rendering, and playback pipeline works well
-across all media that previously had problems: A/V sync, seeking, resume,
-source fallback, and remux warm-up speed are all verified good. This state is
-the result of several hard-won, empirically debugged fixes. Do not refactor,
-"simplify", or swap out parts of this pipeline without a strong reason and
-explicit approval from the maintainer.
+Core-owned playback sessions (`/v1/sessions`) are the only playback path. The
+streaming, rendering, and playback fixes remain load-bearing; do not refactor
+or replace this path without a strong reason and maintainer approval.
 
-### Load-bearing invariants
-
-Each of these fixed a real, user-visible bug. Breaking any of them
-reintroduces it.
-
-1. **Direct-play first.** MP4/WebM sources rank above remux-needing sources
-   within the same quality tier (`apps/web/lib/stream-select.ts`). The ffmpeg
-   remux is a fallback for titles with no direct-playable source, never the
-   default.
-2. **Remuxed sources always play through hls.js, never native HLS**
-   (`apps/web/components/video-player.tsx`). Native players (Safari)
-   treat Core's growing EVENT playlist as a live broadcast:
-   play() snaps to the live edge and seeking collapses to a sliding window.
-3. **The player thinks in absolute movie time.** A remux playlist's time zero
-   is where ffmpeg's input seek ACTUALLY landed — the keyframe at/before the
-   requested `-ss` target, measured by Core via ffprobe and reported in the
-   `X-Cubo-Start` response header. Clients must use that value (never the
-   requested start) as their absolute offset; every displayed/reported/sought
-   position adds it back, and the gap up to the requested spot is closed by a
-   playlist-local jump (`startTimeLocal`). Progress records must always store
-   absolute positions and the full source duration (the `durationHint` from
-   ffprobe), never the partial growing-playlist duration.
-4. **Seeks outside the converted window restart ffmpeg** at the target via
-   `-noaccurate_seek -ss` (`crates/cubo-engine/src/transcode.rs`).
-   `-noaccurate_seek` is load-bearing for lip-sync: without it, transcoded
-   audio is trimmed to the exact seek target while copied video starts at the
-   earlier keyframe, and players shift audio to close the gap — a constant
-   ~1 s A/V desync on every resume/seek.
-5. **Segment URLs are unique per conversion job** (per-job nonce query param,
-   plus `no-store`) in `crates/cubo-engine/src/engine.rs`. Seek restarts
-   reuse segment filenames for different content; without the nonce the
-   browser HTTP cache splices audio from one offset over video from another.
-6. **Probe results are prewarmed and cached.** Core starts ffprobe in the
-   background the moment an MKV torrent is added, with tight analysis caps
-   (`-probesize 5M -analyzeduration 10M`) and `-hls_init_time 2`. This is what
-   keeps remux warm-up fast; raising the caps or serializing the probe brings
-   back multi-second start delays.
-7. **Cache deletion works against recorded file paths, not just rqbit**
-   (`store.rs` / `engine.rs`). rqbit forgets its torrents on every restart, so
-   deletion driven only through its API silently removes nothing.
-8. **Auto stream fallback.** A mid-play source failure advances down the
-   ranked list and resumes at the last reported position; the manual source
-   picker stays hidden. A remux seek restart is not a source failure:
-   killing ffmpeg makes the current playlist 404, and treating that as
-   `source_failed` used to open the next torrent at the pre-seek time.
-9. **Remux playlist polls must not restart ffmpeg.** hls.js keeps GETting
-   the playlist URL it was given, which includes that job's `start=`. A
-   later seek starts a new job at a new offset; leftover polls of the old
-   URL used to call `ensure_job` with the old start, kill the seek remux,
-   and return `X-Cubo-Start: 0` — playhead at the beginning, picture hours
-   later. Each kickoff carries a monotonic `gen=`; an older generation
-   serves the current job and never evicts it (`transcode.rs`).
+1. **Direct-play first.** MP4/WebM rank above remux-needing sources within a
+   quality tier (`apps/web/lib/stream-select.ts`). Core decides the mode after
+   probing the chosen file.
+2. **Remux through hls.js.** Core serves a complete VOD HLS playlist in
+   absolute movie time. `video-player.tsx` uses hls.js, including on Safari;
+   the player and progress store use full-source absolute seconds.
+3. **Seek on the file's own timeline.** MKV keyframes and fMP4 fragments are
+   mapped to fixed VOD segments (`mkv_index.rs`, `segment_plan.rs`,
+   `remuxer.rs`). Every segment URL always names the same movie interval, so
+   seeks and old playlist polls cannot splice different remux jobs together.
+4. **Core owns the live file.** Sessions keep the torrent and selected file
+   alive, pace conversion from heartbeats, and protect it from cache eviction.
+   Closed sessions and failed race candidates release that protection.
+5. **Probe and metadata reuse.** A known torrent is reused in rqbit, otherwise
+   its saved `.torrent` metadata is loaded from disk. Prefetch and playback
+   share probes. Do not re-resolve known magnets from the swarm or serialize
+   probe work behind buffer waits.
+6. **Resume and fallback.** Intentional seeks persist before async work.
+   `raceSessions` gives the top source a head start, launches backups when it
+   is not downloading, plays the first ready one, and closes the rest. A
+   failed active source advances down the ranked list at the last position;
+   healthy sessions recover on the same source.
+7. **Cache deletion.** Recorded file paths are the source of truth after a
+   restart, when rqbit's torrent IDs change. Reject paths with `..`; deleting
+   a torrent's files also removes its saved piece bitfield. Maintenance never
+   removes a live session's file or a root still recorded in the cache index.
+8. **Downloaded bar.** Core maps verified pieces to movie time using the
+   MP4/MKV index. The player draws the contiguous watchable span from the
+   playhead, never the browser's constant-bitrate guess for direct MP4.
 
 ## Security model (added 2026-08-21) — do not weaken
 
@@ -110,7 +84,7 @@ library snapshot) — progress ticks are hot-path.
 - `apps/catalog` — Cloudflare Worker that holds `TMDB_API_KEY` and returns
   allowlisted TMDB JSON. Workers.dev is fine; no custom domain required.
 - `crates/cubo-engine` / `crates/cubo-cli` — Cubo Core: axum bridge on port
-  8765, rqbit torrent engine, ffmpeg remux pipeline (`transcode.rs`),
+  8765, rqbit torrent engine, session remux pipeline (`remuxer.rs`),
   embedded UI, catalog/stream proxies, exposed as the `cubo` CLI.
 - `apps/site` — standalone marketing site (cubo.spheceo.com, Vercel project
   `cubo-site`). Deliberately has NO workspace dependencies so it deploys in
@@ -143,12 +117,9 @@ repo, built by `.github/workflows/release.yml`.
 
 ## Parked work
 
-- **Caption styling/UX shipped; timing alignment fixed** (2026-08-21):
-  remuxed HLS playlists begin at the keyframe ffmpeg lands on, not the
-  requested seek offset — Core now measures that landing point and reports it
-  via `X-Cubo-Start` (see invariant 3), which keeps external subtitle cues
-  aligned across seek restarts. Remaining validation: compare cue timings
-  against audio on real remuxed sources with unusual keyframe intervals.
+- **Subtitle timing:** session playlists use absolute movie time. Remaining
+  validation: compare cues against audio on real remuxed sources with unusual
+  keyframe intervals.
 
 ## Task runner
 
@@ -193,8 +164,8 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   Legacy clients without these optional fields retain their existing behavior.
 - Command-line tests cover ordering and selection; they do not establish real
   first-frame latency, browser seek behavior, or actual audio language. Cold
-  startup still depends on peer availability. The ffmpeg offset, A/V sync,
-  playlist generation, and segment-cache invariants above remain load-bearing.
+  startup still depends on peer availability. A/V sync, playlist mapping,
+  and segment-cache behavior remain load-bearing.
 
 - Session starts race sources (`raceSessions` in `watch-screen.tsx`): the
   top pick runs alone for a few seconds, backups join while nothing is

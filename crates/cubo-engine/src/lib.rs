@@ -10,15 +10,11 @@ pub mod mkv_index;
 pub mod mp4_index;
 pub mod pairing;
 pub mod paths;
-pub mod remux_sink;
 pub mod remuxer;
-pub mod rolling_cache;
 pub mod segment_plan;
 pub mod session;
 #[cfg(test)]
 mod soak_tests;
-#[cfg(test)]
-mod rolling_cache_integration_tests;
 pub mod store;
 pub mod system;
 #[cfg(test)]

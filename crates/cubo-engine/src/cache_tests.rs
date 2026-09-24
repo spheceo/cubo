@@ -52,6 +52,28 @@ fn sparse_files_are_counted_by_allocated_space() {
     fs::remove_dir_all(root).expect("remove temporary directory");
 }
 
+#[test]
+fn reclaim_untracked_keeps_roots_still_in_the_cache_index() {
+    let root = temp_dir("tracked-reclaim");
+    let kept = root.join("kept.mp4");
+    let orphan = root.join("orphan.mp4");
+    for path in [&kept, &orphan] {
+        fs::write(path, vec![1u8; 4096]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+    }
+
+    reclaim_untracked(&root, 0, &HashSet::from([kept.clone()])).unwrap();
+
+    assert!(kept.exists());
+    assert!(!orphan.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn unsafe_recorded_path_is_refused_and_outside_file_survives() {
     let root = temp_dir("safe-delete");
@@ -130,8 +152,10 @@ async fn fixture_state(
         )
         .await
         .unwrap();
-    let transcode = Arc::new(TranscodeManager::new(root.join("transcode")));
-    fs::write(transcode.dir().join("segment.m4s"), b"converted").unwrap();
+    let transcode = Arc::new(TranscodeManager::new());
+    let piece_state = root.join("piece-state");
+    fs::create_dir_all(&piece_state).unwrap();
+    fs::write(piece_state.join("fixture.bitv"), b"pieces").unwrap();
     let sessions = crate::session::SessionManager::for_tests(root, transcode.clone(), store.clone()).await;
     let state = BridgeState {
         rqbit_port,
@@ -140,9 +164,7 @@ async fn fixture_state(
         web_origin: None,
         allowed_hosts: Arc::new(StdRwLock::new(vec![])),
         bridge_port: 0,
-        rolling_cache: RollingCache::new(downloads.clone(), 1024 * 1024).unwrap(),
         download_dir: Arc::new(RwLock::new(downloads)),
-        playback_last_ms: Arc::new(AtomicU64::new(0)),
         cache_swap: Arc::new(RwLock::new(())),
         disk_pressure: Arc::new(AtomicBool::new(false)),
         store,
@@ -156,25 +178,25 @@ async fn fixture_state(
 }
 
 #[tokio::test]
-async fn clear_removes_both_video_locations_before_forgetting_records() {
+async fn clear_removes_downloads_and_piece_records_before_forgetting_entries() {
     let root = temp_dir("clear-all");
     let (state, server) = fixture_state(&root, false).await;
     let downloads = state.current_download_dir().await;
     assert!(
-        cache_size(downloads.clone(), state.transcode.dir().to_path_buf())
+        cache_size(downloads.clone())
             .await
             .unwrap()
             > 0
     );
     empty_cache(&state, &downloads).await.unwrap();
     assert_eq!(
-        cache_size(downloads, state.transcode.dir().to_path_buf())
+        cache_size(downloads)
             .await
             .unwrap(),
         0
     );
     assert!(state.store.cache_snapshot().await.cache_entries.is_empty());
-    assert!(state.transcode.cache_blocked());
+    assert!(!root.join("piece-state").exists());
     assert!(root.join("state.json").exists());
     server.abort();
     fs::remove_dir_all(root).unwrap();

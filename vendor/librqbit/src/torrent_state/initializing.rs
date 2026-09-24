@@ -97,6 +97,9 @@ impl TorrentStateInitializing {
                 expected,
                 "the bitfield loaded isn't of correct length, ignoring it, will do full check"
             );
+            if let Err(e) = bitv_factory.clear(self.shared.info_hash.into()).await {
+                warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
+            }
             return None;
         }
 
@@ -176,7 +179,7 @@ impl TorrentStateInitializing {
                 info_hash = ?self.shared.info_hash,
                 "data corrupted, ignoring fastresume data"
             );
-            if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
+            if let Err(e) = bitv_factory.clear(self.shared.info_hash.into()).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
             }
             self.checked_bytes.store(0, Ordering::Relaxed);

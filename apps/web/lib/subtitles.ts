@@ -1,9 +1,7 @@
 /**
  * Subtitle cue parsing and lookup. External subtitle files are timed against
- * the ORIGINAL source file, but remuxed HLS playlists begin `timeOffset`
- * seconds into that source — callers must therefore look cues up against
- * absolute movie time (timeOffset + video.currentTime), never the raw player
- * position, or every cue fires early on remuxed sources.
+ * the original source file. Core's VOD playlists use the same absolute movie
+ * timeline, so callers look cues up against video.currentTime.
  */
 
 export type SubtitleCue = {

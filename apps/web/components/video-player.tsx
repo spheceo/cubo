@@ -1,14 +1,4 @@
-/**
- * Cubo's video player. Two source shapes reach it:
- *
- * - Playback sessions (`vod`): Core serves a complete VOD playlist whose
- *   timestamps are the movie's own, so the player starts at the resume point
- *   and seeks anywhere with no offset bookkeeping.
- * - The legacy remux pipeline: a growing EVENT playlist that starts
- *   `timeOffset` seconds into the source. It must play through hls.js (native
- *   players treat it as live), every position is offset back to absolute
- *   movie time, and seeks outside the converted window go to `onSeekOutside`.
- */
+/** Cubo's player for direct files and Core's complete VOD HLS playlists. */
 import { watchableSpan } from '@/lib/download-bar';
 import {
   IoContract,
@@ -52,7 +42,6 @@ import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
-import { REMUX_HLS_CONFIG } from '@/lib/remux-hls-config';
 import { sessionHlsConfig } from '@/lib/session-hls-config';
 import type { SkipSection } from '@/lib/local-engine';
 
@@ -66,10 +55,7 @@ export type BufferedRange = {
   end: number;
 };
 
-/** True when `time` sits inside a buffered (not merely seekable) range.
- *  EVENT remux playlists report the whole converted window as seekable long
- *  before those bytes are in MSE — seeking there every tick chases the
- *  loaded edge and looks like 2× playback. */
+/** True when `time` sits inside a buffered range. */
 function timeRangesCover(ranges: TimeRanges, time: number, slack = 0.35): boolean {
   for (let index = 0; index < ranges.length; index += 1) {
     if (time >= ranges.start(index) - slack && time <= ranges.end(index) + slack) {
@@ -89,9 +75,7 @@ export type PlayerSubtitle = {
 export function VideoPlayer({
   src,
   hls = false,
-  vod = false,
   durationHint = null,
-  timeOffset = 0,
   title,
   subtitle,
   logoPath = null,
@@ -106,9 +90,7 @@ export function VideoPlayer({
   subtitles,
   activeSubtitleId,
   initialTime = 0,
-  startTimeLocal = null,
   onPlaybackProgress,
-  onSeekOutside,
   onSeekIntent,
   onPlaying,
   onError,
@@ -136,16 +118,10 @@ export function VideoPlayer({
   /** Every classified section, drawn as colored bands on the scrub bar. */
   sections?: SkipSection[];
   src: string;
-  /** True when `src` is an HLS playlist from Core's remux pipeline. */
+  /** True when `src` is a Core VOD HLS playlist. */
   hls?: boolean;
-  /** The HLS playlist is a playback session's complete VOD playlist in
-   *  absolute movie time: start at `initialTime`, seek natively. */
-  vod?: boolean;
-  /** Full source duration reported by Core while a growing HLS playlist is incomplete. */
+  /** Full source duration reported by Core. */
   durationHint?: number | null;
-  /** Seconds into the source where this HLS playlist begins (seek restart).
-   *  All reported and displayed times are offset by this amount. */
-  timeOffset?: number;
   title: string;
   subtitle: string | null;
   /** TMDB logotype for the playing title, shown by the buffering loader. */
@@ -162,10 +138,6 @@ export function VideoPlayer({
   subtitles: PlayerSubtitle[];
   activeSubtitleId: string | null;
   initialTime?: number;
-  /** Playlist-local position to jump to once the source can seek — used after
-   *  a seek restart to make up the gap between the keyframe ffmpeg landed on
-   *  and the exact spot the viewer asked for. Applied once per source. */
-  startTimeLocal?: number | null;
   captionColor?: CaptionColor;
   onPickCaptionColor: (color: CaptionColor) => void;
   onPlaybackProgress: (
@@ -175,9 +147,6 @@ export function VideoPlayer({
     sessionStarted: boolean,
     persistNow?: boolean,
   ) => void;
-  /** Called with an absolute target when a seek lands outside the converted
-   *  window, so the owner can restart the converter at that position. */
-  onSeekOutside?: (absoluteSeconds: number) => void;
   /** Persist an intentional jump before asynchronous seeking begins. */
   onSeekIntent?: (absoluteSeconds: number) => void;
   onError: () => void;
@@ -214,8 +183,6 @@ export function VideoPlayer({
    *  startup, not interruptions. */
   const playedSinceSource = useRef(false);
   const stallRef = useRef<{ startedAt: number; position: number } | null>(null);
-  /** One-shot local seek (seek-restart catch-up), applied per source. */
-  const localSeekApplied = useRef<string | null>(null);
   /** False only when the viewer hit pause — browsers pausing a hidden tab
    *  must not stick. A new source starts unpaused. */
   const userPaused = useRef(false);
@@ -223,9 +190,6 @@ export function VideoPlayer({
   const playGeneration = useRef(0);
   /** Prevent a teardown/attach pause from immediately restarting playback. */
   const sourceReadyRef = useRef(false);
-  /** Absolute source time before which Core has evicted remux segments. */
-  const retainedWindowStartRef = useRef<number | null>(null);
-  const remuxEvictionHandledRef = useRef(false);
 
   // Framing preference is player-global (like a TV picture-size setting):
   // it follows the viewer across titles, so the player owns it directly.
@@ -290,8 +254,8 @@ export function VideoPlayer({
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
 
-  // Callbacks and the offset live in refs so the media-source effect and the
-  // stable seek helpers never go stale or rerun on unrelated renders.
+  // Callbacks live in refs so the media-source effect and stable seek helpers
+  // never go stale or rerun on unrelated renders.
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
   const onStallRef = useRef(onStall);
@@ -299,16 +263,8 @@ export function VideoPlayer({
   /** Read once per source by the session hls.js setup (its start position). */
   const initialTimeRef = useRef(initialTime);
   initialTimeRef.current = initialTime;
-  const onSeekOutsideRef = useRef(onSeekOutside);
-  onSeekOutsideRef.current = onSeekOutside;
-  const timeOffsetRef = useRef(timeOffset);
-  timeOffsetRef.current = timeOffset;
-
   // Subtitles are rendered by Cubo, not the browser's native track layer:
-  // cues are timed against the original file, so they are looked up against
-  // ABSOLUTE movie time (timeOffset + currentTime) — the same invariant as
-  // every other displayed position. This keeps them aligned on remuxed
-  // sources and re-aligns automatically after seek restarts.
+  // session playlists and cues both use absolute movie time.
   const subtitleCuesRef = useRef<SubtitleCue[]>([]);
   /** Set by the cue-display effect; lets the cue-loading effect repaint the
    *  visible caption once even while the frame loop sleeps (video paused). */
@@ -340,7 +296,7 @@ export function VideoPlayer({
       const video = videoRef.current;
       const cues = subtitleCuesRef.current;
       if (!video || cues.length === 0) return;
-      const cue = findActiveCue(cues, timeOffsetRef.current + video.currentTime);
+      const cue = findActiveCue(cues, video.currentTime);
       const text = cue?.text ?? null;
       setActiveCueText((previous) => (previous === text ? previous : text));
     };
@@ -585,8 +541,8 @@ export function VideoPlayer({
     (video: HTMLVideoElement) => {
       const pending = pendingSeekRef.current;
       if (pending == null) return;
-      const local = Math.max(0, pending - timeOffsetRef.current);
-      const actual = timeOffsetRef.current + video.currentTime;
+      const local = Math.max(0, pending);
+      const actual = video.currentTime;
 
       if (Math.abs(actual - pending) < 1.25) {
         clearPendingSeek();
@@ -613,8 +569,6 @@ export function VideoPlayer({
     pendingSeekRef.current = null;
     pendingSeekKickedRef.current = false;
     setPendingSeek(null);
-    retainedWindowStartRef.current = null;
-    remuxEvictionHandledRef.current = false;
     playedSinceSource.current = false;
     stallRef.current = null;
   }, [src, hls, durationHint, markUserPaused]);
@@ -632,7 +586,7 @@ export function VideoPlayer({
       if (video && !stallRef.current && playedSinceSource.current) {
         stallRef.current = {
           startedAt: performance.now(),
-          position: timeOffsetRef.current + video.currentTime,
+          position: video.currentTime,
         };
       }
       return;
@@ -669,12 +623,8 @@ export function VideoPlayer({
       };
     }
 
-    // Remuxed sources ALWAYS go through hls.js — never the native HLS stack.
-    // Core's playlist grows while ffmpeg works, and native players (Safari)
-    // treat a growing playlist as a live
-    // broadcast: play() snaps to the live edge and seeking is confined to a
-    // sliding window. hls.js with an explicit startPosition keeps normal
-    // video-on-demand behaviour.
+    // Keep remuxed sources on hls.js so every browser uses the same VOD seek
+    // and segment request policy.
     let instance: import('hls.js').default | null = null;
     void import('hls.js').then(({ default: Hls }) => {
       if (cancelled) return;
@@ -682,71 +632,30 @@ export function VideoPlayer({
         onErrorRef.current();
         return;
       }
-      if (vod) {
-        instance = new Hls(sessionHlsConfig(initialTimeRef.current));
-        instance.loadSource(src);
-        instance.attachMedia(video);
-        instance.on(Hls.Events.MANIFEST_PARSED, () => {
-          sourceReadyRef.current = true;
-          start();
-        });
-        // hls.js already retried the request policy; one more round of
-        // recovery before telling the owner, who asks Core what happened.
-        let networkRecoveries = 0;
-        let mediaRecoveries = 0;
-        instance.on(Hls.Events.ERROR, (_event, data) => {
-          if (!data.fatal || !instance) return;
-          const gone = data.response?.code === 404 || data.response?.code === 410;
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !gone && networkRecoveries < 2) {
-            networkRecoveries += 1;
-            instance.startLoad();
-            return;
-          }
-          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
-            mediaRecoveries += 1;
-            instance.recoverMediaError();
-            return;
-          }
-          onErrorRef.current();
-        });
-        return;
-      }
-      instance = new Hls({
-        ...REMUX_HLS_CONFIG,
-        xhrSetup: (xhr, url) => {
-          if (!url.includes('/media.m3u8')) return;
-          const readWindowStart = () => {
-            if (xhr.readyState < XMLHttpRequest.HEADERS_RECEIVED) return;
-            const value = Number(xhr.getResponseHeader('X-Cubo-Window-Start'));
-            if (Number.isFinite(value) && value >= 0) {
-              retainedWindowStartRef.current = value;
-            }
-          };
-          xhr.addEventListener('readystatechange', readWindowStart);
-        },
-      });
+      instance = new Hls(sessionHlsConfig(initialTimeRef.current));
       instance.loadSource(src);
       instance.attachMedia(video);
       instance.on(Hls.Events.MANIFEST_PARSED, () => {
         sourceReadyRef.current = true;
         start();
       });
+      // hls.js already retried the request policy; one more round of
+      // recovery before telling the owner, who asks Core what happened.
+      let networkRecoveries = 0;
+      let mediaRecoveries = 0;
       instance.on(Hls.Events.ERROR, (_event, data) => {
-        // A retained-window eviction is a same-source remux restart. Let the
-        // owner restart at the current absolute playhead instead of falling
-        // through to source fallback.
-        if (
-          data.response?.code === 410 &&
-          !remuxEvictionHandledRef.current &&
-          onSeekOutsideRef.current
-        ) {
-          remuxEvictionHandledRef.current = true;
-          const absolute =
-            pendingSeekRef.current ?? timeOffsetRef.current + video.currentTime;
-          onSeekOutsideRef.current(absolute);
+        if (!data.fatal || !instance) return;
+        const gone = data.response?.code === 404 || data.response?.code === 410;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !gone && networkRecoveries < 2) {
+          networkRecoveries += 1;
+          instance.startLoad();
           return;
         }
-        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
+          mediaRecoveries += 1;
+          instance.recoverMediaError();
+          return;
+        }
         onErrorRef.current();
       });
     });
@@ -757,7 +666,7 @@ export function VideoPlayer({
       stopPlayLoop();
       instance?.destroy();
     };
-  }, [src, hls, vod, requestPlay, stopPlayLoop]);
+  }, [src, hls, requestPlay, stopPlayLoop]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -795,7 +704,7 @@ export function VideoPlayer({
     };
   }, [settingsOpen]);
 
-  const shownTime = scrubTime ?? pendingSeek ?? timeOffset + currentTime;
+  const shownTime = scrubTime ?? pendingSeek ?? currentTime;
 
   const [creditsDismissed, setCreditsDismissed] = useState(false);
   // An intro with no known end cannot be skipped — nothing to offer.
@@ -927,7 +836,7 @@ export function VideoPlayer({
       lastProgressWallTime.current = video.paused ? 0 : now;
       lastProgressReport.current = now;
       onPlaybackProgress(
-        pendingSeekRef.current ?? timeOffsetRef.current + video.currentTime,
+        pendingSeekRef.current ?? video.currentTime,
         fullDuration,
         watchedDelta,
         sessionStarted,
@@ -1008,9 +917,8 @@ export function VideoPlayer({
     };
   }, [title, subtitle, logoPath, playing, markUserPaused, requestPlay, stopPlayLoop]);
 
-  /** Seeks to an absolute source position. The needle stays on the requested
-   *  time immediately; if that section is not converted yet we wait (or
-   *  restart ffmpeg) instead of clamping back to the loaded window. */
+  /** Seeks to an absolute source position and holds the needle there while
+   *  that section buffers. */
   const seekToAbsolute = useCallback(
     (absoluteSeconds: number) => {
       const video = videoRef.current;
@@ -1022,42 +930,18 @@ export function VideoPlayer({
       );
       onSeekIntent?.(target);
       holdSeek(target);
-      setCurrentTime(target - timeOffsetRef.current);
-
-      const local = target - timeOffsetRef.current;
-      const seekable = video.seekable;
-      if (
-        hls &&
-        onSeekOutsideRef.current &&
-        retainedWindowStartRef.current != null &&
-        target < retainedWindowStartRef.current - 0.5
-      ) {
-        onSeekOutsideRef.current(target);
-        return;
-      }
-      if (hls && onSeekOutsideRef.current && seekable.length > 0) {
-        const seekableStart = seekable.start(0);
-        const seekableEnd = seekable.end(seekable.length - 1);
-        // Slack near the frontier: waiting for the next segment is faster
-        // than restarting ffmpeg. Empty seekable means the playlist is
-        // still attaching — hold the needle, do not kick a new remux.
-        if (local < seekableStart - 1 || local > seekableEnd + 10) {
-          onSeekOutsideRef.current(target);
-          return;
-        }
-      }
+      setCurrentTime(target);
       pendingSeekKickedRef.current = true;
-      video.currentTime = Math.max(0, local);
+      video.currentTime = target;
     },
-    [hls, holdSeek, resolveDuration, onSeekIntent],
+    [holdSeek, resolveDuration, onSeekIntent],
   );
 
   const seekBy = useCallback((seconds: number) => {
     const video = videoRef.current;
     if (!video) return;
     const fullDuration = resolveDuration(video);
-    const head =
-      pendingSeekRef.current ?? timeOffsetRef.current + video.currentTime;
+    const head = pendingSeekRef.current ?? video.currentTime;
     seekToAbsolute(Math.max(0, Math.min(fullDuration || Infinity, head + seconds)));
     revealControls();
   }, [resolveDuration, revealControls, seekToAbsolute]);
@@ -1175,24 +1059,6 @@ export function VideoPlayer({
     toggleCaptions,
     revealControls,
   ]);
-
-  // One-shot catch-up after a seek restart: the new playlist begins at the
-  // keyframe ffmpeg landed on (earlier than requested), so close the gap by
-  // seeking locally as soon as the source can seek. Reset per source.
-  useEffect(() => {
-    localSeekApplied.current = null;
-  }, [src]);
-
-  useEffect(() => {
-    if (startTimeLocal == null || startTimeLocal < 0.25) return;
-    if (localSeekApplied.current === src) return;
-    const video = videoRef.current;
-    if (!video || !timeRangesCover(video.seekable, startTimeLocal, 0)) return;
-    localSeekApplied.current = src;
-    // Wait for the requested point rather than claiming a partial jump as
-    // finished while the first segments are still arriving.
-    video.currentTime = startTimeLocal;
-  }, [startTimeLocal, src, currentTime]);
 
   function syncBuffered(video: HTMLVideoElement) {
     const ranges = video.buffered;
@@ -1514,9 +1380,8 @@ export function VideoPlayer({
           <div ref={barRef} className="relative h-[5px] w-full rounded-full bg-white/15">
             {duration > 0
               ? (downloadedRanges ? watchableSpan(downloadedRanges, shownTime) : bufferedRanges).map((range, index) => {
-                  const shift = downloadedRanges ? 0 : timeOffset;
-                  const start = Math.max(0, Math.min(1, (range.start + shift) / duration));
-                  const end = Math.max(start, Math.min(1, (range.end + shift) / duration));
+                  const start = Math.max(0, Math.min(1, range.start / duration));
+                  const end = Math.max(start, Math.min(1, range.end / duration));
                   return (
                     <span
                       key={`${range.start}-${range.end}-${index}`}

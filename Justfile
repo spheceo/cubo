@@ -56,7 +56,7 @@ test:
     cargo test
 
 # Playback soak: real Core + local swarm + virtual player, several episodes
-# back to back with seeks. Tune with CUBO_SOAK_SPEED / _EPISODE_SECONDS /
-# _UPLOAD_KBPS (see crates/cubo-engine/src/soak_tests.rs).
+# back to back with seeks. Tune with CUBO_SOAK_SPEED,
+# CUBO_SOAK_EPISODE_SECONDS, and CUBO_SOAK_BANDWIDTH (see soak_tests.rs).
 soak:
     cargo test -p cubo-engine --release playback_soak -- --ignored --nocapture

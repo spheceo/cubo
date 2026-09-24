@@ -1,21 +1,14 @@
-# Cubo rolling storage extension
+# Cubo rqbit extensions
 
 Based on the published `librqbit` 9.0.1 crate from
 https://github.com/ikatson/rqbit (Apache-2.0). The original crate sources
-remain under that license. Cubo modifications are in the storage trait,
-piece/chunk tracking, and torrent stream/scheduler code.
+remain under that license.
 
-Cubo's storage reserves entire pieces before requesting bytes, reports
-completed-piece eviction, and downloads only the window needed by readers.
-The verified stream-read hook makes a missing piece recoverable without
-exposing an incomplete replacement to the player. Pausing releases each
-in-flight piece's reservation before the tracker is dismantled. Ordinary
-filesystem storage retains its original behaviour through default trait
-methods.
+Cubo exposes each managed torrent's verified piece bitfield for the player's
+download bar and can persist that bitfield by info hash without restoring the
+whole rqbit session. On restart, Cubo re-adds saved torrent metadata and rqbit
+checks representative pieces before trusting the saved bitfield. Deleting a
+torrent's files also removes its bitfield.
 
-When upgrading rqbit, port these hooks and run Cubo's real local-peer test:
-
-    cargo test -p cubo-engine rolling_cache_local_peer -- --ignored --nocapture
-
-Also run the full workspace tests. Do not replace this fork with upstream
-until equivalent bounded-storage support is available and verified.
+When upgrading rqbit, port these extensions and run the workspace tests and
+the local-swarm playback soak (`just soak`).

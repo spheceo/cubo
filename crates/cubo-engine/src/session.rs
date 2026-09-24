@@ -320,6 +320,9 @@ pub struct SessionManager {
     /// restart, and even a managed torrent re-fetches it from peers when
     /// re-added by magnet).
     metadata_dir: PathBuf,
+    /// rqbit's saved have-pieces records (`<info hash>.bitv`), which let a
+    /// torrent re-added after a restart skip hashing files already on disk.
+    piece_state_dir: PathBuf,
     sessions: Mutex<HashMap<String, Arc<PlaybackSession>>>,
     /// Probe + keyframe index per `info_hash:file_index`.
     media_cache: Mutex<HashMap<String, (MediaProbe, Option<MkvIndex>)>>,
@@ -336,9 +339,6 @@ pub struct SessionManager {
     /// Torrents a finished prefetch parked: kept paused (not downloaded in
     /// the background) until a session actually plays them.
     parked: Mutex<HashSet<usize>>,
-    /// Set once any client has used sessions. Cache maintenance then trusts
-    /// explicit liveness instead of the legacy pipeline's timing guesses.
-    used: std::sync::atomic::AtomicBool,
 }
 
 impl SessionManager {
@@ -352,6 +352,7 @@ impl SessionManager {
     ) -> Arc<Self> {
         let _ = std::fs::remove_dir_all(&sessions_dir);
         let metadata_dir = sessions_dir.with_file_name("torrent-meta");
+        let piece_state_dir = sessions_dir.with_file_name("piece-state");
         let manager = Arc::new(Self {
             rqbit,
             rqbit_port,
@@ -361,13 +362,13 @@ impl SessionManager {
             download_dir,
             sessions_dir,
             metadata_dir,
+            piece_state_dir,
             sessions: Mutex::new(HashMap::new()),
             media_cache: Mutex::new(HashMap::new()),
             media_locks: Mutex::new(HashMap::new()),
             byte_maps: Mutex::new(HashMap::new()),
             prefetching: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashSet::new()),
-            used: std::sync::atomic::AtomicBool::new(false),
         });
         let sweeper = Arc::downgrade(&manager);
         tokio::spawn(async move {
@@ -454,12 +455,20 @@ impl SessionManager {
         self.parked.lock().unwrap().iter().map(|id| id.to_string()).collect()
     }
 
-    /// Forgets saved torrent metadata and media probes (cache clear).
+    /// Forgets saved torrent metadata, piece records and media probes
+    /// (cache clear).
     pub fn clear_metadata(&self) {
         self.media_cache.lock().unwrap().clear();
         self.byte_maps.lock().unwrap().clear();
         self.parked.lock().unwrap().clear();
         let _ = std::fs::remove_dir_all(&self.metadata_dir);
+        let _ = std::fs::remove_dir_all(&self.piece_state_dir);
+    }
+
+    /// A torrent's files were deleted: its saved piece record would now
+    /// claim pieces that are gone.
+    pub fn forget_pieces(&self, info_hash: &str) {
+        let _ = std::fs::remove_file(self.piece_state_dir.join(format!("{info_hash}.bitv")));
     }
 
     /// Fails every live session, e.g. when the disk fills up.
@@ -506,12 +515,7 @@ impl SessionManager {
             .any(|session| session.is_live())
     }
 
-    pub fn ever_used(&self) -> bool {
-        self.used.load(std::sync::atomic::Ordering::Acquire)
-    }
-
     pub fn create(self: &Arc<Self>, request: CreateSessionRequest) -> Arc<PlaybackSession> {
-        self.used.store(true, std::sync::atomic::Ordering::Release);
         let id = uuid::Uuid::new_v4().simple().to_string();
         let session = Arc::new(PlaybackSession {
             id: id.clone(),
@@ -1403,6 +1407,17 @@ mod tests {
             format_name: Some(format.into()),
             chapters: vec![],
         }
+    }
+
+    #[test]
+    fn episode_regex_matches_tv_keys_only() {
+        assert!(episode_file_regex(None).is_none());
+        assert!(episode_file_regex(Some("movie:550:-:-")).is_none());
+        assert!(episode_file_regex(Some("tv:236235:-:-")).is_none());
+        let regex = episode_file_regex(Some("tv:236235:2:1")).expect("tv episode");
+        assert!(regex.contains("s0*2"));
+        assert!(regex.contains("e0*1"));
+        assert!(regex.contains("2x0*1"));
     }
 
     #[test]
