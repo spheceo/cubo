@@ -1,0 +1,44 @@
+name: CI
+
+# Every push and pull request runs the full test suites, so a broken change
+# is caught here instead of in a release build (or on someone's machine).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - name: Typecheck every package
+        run: bun run --filter '*' typecheck
+      - name: Web tests
+        working-directory: apps/web
+        run: bun test
+      - name: Build the web app and site
+        run: bun run --filter '*' build
+
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # ffmpeg/ffprobe on PATH: the playback tests build real media fixtures
+      # and play them through a local swarm (they skip without it).
+      - name: Install build dependencies and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev ffmpeg
+      - name: Core tests
+        run: cargo test --workspace
