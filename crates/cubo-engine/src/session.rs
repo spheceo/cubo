@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::mkv_index::{self, ByteSource, MkvIndex};
+use crate::mp4_index::{self, ByteMap};
 use crate::remuxer::{RemuxInput, RemuxStatus, Remuxer};
 use crate::segment_plan::SegmentPlan;
 use crate::store::CoreStore;
@@ -295,6 +296,12 @@ pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<PlaybackSession>>>,
     /// Probe + keyframe index per `info_hash:file_index`.
     media_cache: Mutex<HashMap<String, (MediaProbe, Option<MkvIndex>)>>,
+    /// One probe per file at a time: a prefetch and the session that
+    /// follows it on the same file share the first result.
+    media_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Keyframe `(seconds, byte offset)` points per `info_hash:file_index`,
+    /// for mapping downloaded pieces to movie time.
+    byte_maps: Mutex<HashMap<String, Arc<ByteMap>>>,
     /// Prefetches in flight, by `info_hash:file_index` (or magnet while the
     /// hash is unknown). Their torrents count as live so maintenance does not
     /// pause them mid-warm-up.
@@ -329,6 +336,8 @@ impl SessionManager {
             metadata_dir,
             sessions: Mutex::new(HashMap::new()),
             media_cache: Mutex::new(HashMap::new()),
+            media_locks: Mutex::new(HashMap::new()),
+            byte_maps: Mutex::new(HashMap::new()),
             prefetching: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashSet::new()),
             used: std::sync::atomic::AtomicBool::new(false),
@@ -421,6 +430,7 @@ impl SessionManager {
     /// Forgets saved torrent metadata and media probes (cache clear).
     pub fn clear_metadata(&self) {
         self.media_cache.lock().unwrap().clear();
+        self.byte_maps.lock().unwrap().clear();
         self.parked.lock().unwrap().clear();
         let _ = std::fs::remove_dir_all(&self.metadata_dir);
     }
@@ -750,8 +760,16 @@ impl SessionManager {
 
     /// Probe and keyframe index for a source file, from the cache when a
     /// prefetch (or an earlier session) already read them.
-    async fn media_info(&self, source: &Source) -> Result<(MediaProbe, Option<MkvIndex>), Failure> {
+    async fn media_info(self: &Arc<Self>, source: &Source) -> Result<(MediaProbe, Option<MkvIndex>), Failure> {
         let key = format!("{}:{}", source.info_hash, source.file_index);
+        let lock = self
+            .media_locks
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _probing = lock.lock().await;
         if let Some(cached) = self.media_cache.lock().unwrap().get(&key).cloned() {
             return Ok(cached);
         }
@@ -778,12 +796,64 @@ impl SessionManager {
             }
             None => None,
         };
+        if let Some(index) = index.as_ref().filter(|index| index.byte_map.len() >= 2) {
+            self.byte_maps
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Arc::new(index.byte_map.clone()));
+        } else if !is_mkv {
+            // MP4 sample tables sit in `moov`, which the probe just pulled
+            // onto disk. Read them beside playback, never in its way.
+            let manager = self.clone();
+            let map_key = key.clone();
+            tokio::spawn(async move {
+                match mp4_index::read_byte_map(&index_source).await {
+                    Ok(map) if map.len() >= 2 => {
+                        manager.byte_maps.lock().unwrap().insert(map_key, Arc::new(map));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::info!(target: "session", %error, "no MP4 sample index; download bar is approximate");
+                    }
+                }
+            });
+        }
         let mut cache = self.media_cache.lock().unwrap();
         if cache.len() >= MEDIA_CACHE_ENTRIES {
             cache.clear();
+            self.byte_maps.lock().unwrap().clear();
         }
         cache.insert(key, (probe.clone(), index.clone()));
         Ok((probe, index))
+    }
+
+    /// Stretches of the session's file already on disk, in movie seconds.
+    /// Downloaded pieces are mapped through the file's keyframe index, so
+    /// the player's bar shows what is really fetched ahead — browsers only
+    /// know bytes and assume a constant bitrate.
+    pub fn available_ranges(&self, session: &PlaybackSession) -> Vec<(f64, f64)> {
+        let (source, duration) = session.update(|inner| (inner.source.clone(), inner.duration));
+        let (Some(source), Some(duration)) = (source, duration) else {
+            return Vec::new();
+        };
+        let Ok(have) = source.handle.have_pieces() else {
+            return Vec::new();
+        };
+        let Ok((file_offset, piece_len)) = source.handle.with_metadata(|metadata| {
+            (
+                metadata
+                    .file_infos
+                    .get(source.file_index)
+                    .map(|file| file.offset_in_torrent)
+                    .unwrap_or(0),
+                metadata.lengths().default_piece_length() as u64,
+            )
+        }) else {
+            return Vec::new();
+        };
+        let key = format!("{}:{}", source.info_hash, source.file_index);
+        let map = self.byte_maps.lock().unwrap().get(&key).cloned();
+        available_from_pieces(&have, file_offset, piece_len, source.file_len, duration, map.as_deref())
     }
 
     fn metadata_path(&self, info_hash: &str) -> PathBuf {
@@ -994,7 +1064,7 @@ impl SessionManager {
         });
     }
 
-    async fn run_prefetch(&self, key: &str, request: &CreateSessionRequest) -> Result<Source, Failure> {
+    async fn run_prefetch(self: &Arc<Self>, key: &str, request: &CreateSessionRequest) -> Result<Source, Failure> {
         let source = self
             .resolve(request, request.media_key.clone(), request.title.clone(), "prefetch")
             .await?;
@@ -1008,6 +1078,56 @@ impl SessionManager {
         self.media_info(&source).await?;
         Ok(source)
     }
+}
+
+/// Which movie-time stretches are on disk, given the torrent's piece bitmap.
+/// `map` is `(seconds, file offset)` per keyframe; without one, bytes are
+/// spread evenly over the duration (what a browser would guess).
+fn available_from_pieces(
+    have: &[bool],
+    file_offset: u64,
+    piece_len: u64,
+    file_len: u64,
+    duration: f64,
+    map: Option<&ByteMap>,
+) -> Vec<(f64, f64)> {
+    if piece_len == 0 || file_len == 0 || duration <= 0.0 {
+        return Vec::new();
+    }
+    let present = |start: u64, end: u64| -> bool {
+        if end <= start {
+            return true;
+        }
+        let first = (file_offset + start) / piece_len;
+        let last = (file_offset + end - 1) / piece_len;
+        (first..=last).all(|piece| have.get(piece as usize).copied().unwrap_or(false))
+    };
+    const GRID: u64 = 400;
+    let grid: ByteMap;
+    let points: &[(f64, u64)] = match map {
+        Some(map) if map.len() >= 2 => map,
+        _ => {
+            grid = (0..GRID)
+                .map(|step| (duration * step as f64 / GRID as f64, file_len * step / GRID))
+                .collect();
+            &grid
+        }
+    };
+    let mut ranges: Vec<(f64, f64)> = Vec::new();
+    for (index, &(start_time, start_offset)) in points.iter().enumerate() {
+        let (end_time, end_offset) = points.get(index + 1).copied().unwrap_or((duration, file_len));
+        // Before the first keyframe: the header and whatever precedes it.
+        let (start_time, start_offset) = if index == 0 { (0.0, 0) } else { (start_time, start_offset) };
+        let (low, high) = (start_offset.min(end_offset), start_offset.max(end_offset));
+        if end_time <= start_time || !present(low, high.min(file_len)) {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(last) if (start_time - last.1).abs() < 0.001 => last.1 = end_time.min(duration),
+            _ => ranges.push((start_time, end_time.min(duration))),
+        }
+    }
+    ranges
 }
 
 /// With no explicit index, the file matching this episode's SxxEyy among
@@ -1186,11 +1306,35 @@ mod tests {
     }
 
     #[test]
+    fn download_bar_follows_the_file_index_not_a_constant_bitrate() {
+        // 4 pieces of 100 bytes; the first half of the movie is dense
+        // (bytes 0..300) and the second half sparse (300..400).
+        let map: ByteMap = vec![(0.0, 0), (25.0, 150), (50.0, 300), (75.0, 350)];
+        // Only the last piece is on disk: the final half of the movie.
+        let have = [false, false, false, true];
+        let ranges = available_from_pieces(&have, 0, 100, 400, 100.0, Some(&map));
+        assert_eq!(ranges, vec![(50.0, 100.0)]);
+        // A constant-bitrate guess would call that the last quarter.
+        let guessed = available_from_pieces(&have, 0, 100, 400, 100.0, None);
+        assert_eq!(guessed.first().map(|range| range.0), Some(75.0));
+    }
+
+    #[test]
+    fn a_file_inside_a_pack_uses_its_own_pieces() {
+        let map: ByteMap = vec![(0.0, 0), (50.0, 100)];
+        // The file starts at torrent offset 200: pieces 2 and 3.
+        let have = [false, false, true, false];
+        let ranges = available_from_pieces(&have, 200, 100, 200, 100.0, Some(&map));
+        assert_eq!(ranges, vec![(0.0, 50.0)]);
+    }
+
+    #[test]
     fn late_starting_sources_are_rebased() {
         let index = MkvIndex {
             duration_seconds: Some(100.0),
             video_codec_id: None,
             keyframes: vec![10.0, 16.0, 22.5, 30.0],
+            byte_map: vec![],
         };
         let (plan, origin) = plan_for(Some(&index), 110.0);
         assert_eq!(origin, 10.0);

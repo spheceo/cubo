@@ -29,6 +29,7 @@ const CUE_POINT: u32 = 0xBB;
 const CUE_TIME: u32 = 0xB3;
 const CUE_TRACK_POSITIONS: u32 = 0xB7;
 const CUE_TRACK: u32 = 0xF7;
+const CUE_CLUSTER_POSITION: u32 = 0xF1;
 const CLUSTER: u32 = 0x1F43_B675;
 
 /// First read: the EBML header, SeekHead, Info and Tracks almost always fit.
@@ -52,6 +53,9 @@ pub struct MkvIndex {
     /// Presentation times of the video keyframes listed in Cues, ascending.
     /// Empty when the file carries no usable index.
     pub keyframes: Vec<f64>,
+    /// `(seconds, absolute byte offset of the cluster)` per video cue,
+    /// ascending: maps downloaded bytes to movie time.
+    pub byte_map: Vec<(f64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,8 +278,12 @@ async fn read_element<S: ByteSource>(
     source.read_at(header.data_start, size).await.map(Some)
 }
 
-fn parse_cues(body: &[u8], video_track: Option<u64>, scale: f64) -> Result<Vec<f64>, String> {
+/// Keyframe times, plus `(time, segment-relative cluster position)` pairs.
+type Cues = (Vec<f64>, Vec<(f64, u64)>);
+
+fn parse_cues(body: &[u8], video_track: Option<u64>, scale: f64) -> Result<Cues, String> {
     let mut keyframes = Vec::new();
+    let mut positions = Vec::new();
     for child in children(body) {
         let (id, point) = child?;
         if id != CUE_POINT {
@@ -283,30 +291,45 @@ fn parse_cues(body: &[u8], video_track: Option<u64>, scale: f64) -> Result<Vec<f
         }
         let mut time = None;
         let mut matches_track = false;
+        let mut cluster = None;
         for field in children(point) {
             let (field_id, value) = field?;
             match field_id {
                 CUE_TIME => time = Some(read_uint(value)),
                 CUE_TRACK_POSITIONS => {
+                    let mut this_track = false;
+                    let mut this_cluster = None;
                     for position in children(value) {
                         let (position_id, position_value) = position?;
-                        if position_id == CUE_TRACK
-                            && video_track.is_none_or(|track| read_uint(position_value) == track)
-                        {
-                            matches_track = true;
+                        match position_id {
+                            CUE_TRACK => {
+                                this_track = video_track
+                                    .is_none_or(|track| read_uint(position_value) == track);
+                            }
+                            CUE_CLUSTER_POSITION => this_cluster = Some(read_uint(position_value)),
+                            _ => {}
                         }
+                    }
+                    if this_track {
+                        matches_track = true;
+                        cluster = cluster.or(this_cluster);
                     }
                 }
                 _ => {}
             }
         }
         if let (Some(time), true) = (time, matches_track) {
-            keyframes.push(time as f64 * scale);
+            let seconds = time as f64 * scale;
+            keyframes.push(seconds);
+            if let Some(cluster) = cluster {
+                positions.push((seconds, cluster));
+            }
         }
     }
     keyframes.sort_by(|a, b| a.total_cmp(b));
     keyframes.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-    Ok(keyframes)
+    positions.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok((keyframes, positions))
 }
 
 /// Reads the keyframe index. A file without Cues still returns duration and
@@ -397,10 +420,14 @@ pub async fn read_index<S: ByteSource>(source: &S) -> Result<MkvIndex, String> {
     }
 
     let scale = metadata.scale_seconds();
-    let keyframes = match cues_body {
+    let (keyframes, positions) = match cues_body {
         Some(body) => parse_cues(&body, metadata.video_track, scale)?,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
+    let byte_map = positions
+        .into_iter()
+        .map(|(seconds, relative)| (seconds, segment_start + relative))
+        .collect();
     Ok(MkvIndex {
         duration_seconds: metadata
             .duration_ticks
@@ -408,6 +435,7 @@ pub async fn read_index<S: ByteSource>(source: &S) -> Result<MkvIndex, String> {
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
         video_codec_id: metadata.video_codec_id,
         keyframes,
+        byte_map,
     })
 }
 

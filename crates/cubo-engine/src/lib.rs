@@ -7,6 +7,7 @@ pub mod engine;
 pub mod fmp4;
 pub mod logging;
 pub mod mkv_index;
+pub mod mp4_index;
 pub mod pairing;
 pub mod paths;
 pub mod remux_sink;

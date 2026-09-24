@@ -875,19 +875,29 @@ export async function waitForSession(
 }
 
 /** Tells Core where the viewer is. Drives how far ahead Core converts and
- *  keeps the session alive while paused. */
+ *  keeps the session alive while paused. Returns the stretches of the movie
+ *  already on disk (absolute seconds), or null from Cores that don't say. */
 export async function heartbeatSession(
   engine: LocalEngineConnection,
   id: string,
   positionSeconds: number,
   playing: boolean,
-): Promise<void> {
+): Promise<{ start: number; end: number }[] | null> {
   const response = await engineFetch(engine, `/v1/sessions/${encodeURIComponent(id)}/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ positionSeconds, playing }),
   });
   if (response.status === 404) throw new SessionGoneError('The playback session ended.');
+  if (response.status !== 200) return null;
+  const body = (await response.json().catch(() => null)) as { availableRanges?: unknown } | null;
+  if (!Array.isArray(body?.availableRanges)) return null;
+  return body.availableRanges
+    .filter(
+      (range): range is [number, number] =>
+        Array.isArray(range) && Number.isFinite(range[0]) && Number.isFinite(range[1]),
+    )
+    .map(([start, end]) => ({ start, end }));
 }
 
 export function closeSession(engine: LocalEngineConnection, id: string): void {

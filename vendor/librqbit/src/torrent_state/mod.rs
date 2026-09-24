@@ -276,6 +276,22 @@ impl ManagedTorrent {
         }
     }
 
+    /// Which pieces are on disk, one entry per piece. Errors while the
+    /// torrent is still initializing. (Cubo: drives the player's
+    /// "downloaded" bar.)
+    pub fn have_pieces(&self) -> anyhow::Result<Vec<bool>> {
+        self.with_chunk_tracker(|tracker| {
+            let total = tracker.get_lengths().total_pieces() as usize;
+            tracker
+                .get_have_pieces()
+                .as_slice()
+                .iter()
+                .by_vals()
+                .take(total)
+                .collect()
+        })
+    }
+
     pub(crate) fn with_chunk_tracker_mut<R>(
         &self,
         f: impl FnOnce(&mut ChunkTracker) -> R,

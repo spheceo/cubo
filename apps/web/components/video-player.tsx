@@ -60,7 +60,7 @@ const SKIP_SECONDS = 10;
 /** Seconds the Next episode fill takes to complete before auto-advancing. */
 const AUTO_NEXT_MS = 6_000;
 
-type BufferedRange = {
+export type BufferedRange = {
   start: number;
   end: number;
 };
@@ -112,6 +112,7 @@ export function VideoPlayer({
   onPlaying,
   onError,
   onStall,
+  downloadedRanges = null,
   flushRef,
   topRightControls,
   introWindow,
@@ -181,6 +182,10 @@ export function VideoPlayer({
   onPlaying?: () => void;
   /** A mid-playback buffering pause ended (not startup, seeks or pauses). */
   onStall?: (stall: { positionSeconds: number; durationMs: number }) => void;
+  /** Absolute stretches Core has on disk. When given, the bar draws these
+   *  instead of the browser's buffered ranges: for direct files the browser
+   *  only knows bytes and places them as if the bitrate were constant. */
+  downloadedRanges?: BufferedRange[] | null;
   /** Parent calls this before leaving so progress is snapshotted while the
    *  video element still has a real currentTime. */
   flushRef?: MutableRefObject<(() => void) | null>;
@@ -1499,9 +1504,10 @@ export function VideoPlayer({
         >
           <div ref={barRef} className="relative h-[5px] w-full rounded-full bg-white/15">
             {duration > 0
-              ? bufferedRanges.map((range, index) => {
-                  const start = Math.max(0, Math.min(1, (range.start + timeOffset) / duration));
-                  const end = Math.max(start, Math.min(1, (range.end + timeOffset) / duration));
+              ? (downloadedRanges ?? bufferedRanges).map((range, index) => {
+                  const shift = downloadedRanges ? 0 : timeOffset;
+                  const start = Math.max(0, Math.min(1, (range.start + shift) / duration));
+                  const end = Math.max(start, Math.min(1, (range.end + shift) / duration));
                   return (
                     <span
                       key={`${range.start}-${range.end}-${index}`}

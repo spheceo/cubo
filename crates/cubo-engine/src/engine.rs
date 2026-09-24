@@ -3050,7 +3050,14 @@ async fn session_heartbeat(
     match state.sessions.get(&id) {
         Some(session) => {
             session.heartbeat(body.position_seconds, body.playing);
-            StatusCode::NO_CONTENT.into_response()
+            // What is on disk, in movie time, for the player's download bar.
+            let ranges: Vec<[f64; 2]> = state
+                .sessions
+                .available_ranges(&session)
+                .into_iter()
+                .map(|(start, end)| [start, end])
+                .collect();
+            Json(serde_json::json!({ "availableRanges": ranges })).into_response()
         }
         None => bridge_error(StatusCode::NOT_FOUND, "playback session not found".into()),
     }

@@ -845,8 +845,24 @@ async fn reopening_a_downloaded_source_needs_no_swarm() {
         .json(reqwest::Method::DELETE, &format!("/v1/sessions/{first_id}"), None)
         .await;
 
-    let (_, reopened) = open_session(&client, json!({ "magnet": torrent.magnet, "hevc": false })).await;
+    let (ready, reopened) = open_session(&client, json!({ "magnet": torrent.magnet, "hevc": false })).await;
     assert!(reopened < Duration::from_secs(5), "reopen took {reopened:?}");
+
+    // The whole file is on disk, so the player's download bar is full.
+    let id = ready["id"].as_str().unwrap();
+    let (status, beat) = client
+        .json(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/heartbeat"),
+            Some(json!({ "positionSeconds": 1.0, "playing": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "heartbeat: {beat}");
+    let ranges = beat["availableRanges"].as_array().expect("availableRanges");
+    assert_eq!(ranges.len(), 1, "{beat}");
+    let duration = ready["durationSeconds"].as_f64().unwrap();
+    assert_eq!(ranges[0][0].as_f64(), Some(0.0));
+    assert!((ranges[0][1].as_f64().unwrap() - duration).abs() < 0.01, "{beat}");
 
     // A fresh Core over the same data dir (rqbit forgets torrents on
     // restart) starts from the saved metadata and the file on disk.

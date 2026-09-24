@@ -31,7 +31,7 @@ import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
 import { resetWindowScroll } from './scroll-to-top';
 import { watchOrigin } from './watch-origin';
-import { VideoPlayer, type PlayerSubtitle } from './video-player';
+import { VideoPlayer, type BufferedRange, type PlayerSubtitle } from './video-player';
 import {
   addMagnet,
   closeSession,
@@ -186,6 +186,8 @@ export function WatchScreen({
    *  fallback switch clears the previous file's timings. */
   const [skipSegments, setSkipSegments] = useState<SkipSegments | null>(null);
   const [resumeAt, setResumeAt] = useState(0);
+  /** What Core has on disk for the current session, for the download bar. */
+  const [downloadedRanges, setDownloadedRanges] = useState<BufferedRange[] | null>(null);
   const [episodesOpen, setEpisodesOpen] = useState(false);
   const cacheClearingRef = useRef(false);
   /** The Core playback session currently attached to the player. */
@@ -357,6 +359,7 @@ export function WatchScreen({
     setError(null);
     setNeedsCore(false);
     setVideoUrl(null);
+    setDownloadedRanges(null);
     setVideoVod(false);
     setVideoDurationHint(null);
     setVideoTimeOffset(0);
@@ -1010,9 +1013,11 @@ export function WatchScreen({
     const beat = () => {
       const session = sessionRef.current;
       if (!session) return;
-      void heartbeatSession(session.connection, session.id, lastPositionRef.current, true).catch(
-        () => undefined,
-      );
+      void heartbeatSession(session.connection, session.id, lastPositionRef.current, true)
+        .then((ranges) => {
+          if (sessionRef.current?.id === session.id) setDownloadedRanges(ranges);
+        })
+        .catch(() => undefined);
     };
     beat();
     const interval = window.setInterval(beat, HEARTBEAT_MS);
@@ -1515,6 +1520,7 @@ export function WatchScreen({
           initialTime={videoIsHls && !videoVod ? 0 : resumeAt}
           startTimeLocal={videoIsHls && !videoVod ? videoStartLocal : null}
           onPlaybackProgress={savePlaybackProgress}
+          downloadedRanges={videoVod ? downloadedRanges : null}
           onPlaying={() => {
             if (activeSourceRef.current) rememberSource(itemKey, activeSourceRef.current);
             reportFirstFrame();
