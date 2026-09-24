@@ -907,3 +907,73 @@ async fn prefetched_source_starts_without_probing() {
     assert!(probe_ms < 50, "session re-probed a prefetched source: {timeline}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Some releases stop the picture before the container's duration while the
+/// audio runs on. The playlist must end with the picture: a playlist longer
+/// than it lists time no segment can fill, and a seek there loads forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn playlist_ends_where_the_picture_ends() {
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("skipping: needs ffmpeg on PATH");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("cubo-short-video-{}", uuid::Uuid::new_v4()));
+    let seed_root = root.join("seed");
+    std::fs::create_dir_all(&seed_root).unwrap();
+    let movie = seed_root.join("Movie.2026.mkv");
+    let status = std::process::Command::new(ffmpeg)
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=20"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=60"])
+        .args(["-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48"])
+        .args(["-c:a", "ac3"])
+        .arg(&movie)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let seeder = loopback_seeder(&seed_root).await;
+    let torrent = seed(&seeder, &movie, "Movie.2026.mkv", 100_000).await;
+    let peer = seeder.listen_addr().unwrap();
+    let core = spawn_test_core(&root.join("core"), 4 * 1024 * 1024 * 1024).await;
+    let client = Client::new(&core);
+    let (ready, _) = open_session(
+        &client,
+        json!({ "magnet": torrent.magnet, "peers": [peer], "hevc": false, "resumeSeconds": 55.0 }),
+    )
+    .await;
+    let duration = ready["durationSeconds"].as_f64().unwrap();
+    assert!((duration - 20.0).abs() < 0.5, "playlist should end with the picture: {ready}");
+
+    // The final listed segment really holds picture up to that end.
+    let id = ready["id"].as_str().unwrap();
+    let playlist = client
+        .http
+        .get(client.media_url(id, "hls/media.m3u8"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let last = playlist
+        .lines()
+        .filter(|line| line.contains(".m4s"))
+        .last()
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap()
+        .to_string();
+    let fetch = |file: String| {
+        let url = client.media_url(id, &format!("hls/{file}"));
+        let http = client.http.clone();
+        async move { http.get(url).send().await.unwrap().bytes().await.unwrap() }
+    };
+    let init = fetch("init.mp4".into()).await;
+    let segment = fetch(last).await;
+    let times = fragment_times(&init, &segment, OUTPUT_TS_OFFSET);
+    let end = times.iter().map(|(_, end)| *end).fold(0.0f64, f64::max);
+    assert!((end - duration).abs() < 0.5, "last segment ends at {end}, playlist at {duration}");
+    let _ = std::fs::remove_dir_all(&root);
+}

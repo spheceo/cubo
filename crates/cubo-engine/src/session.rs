@@ -686,10 +686,27 @@ impl SessionManager {
         session.update(|inner| inner.timeline.probed_ms = Some(probed));
 
         let mode = choose_mode(&probe, &source.file_name, request.hevc)?;
-        let duration = index
+        let container_duration = index
             .as_ref()
             .and_then(|index| index.duration_seconds)
             .or(probe.duration_seconds);
+        // The playlist ends with the picture. A release whose audio runs on
+        // past the last frame would otherwise list minutes that no segment
+        // can fill, and a seek there waits forever.
+        let video_end = index.as_ref().and_then(|index| index.video_end);
+        let duration = match (container_duration, video_end) {
+            (Some(container), Some(end)) if end > 0.0 && end < container - 1.0 => {
+                tracing::info!(
+                    target: "session",
+                    session = %session.id,
+                    container_seconds = container,
+                    video_end_seconds = end,
+                    "picture ends before the container; trimming the playlist"
+                );
+                Some(end)
+            }
+            (container, _) => container,
+        };
         let remuxer = match mode {
             Mode::Direct => None,
             Mode::Hls => {
@@ -1335,6 +1352,7 @@ mod tests {
             video_codec_id: None,
             keyframes: vec![10.0, 16.0, 22.5, 30.0],
             byte_map: vec![],
+            video_end: None,
         };
         let (plan, origin) = plan_for(Some(&index), 110.0);
         assert_eq!(origin, 10.0);

@@ -74,7 +74,7 @@ import {
 import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playback';
 import { historyForEpisode, playbackKey } from '@/lib/library';
 import { resolveNextEpisode } from '@/lib/next-episode';
-import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
+import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, RESUME_END_EPSILON, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
 import { isAutomaticSource, streamKey } from '@/lib/stream-select';
 import { ProgressWriter } from '@/lib/progress-writer';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
@@ -751,7 +751,12 @@ export function WatchScreen({
           racers.delete(racer);
           racer.done = true;
           finish(true);
-          attachSession(connection, stream, racer.index, list.length, auto, startAt, ready, abort, stale);
+          // Core may know the title is shorter than the saved progress
+          // assumed (the picture ends before the container says). A resume
+          // point past the real end means the title was finished.
+          const end = ready.durationSeconds ?? 0;
+          const resumeAt = end > 0 && startAt >= end - RESUME_END_EPSILON ? 0 : startAt;
+          attachSession(connection, stream, racer.index, list.length, auto, resumeAt, ready, abort, stale);
         } catch (reason) {
           if (racer.done || settled) return;
           if (stale() || abort.signal.aborted) {

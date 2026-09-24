@@ -31,6 +31,14 @@ const CUE_TRACK_POSITIONS: u32 = 0xB7;
 const CUE_TRACK: u32 = 0xF7;
 const CUE_CLUSTER_POSITION: u32 = 0xF1;
 const CLUSTER: u32 = 0x1F43_B675;
+const CLUSTER_TIMESTAMP: u32 = 0xE7;
+const SIMPLE_BLOCK: u32 = 0xA3;
+const BLOCK_GROUP: u32 = 0xA0;
+const BLOCK: u32 = 0xA1;
+const DEFAULT_DURATION: u32 = 0x23_E383;
+/// The clusters after the last cue are read to find where the picture
+/// really ends. Cues come every few seconds, so this is normally a few MB.
+const MAX_TAIL_SCAN: u64 = 24 * 1024 * 1024;
 
 /// First read: the EBML header, SeekHead, Info and Tracks almost always fit.
 const HEAD_READ: u64 = 256 * 1024;
@@ -56,6 +64,11 @@ pub struct MkvIndex {
     /// `(seconds, absolute byte offset of the cluster)` per video cue,
     /// ascending: maps downloaded bytes to movie time.
     pub byte_map: Vec<(f64, u64)>,
+    /// When the video track's last frame ends. Some releases stop the
+    /// picture minutes before the container's duration (the audio runs on);
+    /// a playlist longer than the picture leaves the player waiting forever
+    /// at the end.
+    pub video_end: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,6 +192,7 @@ struct Metadata {
     duration_ticks: Option<f64>,
     video_track: Option<u64>,
     video_codec_id: Option<String>,
+    video_frame_ns: Option<u64>,
     cues_position: Option<u64>,
     extra_seek_heads: Vec<u64>,
 }
@@ -230,12 +244,14 @@ impl Metadata {
             let mut number = None;
             let mut kind = None;
             let mut codec = None;
+            let mut frame_ns = None;
             for field in children(entry) {
                 let (field_id, value) = field?;
                 match field_id {
                     TRACK_NUMBER => number = Some(read_uint(value)),
                     TRACK_TYPE => kind = Some(read_uint(value)),
                     CODEC_ID => codec = Some(String::from_utf8_lossy(value).trim_end_matches('\0').to_owned()),
+                    DEFAULT_DURATION => frame_ns = Some(read_uint(value)),
                     _ => {}
                 }
             }
@@ -243,6 +259,7 @@ impl Metadata {
             if kind == Some(1) && self.video_track.is_none() {
                 self.video_track = number;
                 self.video_codec_id = codec;
+                self.video_frame_ns = frame_ns;
             }
         }
         Ok(())
@@ -330,6 +347,55 @@ fn parse_cues(body: &[u8], video_track: Option<u64>, scale: f64) -> Result<Cues,
     keyframes.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
     positions.sort_by(|a, b| a.0.total_cmp(&b.0));
     Ok((keyframes, positions))
+}
+
+/// Track number and signed relative timestamp at the start of a
+/// (Simple)Block body.
+fn block_header(body: &[u8]) -> Option<(u64, i16)> {
+    let (track, used) = read_size(body).ok()??;
+    let time = body.get(used..used + 2)?;
+    Some((track?, i16::from_be_bytes([time[0], time[1]])))
+}
+
+/// Latest video block timestamp (in ticks) in a run of top-level elements
+/// that starts at a Cluster.
+fn last_video_tick(bytes: &[u8], video_track: u64) -> Option<i64> {
+    let mut latest: Option<i64> = None;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let Ok(Some((header, used))) = parse_header(&bytes[at..], 0) else { break };
+        let size = header.size? as usize;
+        let body_start = at + used;
+        let Some(body) = bytes.get(body_start..body_start + size) else { break };
+        if header.id == CLUSTER {
+            let mut cluster_time: Option<i64> = None;
+            for child in children(body) {
+                let Ok((id, value)) = child else { break };
+                let block = match id {
+                    CLUSTER_TIMESTAMP => {
+                        cluster_time = Some(read_uint(value) as i64);
+                        None
+                    }
+                    SIMPLE_BLOCK => Some(value),
+                    BLOCK_GROUP => children(value)
+                        .filter_map(Result::ok)
+                        .find(|(inner, _)| *inner == BLOCK)
+                        .map(|(_, block)| block),
+                    _ => None,
+                };
+                if let (Some(block), Some(base)) = (block, cluster_time) {
+                    if let Some((track, relative)) = block_header(block) {
+                        if track == video_track {
+                            let tick = base + relative as i64;
+                            latest = Some(latest.map_or(tick, |current| current.max(tick)));
+                        }
+                    }
+                }
+            }
+        }
+        at = body_start + size;
+    }
+    latest
 }
 
 /// Reads the keyframe index. A file without Cues still returns duration and
@@ -424,10 +490,24 @@ pub async fn read_index<S: ByteSource>(source: &S) -> Result<MkvIndex, String> {
         Some(body) => parse_cues(&body, metadata.video_track, scale)?,
         None => (Vec::new(), Vec::new()),
     };
-    let byte_map = positions
+    let byte_map: Vec<(f64, u64)> = positions
         .into_iter()
         .map(|(seconds, relative)| (seconds, segment_start + relative))
         .collect();
+
+    // Where the picture really ends: walk the clusters after the last cue.
+    let mut video_end = None;
+    if let (Some(&(_, last_cluster)), Some(track)) = (byte_map.last(), metadata.video_track) {
+        let span = segment_end.saturating_sub(last_cluster);
+        if span > 0 && span <= MAX_TAIL_SCAN {
+            if let Ok(tail) = source.read_at(last_cluster, span).await {
+                if let Some(tick) = last_video_tick(&tail, track) {
+                    let frame = metadata.video_frame_ns.map_or(0.0, |ns| ns as f64 / 1e9);
+                    video_end = Some(tick as f64 * scale + frame);
+                }
+            }
+        }
+    }
     Ok(MkvIndex {
         duration_seconds: metadata
             .duration_ticks
@@ -436,6 +516,7 @@ pub async fn read_index<S: ByteSource>(source: &S) -> Result<MkvIndex, String> {
         video_codec_id: metadata.video_codec_id,
         keyframes,
         byte_map,
+        video_end,
     })
 }
 
@@ -533,10 +614,85 @@ mod tests {
         assert_eq!(index.keyframes, vec![0.0, 4.17, 8.342]);
     }
 
+    /// Picture stops at 4.04 s while the container claims 120.5 s (the
+    /// audio track runs on): the index reports where the picture ends.
+    #[tokio::test]
+    async fn finds_where_the_picture_ends() {
+        let info = element(
+            INFO,
+            &[uint(TIMESTAMP_SCALE, 1_000_000), element(DURATION, &120_500.0f64.to_be_bytes())].concat(),
+        );
+        let tracks = element(
+            TRACKS,
+            &[
+                element(TRACK_ENTRY, &[uint(TRACK_NUMBER, 1), uint(TRACK_TYPE, 2)].concat()),
+                element(
+                    TRACK_ENTRY,
+                    &[uint(TRACK_NUMBER, 2), uint(TRACK_TYPE, 1), uint(DEFAULT_DURATION, 40_000_000)].concat(),
+                ),
+            ]
+            .concat(),
+        );
+        // SimpleBlock: track vint, i16 relative time, flags, payload.
+        let block = |track: u8, relative: i16| {
+            let time = relative.to_be_bytes();
+            element(SIMPLE_BLOCK, &[0x80 | track, time[0], time[1], 0x80, 0, 0])
+        };
+        let cluster = element(
+            CLUSTER,
+            &[uint(CLUSTER_TIMESTAMP, 3_000), block(2, 0), block(2, 1_000), block(1, 30_000)].concat(),
+        );
+        let cues_for = |cluster_relative: u64| {
+            let positions = [uint(CUE_TRACK, 2), uint(CUE_CLUSTER_POSITION, cluster_relative)].concat();
+            element(
+                CUES,
+                &element(CUE_POINT, &[uint(CUE_TIME, 3_000), element(CUE_TRACK_POSITIONS, &positions)].concat()),
+            )
+        };
+        // Cues sit before the cluster; their length does not depend on the
+        // position value (fixed-width integers).
+        let cues_len = cues_for(0).len();
+        let cues = cues_for((info.len() + tracks.len() + cues_len) as u64);
+        let body = [info, tracks, cues, cluster].concat();
+        let bytes = [element(EBML_HEADER, &uint(0x4282, 0)), element(SEGMENT, &body)].concat();
+        let index = read_index(&SliceSource(&bytes)).await.unwrap();
+        assert_eq!(index.duration_seconds, Some(120.5));
+        let end = index.video_end.expect("video end");
+        assert!((end - 4.04).abs() < 1e-9, "{end}");
+    }
+
     #[tokio::test]
     async fn rejects_non_matroska() {
         let bytes = vec![0u8; 64];
         assert!(read_index(&SliceSource(&bytes)).await.is_err());
+    }
+
+    struct FileSource(std::path::PathBuf, u64);
+
+    impl ByteSource for FileSource {
+        fn len(&self) -> u64 {
+            self.1
+        }
+
+        async fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&self.0).map_err(|error| error.to_string())?;
+            file.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+            let mut out = vec![0; length as usize];
+            file.read_exact(&mut out).map_err(|error| error.to_string())?;
+            Ok(out)
+        }
+    }
+
+    /// Reports duration vs. where the picture ends for a real file:
+    /// `CUBO_MKV_TAIL=/path/file.mkv cargo test -p cubo-engine mkv_tail -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs CUBO_MKV_TAIL"]
+    async fn mkv_tail_video_end() {
+        let path = std::path::PathBuf::from(std::env::var("CUBO_MKV_TAIL").expect("CUBO_MKV_TAIL"));
+        let len = std::fs::metadata(&path).unwrap().len();
+        let index = read_index(&FileSource(path, len)).await.unwrap();
+        eprintln!("duration={:?} video_end={:?} cues={}", index.duration_seconds, index.video_end, index.keyframes.len());
     }
 
     /// Checks the parser against an ffmpeg-written file when one is supplied:
