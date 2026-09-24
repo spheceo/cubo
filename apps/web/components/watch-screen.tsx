@@ -15,7 +15,7 @@ import {
 } from '@cubo/core';
 import { IoIosArrowBack } from 'react-icons/io';
 import { IoClose, IoList } from 'react-icons/io5';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router';
@@ -116,6 +116,7 @@ function sessionStage(status: PlaybackSessionStatus): number {
 }
 
 export function WatchScreen({
+  fullscreenTargetRef,
   mediaType,
   mediaId,
   imdbId,
@@ -130,6 +131,7 @@ export function WatchScreen({
   episode,
   seasons,
 }: {
+  fullscreenTargetRef: RefObject<HTMLDivElement | null>;
   mediaType: MediaType;
   mediaId: number;
   imdbId: string | null;
@@ -1214,6 +1216,7 @@ export function WatchScreen({
       {videoUrl && status === 'ready' ? (
         <div className="relative min-h-0 flex-1">
           <VideoPlayer
+          fullscreenTargetRef={fullscreenTargetRef}
           topRightControls={mediaType === 'tv' && season != null && episode != null && seasons?.length ? (
             <PlayerEpisodes
               showId={mediaId}

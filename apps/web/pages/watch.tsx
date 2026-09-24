@@ -1,5 +1,6 @@
 import type { MediaType } from '@cubo/core';
 import { useQuery } from '@tanstack/react-query';
+import { useRef } from 'react';
 import { useParams, useSearchParams } from 'react-router';
 import { WatchScreen } from '@/components/watch-screen';
 import { tmdbQueries } from '@/lib/queries';
@@ -11,6 +12,7 @@ function parseMediaType(value: string | undefined): MediaType | null {
 }
 
 export function WatchPage() {
+  const fullscreenTargetRef = useRef<HTMLDivElement>(null);
   const params = useParams();
   const [searchParams] = useSearchParams();
   const mediaType = parseMediaType(params.mediaType);
@@ -51,21 +53,24 @@ export function WatchPage() {
       : null;
 
   return (
-    <WatchScreen
-      key={`${mediaType}:${id}:${resolvedSeason ?? '-'}:${resolvedEpisode ?? '-'}`}
-      mediaType={mediaType}
-      mediaId={id}
-      imdbId={details.data.imdbId}
-      title={details.data.title}
-      subtitle={subtitle}
-      backHref={`/${mediaType}/${id}`}
-      backdropPath={details.data.backdropPath}
-      posterPath={details.data.posterPath}
-      logoPath={details.data.logoPath}
-      originalLanguage={details.data.originalLanguage}
-      season={resolvedSeason}
-      episode={resolvedEpisode}
-      seasons={details.data.seasons}
-    />
+    <div ref={fullscreenTargetRef} className="fixed inset-0 bg-black">
+      <WatchScreen
+        key={`${mediaType}:${id}:${resolvedSeason ?? '-'}:${resolvedEpisode ?? '-'}`}
+        fullscreenTargetRef={fullscreenTargetRef}
+        mediaType={mediaType}
+        mediaId={id}
+        imdbId={details.data.imdbId}
+        title={details.data.title}
+        subtitle={subtitle}
+        backHref={`/${mediaType}/${id}`}
+        backdropPath={details.data.backdropPath}
+        posterPath={details.data.posterPath}
+        logoPath={details.data.logoPath}
+        originalLanguage={details.data.originalLanguage}
+        season={resolvedSeason}
+        episode={resolvedEpisode}
+        seasons={details.data.seasons}
+      />
+    </div>
   );
 }

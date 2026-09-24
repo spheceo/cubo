@@ -19,7 +19,7 @@ import {
   MdPictureInPictureAlt,
 } from 'react-icons/md';
 import { IoIosArrowBack } from 'react-icons/io';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type MutableRefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type MutableRefObject, type RefObject } from 'react';
 import type { CaptionColor, CaptionSize } from '@/lib/caption-prefs';
 import { CAPTION_COLORS } from '@/lib/caption-prefs';
 import {
@@ -73,6 +73,7 @@ export type PlayerSubtitle = {
 };
 
 export function VideoPlayer({
+  fullscreenTargetRef,
   src,
   hls = false,
   durationHint = null,
@@ -104,6 +105,7 @@ export function VideoPlayer({
   onCreditsReached,
   sections,
 }: {
+  fullscreenTargetRef: RefObject<HTMLDivElement | null>;
   topRightControls?: ReactNode;
   /** Detected intro window in absolute source seconds. A Skip intro button
    *  shows while the playhead is inside it; `end` null means unbounded. */
@@ -245,7 +247,7 @@ export function VideoPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreen, setFullscreen] = useState(() => Boolean(document.fullscreenElement));
   const [controlsVisible, setControlsVisible] = useState(true);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
@@ -956,8 +958,8 @@ export function VideoPlayer({
 
   const toggleFullscreen = useCallback(() => {
     if (document.fullscreenElement) void document.exitFullscreen();
-    else void containerRef.current?.requestFullscreen().catch(() => undefined);
-  }, []);
+    else void fullscreenTargetRef.current?.requestFullscreen().catch(() => undefined);
+  }, [fullscreenTargetRef]);
 
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
