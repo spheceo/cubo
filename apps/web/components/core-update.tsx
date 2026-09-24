@@ -233,7 +233,7 @@ function UpdateActionButton({
       title={status.error ?? (status.latest ? `Update to ${displayTag(status.latest)}` : undefined)}
       aria-label={status.latest ? `Update to ${displayTag(status.latest)}` : 'Update'}
       aria-busy={live}
-      className="relative isolate h-10 min-w-[11.5rem] shrink-0 overflow-hidden rounded-full bg-fg px-5 text-sm font-semibold text-ink transition-opacity hover:opacity-90 disabled:cursor-wait"
+      className="relative isolate h-10 min-w-[11.5rem] shrink-0 cursor-pointer overflow-hidden rounded-full bg-fg px-5 text-sm font-semibold text-ink transition-opacity hover:opacity-90 disabled:cursor-wait"
     >
       {live ? (
         <span
