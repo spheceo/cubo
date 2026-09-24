@@ -226,3 +226,43 @@ test('a foreign pack that carries the original track stays eligible, below clean
   ).filter((stream) => isAutomaticSource(stream, 'en'));
   assert.deepEqual(ranked.map((stream) => stream.infoHash), ['english', 'lostfilm']);
 });
+
+test('3D side-by-side releases never win the auto-pick', () => {
+  const sbs: Stream = {
+    name: 'Torrentio\n1080p 3D SBS',
+    title:
+      'Severance.S01.1080p.3D.FULL-SBS.HEVC.SBS-SUB.ENG.iFA-AI3D\nSeverance.S01E01.Good.News.About.Hell.1080p.3D.FULL-SBS.HEVC.SBS-SUB.ENG.iFA-AI3D.mkv\n👤 5 💾 3.3 GB ⚙️ 1337x',
+    infoHash: 'sbs',
+    fileIdx: 2,
+    filename: 'Severance.S01E01.Good.News.About.Hell.1080p.3D.FULL-SBS.HEVC.SBS-SUB.ENG.iFA-AI3D.mkv',
+    quality: '1080p',
+    seeders: 5,
+    sizeBytes: 3543348019,
+    trackers: [],
+  };
+  const halfOu: Stream = {
+    ...sbs,
+    infoHash: 'hou',
+    name: 'Torrentio\n1080p',
+    title: 'Severance S01E01 1080p H-OU x264\n👤 30 💾 3 GB',
+    filename: 'Severance.S01E01.1080p.H-OU.mkv',
+  };
+  const flat: Stream = {
+    ...sbs,
+    infoHash: 'flat',
+    name: 'Torrentio\n1080p',
+    title: 'Severance S01E01 Good News About Hell 1080p BluRay 10Bit DDP5 1 H265-d3g\n👤 106 💾 2.43 GB ⚙️ ThePirateBay',
+    filename: 'Severance S01E01 Good News About Hell 1080p BluRay 10Bit DDP5 1 H265-d3g.mkv',
+    seeders: 106,
+    sizeBytes: 2609192632,
+  };
+
+  assert.equal(isAutomaticSource(sbs, 'en'), false);
+  assert.equal(isAutomaticSource(halfOu, 'en'), false);
+  assert.equal(isAutomaticSource(flat, 'en'), true);
+  const ranked = rankStreams([sbs, halfOu, flat], { transcode: true, hevc: true }, 'en', {
+    season: 1,
+    episode: 1,
+  });
+  assert.equal(ranked[0].infoHash, 'flat');
+});

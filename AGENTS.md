@@ -147,7 +147,8 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   sources are forgotten and excluded from further automatic attempts in the
   same session; an explicit retry resets that exclusion.
 - Automatic playback and previews exclude positively identified foreign dubs,
-  burned-in subtitles, and cinema captures. Unknown language is still eligible:
+  burned-in subtitles, cinema captures, and stereoscopic 3D (SBS/OU) encodes,
+  which rank last. Unknown language is still eligible:
   release metadata is heuristic and does not prove the audio track's language.
   Keep direct-play precedence within the established quality tiers.
 - Preview startup uses already-buffered footage where a full clip fits, otherwise

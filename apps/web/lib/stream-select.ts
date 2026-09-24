@@ -73,6 +73,13 @@ const ORIGINAL_TRACK_RE = /\b(?:original|orig)\b|оригинал/i;
 const CAPTURED_RELEASE_RE =
   /\b(?:cam(?:rip)?|telesync|telecine|ts|hdts|hdto|tc|screener|scr|dvdscr|bdscr|workprint)\b/i;
 
+/** Stereoscopic 3D encodes (3D, SBS/HSBS/Full-SBS, OU/HOU/TAB, MVC). Both
+ *  eyes are packed into one frame, so a flat screen shows the picture split
+ *  in two. Torrentio still labels them "1080p"; they rank last and are
+ *  never an automatic pick. */
+const STEREO_3D_RE =
+  /\b(?:3d|(?:half|full|h)?[ ._-]?sbs|(?:half|full|h)[ ._-]?ou|(?:half|full|h)?[ ._-]?tab|mvc)\b/i;
+
 /** Torrentio marks stream languages with country-flag emoji — a far stronger
  *  dub signal than release-name tokens, since English-original releases
  *  almost never say "English" while dubs often carry only a flag. */
@@ -115,6 +122,13 @@ function rank(stream: Stream): number {
 function capturedReleaseRank(stream: Stream): number {
   const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
   return CAPTURED_RELEASE_RE.test(hint) ? 1 : 0;
+}
+
+/** 0 = flat picture, 1 = stereoscopic 3D. Sorted ahead of audio language:
+ *  a split frame is unwatchable whatever the soundtrack. */
+function stereo3dRank(stream: Stream): number {
+  const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
+  return STEREO_3D_RE.test(hint) ? 1 : 0;
 }
 
 /** Buckets seeders so "plenty" sources compete on bitrate instead of raw swarm size. */
@@ -285,6 +299,8 @@ export function rankStreams(
   return streams
     .filter((stream) => isPlayableStream(stream, capabilities.transcode, capabilities.hevc))
     .sort((a, b) => {
+      const by3d = stereo3dRank(a) - stereo3dRank(b);
+      if (by3d !== 0) return by3d;
       const byLanguage =
         audioLanguageRank(a, nativeLanguage) - audioLanguageRank(b, nativeLanguage);
       if (byLanguage !== 0) return byLanguage;
@@ -352,10 +368,11 @@ export function streamKey(stream: Stream): string {
 }
 
 /** Automatic fallback must not silently change the title's audio language
- * or replace a proper release with a cinema capture. Unknown audio remains
+ * or replace a proper release with a cinema capture or 3D encode. Unknown audio remains
  * eligible: most original-language releases do not label their language. */
 export function isAutomaticSource(stream: Stream, nativeLanguage: string | null): boolean {
   return !isOversizedStream(stream)
     && capturedReleaseRank(stream) === 0
+    && stereo3dRank(stream) === 0
     && audioLanguageRank(stream, nativeLanguage) < 3;
 }
