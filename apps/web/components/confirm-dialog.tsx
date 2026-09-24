@@ -1,7 +1,12 @@
 import { useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 
 /** App-styled replacement for window.confirm: dark panel, backdrop blur,
- *  Escape/backdrop cancel, and focus starts on the safe action. */
+ *  Escape/backdrop cancel, and focus starts on the safe action.
+ *
+ *  Rendered into document.body: callers sit inside animated rows whose
+ *  transforms turn `position: fixed` into "fixed to the row", which let
+ *  later rows paint over the dialog and scrolled it with the page. */
 export function ConfirmDialog({
   title,
   description,
@@ -29,7 +34,17 @@ export function ConfirmDialog({
     return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [onCancel]);
 
-  return (
+  // The page behind a modal stays put.
+  useEffect(() => {
+    const root = document.documentElement;
+    const previous = root.style.overflow;
+    root.style.overflow = 'hidden';
+    return () => {
+      root.style.overflow = previous;
+    };
+  }, []);
+
+  return createPortal(
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 px-6 backdrop-blur-sm"
       onClick={onCancel}
@@ -62,6 +77,7 @@ export function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -1559,9 +1559,11 @@ export function VideoPlayer({
                     );
                   })
               : null}
+            {/* Clipped rather than scaled: scaleX squashes the rounded
+                end flat, a rounded inset keeps it a full pill. */}
             <div
-              className="absolute inset-y-0 left-0 w-full origin-left rounded-full bg-accent will-change-transform"
-              style={{ transform: `scaleX(${playedRatio})` }}
+              className="absolute inset-0 rounded-full bg-accent will-change-[clip-path]"
+              style={{ clipPath: `inset(0 ${(1 - playedRatio) * 100}% 0 0 round 9999px)` }}
             />
             {/* Hover highlight — repaints the hovered section above the
                 played fill so its color reads even in watched territory.

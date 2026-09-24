@@ -119,6 +119,26 @@ pub struct Timeline {
     pub probed_ms: Option<u64>,
     pub ready_ms: Option<u64>,
     pub first_media_ms: Option<u64>,
+    /// When the swarm first gave us a connected peer / the first new bytes
+    /// (none when the file needed nothing from the network).
+    pub first_peer_ms: Option<u64>,
+    pub first_bytes_ms: Option<u64>,
+    /// ffprobe and the MKV index read, each on its own (they run side by
+    /// side), or `media_cached` when a prefetch already had both.
+    pub probe_ms: Option<u64>,
+    pub index_ms: Option<u64>,
+    pub media_cached: Option<bool>,
+    /// Swarm state when the session became ready.
+    pub peers_at_ready: Option<u32>,
+    pub downloaded_bytes_at_ready: Option<u64>,
+}
+
+/// How the probe step went, for the startup timeline.
+#[derive(Debug, Clone, Copy, Default)]
+struct MediaTimings {
+    probe_ms: u64,
+    index_ms: Option<u64>,
+    cached: bool,
 }
 
 struct Inner {
@@ -274,6 +294,13 @@ impl PlaybackSession {
                 probed_ms = timeline.probed_ms.unwrap_or(0),
                 ready_ms = timeline.ready_ms.unwrap_or(0),
                 first_media_ms = elapsed,
+                first_peer_ms = ?timeline.first_peer_ms,
+                first_bytes_ms = ?timeline.first_bytes_ms,
+                probe_ms = ?timeline.probe_ms,
+                index_ms = ?timeline.index_ms,
+                media_cached = ?timeline.media_cached,
+                peers_at_ready = ?timeline.peers_at_ready,
+                downloaded_bytes_at_ready = ?timeline.downloaded_bytes_at_ready,
                 "session startup timeline"
             );
         }
@@ -676,8 +703,48 @@ impl SessionManager {
         let initialized = session.elapsed_ms();
         session.update(|inner| inner.timeline.initialized_ms = Some(initialized));
 
+        // Swarm milestones, sampled until the session is ready: separates
+        // "waiting for peers" from "waiting for bytes" in the timeline.
+        let watcher = {
+            let session = session.clone();
+            let handle = source.handle.clone();
+            let start_bytes = handle.stats().progress_bytes;
+            tokio::spawn(async move {
+                loop {
+                    let stats = handle.stats();
+                    let peers = stats.live.as_ref().map(|live| live.snapshot.peer_stats.live).unwrap_or(0);
+                    let elapsed = session.elapsed_ms();
+                    let done = session.update(|inner| {
+                        if peers > 0 && inner.timeline.first_peer_ms.is_none() {
+                            inner.timeline.first_peer_ms = Some(elapsed);
+                        }
+                        if stats.progress_bytes > start_bytes && inner.timeline.first_bytes_ms.is_none() {
+                            inner.timeline.first_bytes_ms = Some(elapsed);
+                        }
+                        inner.timeline.ready_ms.is_some()
+                            || matches!(inner.phase, Phase::Failed | Phase::Closed)
+                    });
+                    if done {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+        };
         let url = self.stream_url(source.torrent_id, source.file_index);
-        let (probe, index) = self.media_info(&source).await?;
+        let media = self.media_info(&source).await;
+        let (probe, index, timings) = match media {
+            Ok(media) => media,
+            Err(failure) => {
+                watcher.abort();
+                return Err(failure);
+            }
+        };
+        session.update(|inner| {
+            inner.timeline.probe_ms = Some(timings.probe_ms);
+            inner.timeline.index_ms = timings.index_ms;
+            inner.timeline.media_cached = Some(timings.cached);
+        });
         // The skip-segments endpoint reads chapters from this cache entry.
         self.transcode
             .remember_probe(&format!("{}:{}", source.torrent_id, source.file_index), probe.clone())
@@ -745,7 +812,11 @@ impl SessionManager {
         };
 
         let ready = session.elapsed_ms();
+        let stats = source.handle.stats();
+        let peers_at_ready = stats.live.as_ref().map(|live| live.snapshot.peer_stats.live).unwrap_or(0);
         let closed = session.update(|inner| {
+            inner.timeline.peers_at_ready = Some(peers_at_ready);
+            inner.timeline.downloaded_bytes_at_ready = Some(stats.progress_bytes);
             if matches!(inner.phase, Phase::Closed) {
                 return true;
             }
@@ -777,7 +848,10 @@ impl SessionManager {
 
     /// Probe and keyframe index for a source file, from the cache when a
     /// prefetch (or an earlier session) already read them.
-    async fn media_info(self: &Arc<Self>, source: &Source) -> Result<(MediaProbe, Option<MkvIndex>), Failure> {
+    async fn media_info(
+        self: &Arc<Self>,
+        source: &Source,
+    ) -> Result<(MediaProbe, Option<MkvIndex>, MediaTimings), Failure> {
         let key = format!("{}:{}", source.info_hash, source.file_index);
         let lock = self
             .media_locks
@@ -786,9 +860,16 @@ impl SessionManager {
             .entry(key.clone())
             .or_default()
             .clone();
+        let waited = Instant::now();
         let _probing = lock.lock().await;
-        if let Some(cached) = self.media_cache.lock().unwrap().get(&key).cloned() {
-            return Ok(cached);
+        if let Some((probe, index)) = self.media_cache.lock().unwrap().get(&key).cloned() {
+            // Either warm already, or we waited on a prefetch's probe.
+            let timings = MediaTimings {
+                probe_ms: waited.elapsed().as_millis() as u64,
+                index_ms: None,
+                cached: true,
+            };
+            return Ok((probe, index, timings));
         }
         let url = self.stream_url(source.torrent_id, source.file_index);
         let is_mkv = source.file_name.to_ascii_lowercase().ends_with(".mkv");
@@ -797,15 +878,28 @@ impl SessionManager {
             url: url.clone(),
             len: source.file_len,
         };
-        let (probe, index) = tokio::join!(self.transcode.probe(&url), async {
-            if is_mkv {
-                Some(mkv_index::read_index(&index_source).await)
-            } else {
-                None
+        let started = Instant::now();
+        let ((probe, probe_ms), index) = tokio::join!(
+            async {
+                let probe = self.transcode.probe(&url).await;
+                (probe, started.elapsed().as_millis() as u64)
+            },
+            async {
+                if is_mkv {
+                    let index = mkv_index::read_index(&index_source).await;
+                    Some((index, started.elapsed().as_millis() as u64))
+                } else {
+                    None
+                }
             }
-        });
+        );
         let probe = probe.map_err(|error| Failure::new("probe_failed", error))?;
-        let index = match index {
+        let timings = MediaTimings {
+            probe_ms,
+            index_ms: index.as_ref().map(|(_, ms)| *ms),
+            cached: false,
+        };
+        let index = match index.map(|(index, _)| index) {
             Some(Ok(index)) => Some(index),
             Some(Err(error)) => {
                 tracing::info!(target: "session", file = %source.file_name, %error, "no keyframe index; using a time grid");
@@ -841,7 +935,7 @@ impl SessionManager {
             self.byte_maps.lock().unwrap().clear();
         }
         cache.insert(key, (probe.clone(), index.clone()));
-        Ok((probe, index))
+        Ok((probe, index, timings))
     }
 
     /// Stretches of the session's file already on disk, in movie seconds.
@@ -1092,7 +1186,15 @@ impl SessionManager {
             .await
             .map_err(|_| Failure::new("metadata_timeout", "The torrent did not start in time."))?
             .map_err(|error| Failure::new("internal", format!("The torrent failed to start: {error:#}")))?;
-        self.media_info(&source).await?;
+        let (_, _, timings) = self.media_info(&source).await?;
+        tracing::info!(
+            target: "session",
+            file = %source.file_name,
+            probe_ms = timings.probe_ms,
+            index_ms = ?timings.index_ms,
+            cached = timings.cached,
+            "prefetch probe timing"
+        );
         Ok(source)
     }
 }
