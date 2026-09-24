@@ -127,7 +127,8 @@ export function VideoPlayer({
   introWindow?: { start: number; end: number | null } | null;
   /** Detected credits/outro window in absolute source seconds. */
   creditsWindow?: { start: number; end: number | null } | null;
-  /** Offered during the credits window when a follow-up episode exists. */
+  /** Offered during the credits window when a follow-up episode exists;
+   *  without one the credits action leaves the player instead. */
   onNextEpisode?: () => void;
   /** Fired once when the playhead first enters the credits window. */
   onCreditsReached?: () => void;
@@ -195,6 +196,10 @@ export function VideoPlayer({
   const settingsRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
+  /** The pointer shows while it moves, even when the chrome stays down
+   *  (the credits takeover), and hides again after the same idle delay. */
+  const [cursorVisible, setCursorVisible] = useState(true);
+  const cursorTimer = useRef<number | null>(null);
   const scrubFrame = useRef<number | null>(null);
   const pendingScrubRatio = useRef(0);
   const scrubbing = useRef(false);
@@ -879,6 +884,9 @@ export function VideoPlayer({
   }, [creditsTakeover, onNextEpisode, playing]);
 
   const revealControls = useCallback(() => {
+    setCursorVisible(true);
+    if (cursorTimer.current) window.clearTimeout(cursorTimer.current);
+    cursorTimer.current = window.setTimeout(() => setCursorVisible(false), HIDE_DELAY_MS);
     // No chrome during the credits takeover — a click still toggles play,
     // but only Watch credits gives the controls back.
     if (creditsTakeoverRef.current) return;
@@ -897,6 +905,7 @@ export function VideoPlayer({
   useEffect(
     () => () => {
       if (hideTimer.current) window.clearTimeout(hideTimer.current);
+      if (cursorTimer.current) window.clearTimeout(cursorTimer.current);
       if (scrubFrame.current) window.cancelAnimationFrame(scrubFrame.current);
     },
     [],
@@ -1242,7 +1251,7 @@ export function VideoPlayer({
       onPointerMove={revealControls}
       onPointerLeave={() => !keepControls && setControlsVisible(false)}
       className={`group/player relative h-full w-full overflow-hidden bg-black outline-none ${
-        controlsVisible ? '' : 'cursor-none'
+        controlsVisible || cursorVisible || keepControls ? '' : 'cursor-none'
       }`}
     >
       {topRightControls ? (
@@ -1408,28 +1417,24 @@ export function VideoPlayer({
             controlsVisible ? 'bottom-24' : 'bottom-6'
           }`}
         >
-          {onNextEpisode ? (
-            <button
-              type="button"
-              onClick={() => setCreditsDismissed(true)}
-              className="cursor-pointer rounded-full border border-white/30 bg-black/60 px-3.5 py-2 text-[0.8rem] font-medium text-white/90 backdrop-blur-md transition-colors hover:border-white/50 hover:text-white"
-            >
-              Watch credits
-            </button>
-          ) : null}
+          <button
+            type="button"
+            onClick={() => setCreditsDismissed(true)}
+            className="cursor-pointer rounded-full border border-white/30 bg-black/60 px-3.5 py-2 text-[0.8rem] font-medium text-white/90 backdrop-blur-md transition-colors hover:border-white/50 hover:text-white"
+          >
+            Watch credits
+          </button>
           <button
             type="button"
             onClick={() => {
-              if (onNextEpisode) {
-                onNextEpisode();
-                return;
-              }
-              // No follow-up episode — skipping credits runs the file out.
-              const video = videoRef.current;
-              const end = creditsWindow.end ?? (video ? resolveDuration(video) : 0);
-              if (end > 0) seekToAbsolute(end);
+              // With nothing to play next (a movie, a finale), the title is
+              // done: leave the player instead of parking on the last frame.
+              if (onNextEpisode) onNextEpisode();
+              else goBack();
             }}
-            className="relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full bg-white/70 px-4 py-2 text-[0.8rem] font-medium text-black transition-colors"
+            className={`relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full px-4 py-2 text-[0.8rem] font-medium text-black transition-colors ${
+              onNextEpisode ? 'bg-white/70' : 'bg-white hover:bg-white/85'
+            }`}
           >
             {onNextEpisode ? (
               <span
@@ -1439,8 +1444,10 @@ export function VideoPlayer({
                 style={{ transform: 'scaleX(0)' }}
               />
             ) : null}
-            <span className="relative">{onNextEpisode ? 'Next episode' : 'Skip credits'}</span>
-            <IoPlaySkipForward size={15} className="relative" aria-hidden />
+            <span className="relative">{onNextEpisode ? 'Next episode' : 'Back to browsing'}</span>
+            {onNextEpisode ? (
+              <IoPlaySkipForward size={15} className="relative" aria-hidden />
+            ) : null}
           </button>
         </div>
       ) : null}
