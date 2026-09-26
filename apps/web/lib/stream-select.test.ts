@@ -266,3 +266,34 @@ test('3D side-by-side releases never win the auto-pick', () => {
   });
   assert.equal(ranked[0].infoHash, 'flat');
 });
+
+test('English dub mode prefers releases that carry English audio for a German original', () => {
+  const release = (infoHash: string, title: string, seeders = 20): Stream => ({
+    name: 'Torrentio\n1080p', title, filename: `${infoHash}.S01E01.mkv`, infoHash, fileIdx: 0, quality: '1080p',
+    sizeBytes: 1_000_000_000, seeders, trackers: [],
+  });
+  // Real Torrentio titles for Dark S01E01.
+  const germanOnly = release('qxr', 'Dark (2017) Season 1-3 S01-S03 (1080p NF WEB-DL x265 HEVC 10bit EAC3 5.1 German Ghost) [QxR]\n🇩🇪', 192);
+  const gerEng = release('psa', 'Dark.S01.COMPLETE.DUAL-AUDIO.GER-ENG.1080p.10bit.WEBRip.6CH.x265\nDual Audio / 🇬🇧 / 🇩🇪', 383);
+  const bareDual = release('kontrast', 'Dark.S01.DUAL.1080p.WEBRip.x265-KONTRAST\nDual Audio / 🇩🇪', 46);
+  const englishSubs = release('budget', 'Dark COMPLETE S01 S02 S03 (EN subs) 720p.10bit.WEBRip.x265-budgetbits\n🇬🇧 / 🇩🇪');
+  const germanWithSubFlag = release('garshasp', 'Dark (2017) Season 1 S01 (1080p NF WEB-DL x265 HEVC 10bit EAC3 5.1 German Garshasp)\n🇬🇧 / 🇩🇪');
+  const frenchMulti = release('btt', 'Dark.COMPLETE.MULTi.1080p.NF.WEB.DDP.5.1.AV1-BTT\nMulti Audio / 🇫🇷');
+  const russian = release('rutracker', 'Тьма / Dark MVO (LostFilm) + Original + Sub (Rus Eng)\n🇬🇧 / 🇷🇺 / 🇩🇪');
+  const dub = { dub: 'en', original: 'de' };
+
+  for (const stream of [germanOnly, englishSubs, germanWithSubFlag, frenchMulti, russian]) {
+    assert.equal(isAutomaticSource(stream, dub), false, stream.infoHash);
+  }
+  assert.equal(isAutomaticSource(gerEng, dub), true);
+  assert.equal(isAutomaticSource(bareDual, dub), true);
+  const ranked = rankStreams(
+    [germanOnly, bareDual, gerEng, englishSubs],
+    { transcode: true, hevc: true },
+    dub,
+  ).filter((stream) => isAutomaticSource(stream, dub));
+  assert.deepEqual(ranked.map((stream) => stream.infoHash), ['psa', 'kontrast']);
+
+  // The original choice keeps today's order: the German-only release wins.
+  assert.equal(rankStreams([gerEng, germanOnly], { transcode: true, hevc: true }, 'de')[0].infoHash, 'qxr');
+});

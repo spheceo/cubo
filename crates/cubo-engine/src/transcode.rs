@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -37,6 +37,9 @@ pub struct MediaProbe {
     /// with several audio tracks often list a dub first, so the remux must
     /// never blindly take `0:a:0`.
     pub audio_stream_index: Option<u32>,
+    /// Every audio track in the file, in container order, so a session can
+    /// honour the viewer's language choice and report what else is there.
+    pub audio_tracks: Vec<AudioTrack>,
     pub duration_seconds: Option<f64>,
     /// ffprobe's container name list, e.g. `matroska,webm` or
     /// `mov,mp4,m4a,3gp,3g2,mj2`.
@@ -44,6 +47,18 @@ pub struct MediaProbe {
     /// Container chapters — named ones ("Intro", "Credits", "OP"/"ED") give
     /// exact, provider-independent skip windows.
     pub chapters: Vec<Chapter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrack {
+    /// Absolute stream index (`-map 0:N`).
+    pub index: u32,
+    pub codec: Option<String>,
+    /// ISO 639-1 code when the tag is recognisable ("ger" → "de"), else the
+    /// raw lowercase tag; `None` for untagged or `und` tracks.
+    pub language: Option<String>,
+    pub default: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +215,104 @@ impl MediaProbe {
             Some(codec) => COPYABLE_AUDIO.contains(&codec),
         }
     }
+
+    /// True when the chosen audio is the file's first audio track — the one
+    /// a browser plays when it opens the file directly.
+    pub fn audio_is_first(&self) -> bool {
+        self.audio_tracks
+            .first()
+            .is_none_or(|track| Some(track.index) == self.audio_stream_index)
+    }
+
+    /// Switches to the viewer's chosen audio language (ISO 639-1, e.g. "de"
+    /// for a German original, "en" for an English dub). When the file has
+    /// no such track, the container's default (then the first) track plays
+    /// rather than the English preference, which would be the dub. Without
+    /// a choice the probe's own pick stands.
+    pub fn with_audio_language(mut self, language: Option<&str>) -> Self {
+        let Some(wanted) = language.and_then(language_code) else {
+            return self;
+        };
+        let track = self
+            .audio_tracks
+            .iter()
+            .find(|track| track.language.as_deref() == Some(wanted))
+            .or_else(|| self.audio_tracks.iter().find(|track| track.default))
+            .or_else(|| self.audio_tracks.first());
+        if let Some(track) = track {
+            self.audio_stream_index = Some(track.index);
+            self.audio_codec = track.codec.clone();
+        }
+        self
+    }
+}
+
+/// ISO 639-1 code for a language tag or name: "ger", "deu", "German" and
+/// "de" all give "de". `None` for unknown or undetermined tags.
+pub fn language_code(tag: &str) -> Option<&'static str> {
+    const CODES: &[(&str, &[&str])] = &[
+        ("en", &["en", "eng", "english"]),
+        ("de", &["de", "ger", "deu", "german", "deutsch"]),
+        ("fr", &["fr", "fre", "fra", "french"]),
+        ("es", &["es", "spa", "spanish", "castellano"]),
+        ("it", &["it", "ita", "italian"]),
+        ("pt", &["pt", "por", "portuguese"]),
+        ("ru", &["ru", "rus", "russian"]),
+        ("uk", &["uk", "ukr", "ukrainian"]),
+        ("pl", &["pl", "pol", "polish"]),
+        ("nl", &["nl", "dut", "nld", "dutch"]),
+        ("sv", &["sv", "swe", "swedish"]),
+        ("da", &["da", "dan", "danish"]),
+        ("no", &["no", "nb", "nn", "nor", "nob", "nno", "norwegian"]),
+        ("fi", &["fi", "fin", "finnish"]),
+        ("is", &["is", "ice", "isl", "icelandic"]),
+        ("cs", &["cs", "cze", "ces", "czech"]),
+        ("hu", &["hu", "hun", "hungarian"]),
+        ("ro", &["ro", "rum", "ron", "romanian"]),
+        ("el", &["el", "gre", "ell", "greek"]),
+        ("tr", &["tr", "tur", "turkish"]),
+        ("he", &["he", "heb", "hebrew"]),
+        ("ar", &["ar", "ara", "arabic"]),
+        ("fa", &["fa", "per", "fas", "persian"]),
+        ("hi", &["hi", "hin", "hindi"]),
+        ("ta", &["ta", "tam", "tamil"]),
+        ("te", &["te", "tel", "telugu"]),
+        ("ml", &["ml", "mal", "malayalam"]),
+        ("th", &["th", "tha", "thai"]),
+        ("vi", &["vi", "vie", "vietnamese"]),
+        ("id", &["id", "ind", "indonesian"]),
+        ("ms", &["ms", "may", "msa", "malay"]),
+        ("tl", &["tl", "tgl", "fil", "tagalog", "filipino"]),
+        ("ja", &["ja", "jpn", "japanese"]),
+        ("ko", &["ko", "kor", "korean"]),
+        ("zh", &["zh", "chi", "zho", "cn", "chinese", "mandarin", "cmn"]),
+    ];
+    let tag = tag.trim().to_ascii_lowercase();
+    CODES
+        .iter()
+        .find(|(_, names)| names.contains(&tag.as_str()))
+        .map(|(code, _)| *code)
+}
+
+fn audio_tracks(streams: &[FfprobeStream]) -> Vec<AudioTrack> {
+    streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .filter_map(|stream| {
+            let language = stream.tags.language.as_deref().and_then(|tag| {
+                language_code(tag).map(str::to_owned).or_else(|| {
+                    let tag = tag.trim().to_ascii_lowercase();
+                    (!tag.is_empty() && tag != "und").then_some(tag)
+                })
+            });
+            Some(AudioTrack {
+                index: stream.index?,
+                codec: stream.codec_name.clone(),
+                language,
+                default: stream.disposition.default == Some(1),
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -406,6 +519,7 @@ impl TranscodeManager {
             video_codec,
             audio_codec: audio.and_then(|stream| stream.codec_name.clone()),
             audio_stream_index: audio.and_then(|stream| stream.index),
+            audio_tracks: audio_tracks(&parsed.streams),
             duration_seconds,
             format_name: parsed.format.format_name.clone(),
             chapters,
@@ -465,6 +579,72 @@ pub(crate) fn find_tool(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    mod audio_language {
+        use super::super::{language_code, AudioTrack, MediaProbe};
+
+        fn track(index: u32, codec: &str, language: Option<&str>, default: bool) -> AudioTrack {
+            AudioTrack {
+                index,
+                codec: Some(codec.into()),
+                language: language.map(str::to_owned),
+                default,
+            }
+        }
+
+        /// Dark's KONTRAST dual release: German original first, English dub
+        /// second. The probe's own pick is the English track.
+        fn dual() -> MediaProbe {
+            MediaProbe {
+                video_codec: Some("hevc".into()),
+                audio_codec: Some("aac".into()),
+                audio_stream_index: Some(2),
+                audio_tracks: vec![
+                    track(1, "eac3", Some("de"), true),
+                    track(2, "aac", Some("en"), false),
+                ],
+                duration_seconds: Some(3000.0),
+                format_name: Some("matroska,webm".into()),
+                chapters: vec![],
+            }
+        }
+
+        #[test]
+        fn tags_and_names_normalise_to_iso_639_1() {
+            assert_eq!(language_code("ger"), Some("de"));
+            assert_eq!(language_code("DEU"), Some("de"));
+            assert_eq!(language_code("de"), Some("de"));
+            assert_eq!(language_code("English"), Some("en"));
+            assert_eq!(language_code("und"), None);
+        }
+
+        #[test]
+        fn original_choice_picks_the_original_track() {
+            let probe = dual().with_audio_language(Some("de"));
+            assert_eq!(probe.audio_stream_index, Some(1));
+            assert_eq!(probe.audio_codec.as_deref(), Some("eac3"));
+            assert!(probe.audio_is_first());
+        }
+
+        #[test]
+        fn english_choice_picks_the_dub() {
+            let probe = dual().with_audio_language(Some("en"));
+            assert_eq!(probe.audio_stream_index, Some(2));
+            assert_eq!(probe.audio_codec.as_deref(), Some("aac"));
+            assert!(!probe.audio_is_first());
+        }
+
+        #[test]
+        fn missing_language_falls_back_to_the_default_track() {
+            let probe = dual().with_audio_language(Some("fr"));
+            assert_eq!(probe.audio_stream_index, Some(1));
+        }
+
+        #[test]
+        fn no_choice_keeps_the_probe_pick() {
+            assert_eq!(dual().with_audio_language(None).audio_stream_index, Some(2));
+        }
+    }
+
     mod chapters {
         use super::super::{chapter_skip_segments, Chapter};
 
@@ -673,6 +853,32 @@ JSON"#,
             );
             assert_eq!(intro.map(|s| (s.start, s.end)), Some((250.333, 348.125)));
             assert_eq!(credits.map(|s| (s.start, s.end)), Some((3092.0, 3153.76)));
+        }
+
+        #[tokio::test]
+        async fn source_probe_lists_audio_tracks_and_honours_the_choice() {
+            // ffprobe's output for a German-first, English-second MKV.
+            let fixture = Fixture::new();
+            let mut manager = TranscodeManager::new();
+            manager.ffprobe = Some(fixture.script(
+                "ffprobe",
+                r#"cat <<'JSON'
+{"streams":[
+  {"index":0,"codec_type":"video","codec_name":"h264","tags":{},"disposition":{"default":0}},
+  {"index":1,"codec_type":"audio","codec_name":"eac3","tags":{"language":"ger"},"disposition":{"default":1}},
+  {"index":2,"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"},"disposition":{"default":0}}
+ ],
+ "format":{"duration":"2.0"}}
+JSON"#,
+            ));
+            let probe = manager.probe("unused").await.unwrap();
+            let languages: Vec<_> = probe.audio_tracks.iter().map(|track| track.language.as_deref()).collect();
+            assert_eq!(languages, [Some("de"), Some("en")]);
+            // Without a choice the English-first default stands.
+            assert_eq!(probe.audio_stream_index, Some(2));
+            let original = probe.clone().with_audio_language(Some("de"));
+            assert_eq!((original.audio_stream_index, original.audio_codec.as_deref()), (Some(1), Some("eac3")));
+            assert!(!original.audio_copyable());
         }
 
     }

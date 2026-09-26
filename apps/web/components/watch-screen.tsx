@@ -43,6 +43,7 @@ import {
   waitForSession,
   type LocalEngineConnection,
   type PlaybackSessionStatus,
+  type SessionAudioTrack,
   getLibrary,
   getSkipSegments,
   getSubtitleMatch,
@@ -63,7 +64,19 @@ import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playbac
 import { historyForEpisode, playbackKey } from '@/lib/library';
 import { resolveNextEpisode } from '@/lib/next-episode';
 import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, RESUME_END_EPSILON, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
-import { isAutomaticSource, streamKey } from '@/lib/stream-select';
+import { isAutomaticSource, streamKey, type AudioTarget } from '@/lib/stream-select';
+import {
+  audioTargetFor,
+  DUB_LANGUAGE,
+  languageName,
+  loadAudioChoice,
+  loadCaptionsOff,
+  offersDub,
+  saveAudioChoice,
+  saveCaptionsOff,
+  sessionAudioLanguage,
+  type AudioChoice,
+} from '@/lib/audio-choice';
 import { ProgressWriter } from '@/lib/progress-writer';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
@@ -104,6 +117,19 @@ const HEARTBEAT_MS = 5_000;
  *  session) allowed per window before the source counts as failed. */
 const RECOVERY_LIMIT = 3;
 const RECOVERY_WINDOW_MS = 5 * 60_000;
+
+/** Whether a ready session's file carries `language`. Unknown counts as
+ *  yes: older Cores report no tracks, and untagged tracks prove nothing. */
+function hasAudio(status: PlaybackSessionStatus, language: string | null): boolean {
+  const tracks = status.audioTracks ?? [];
+  if (!language || tracks.length === 0) return true;
+  const tagged = tracks.filter((track) => track.language);
+  if (tagged.some((track) => track.language?.toLowerCase() === language.toLowerCase())) return true;
+  return tagged.length < tracks.length;
+}
+
+/** How long the "no English audio" notice stays up. */
+const AUDIO_NOTICE_MS = 7_000;
 
 function sessionStage(status: PlaybackSessionStatus): number {
   if (status.phase === 'resolving') return STAGE.opening;
@@ -173,6 +199,23 @@ export function WatchScreen({
   /** What Core has on disk for the current session, for the download bar. */
   const [downloadedRanges, setDownloadedRanges] = useState<BufferedRange[] | null>(null);
   const [episodesOpen, setEpisodesOpen] = useState(false);
+  /** Original audio or English dub, for titles not made in English. Null
+   *  until decided (the viewer is asked once per title when a dub exists). */
+  const [audioChoice, setAudioChoice] = useState<AudioChoice | null>(() => loadAudioChoice(mediaType, mediaId));
+  /** What ranking and Core aim for right now; read by in-flight starts. */
+  const audioTargetRef = useRef<AudioTarget>(audioTargetFor(audioChoice, originalLanguage));
+  /** Resolves the pre-play language question. */
+  const [audioPrompt, setAudioPrompt] = useState<((choice: AudioChoice) => void) | null>(null);
+  /** Whether any eligible source carries English audio. */
+  const [dubAvailable, setDubAvailable] = useState(false);
+  /** The playing file's audio tracks and the language actually playing. */
+  const [playingAudio, setPlayingAudio] = useState<{ tracks: SessionAudioTrack[]; language: string | null } | null>(null);
+  const [audioNotice, setAudioNotice] = useState<string | null>(null);
+  /** This title's raw Torrentio list, re-ranked when the audio choice changes. */
+  const foundRef = useRef<Promise<Stream[]> | null>(null);
+  /** False while a dub was asked for but the file only has the original:
+   *  that source must not become this episode's remembered pick. */
+  const rememberableRef = useRef(true);
   const cacheClearingRef = useRef(false);
   /** The Core playback session currently attached to the player. */
   const sessionRef = useRef<{ connection: LocalEngineConnection; id: string } | null>(null);
@@ -217,9 +260,16 @@ export function WatchScreen({
     });
   }, []);
 
+  // Listening to a language other than English means captions by default
+  // (English unless the viewer keeps captions in another language).
+  const listeningLanguage =
+    playingAudio?.language ?? sessionAudioLanguage(audioTargetFor(audioChoice, originalLanguage));
+  const foreignAudio = listeningLanguage != null && listeningLanguage.toLowerCase() !== DUB_LANGUAGE;
+
   const pickSubtitle = useCallback(
     (id: string | null) => {
       setActiveSubtitleId(id);
+      if (foreignAudio) saveCaptionsOff(mediaType, mediaId, id === null);
       if (id === null) {
         updateCaptionPrefs({ enabled: false });
         return;
@@ -227,7 +277,7 @@ export function WatchScreen({
       const track = subtitleTracks.find((entry) => entry.id === id);
       updateCaptionPrefs({ enabled: true, language: track?.language ?? captionPrefs.language });
     },
-    [subtitleTracks, captionPrefs.language, updateCaptionPrefs],
+    [subtitleTracks, captionPrefs.language, updateCaptionPrefs, foreignAudio, mediaType, mediaId],
   );
 
   const enableCaptions = useCallback(() => {
@@ -239,19 +289,26 @@ export function WatchScreen({
       : undefined;
     setActiveSubtitleId(match?.id ?? subtitleTracks[0]?.id ?? null);
     updateCaptionPrefs({ enabled: true });
-  }, [subtitleTracks, captionPrefs.language, updateCaptionPrefs]);
+    saveCaptionsOff(mediaType, mediaId, false);
+  }, [subtitleTracks, captionPrefs.language, updateCaptionPrefs, mediaType, mediaId]);
 
   // When a title's tracks arrive, apply whatever the viewer left behind:
   // captions on means this title opens with captions too, same language.
+  // Foreign audio turns captions on in English (or the viewer's caption
+  // language) unless they switched them off for this title.
   useEffect(() => {
     if (subtitleTracks.length === 0) return;
     setActiveSubtitleId((current) => {
       if (current != null && subtitleTracks.some((track) => track.id === current)) return current;
+      if (foreignAudio && !loadCaptionsOff(mediaType, mediaId)) {
+        const language = captionPrefs.enabled && captionPrefs.language ? captionPrefs.language : DUB_LANGUAGE;
+        return preferredSubtitleId(subtitleTracks, { ...captionPrefs, enabled: true, language });
+      }
       return preferredSubtitleId(subtitleTracks, captionPrefs);
     });
-    // Only re-apply when a new title's track list lands.
+    // Only re-apply when a new title's track list lands or the audio changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- captionPrefs intentionally read once per list
-  }, [subtitleTracks]);
+  }, [subtitleTracks, foreignAudio]);
 
   const attemptRef = useRef(0);
   const failedSourcesRef = useRef(new Set<string>());
@@ -427,14 +484,23 @@ export function WatchScreen({
       abort: AbortController;
     };
     let lastError = 'Could not start playback';
+    const audioTarget = audioTargetRef.current;
+    const audioLanguage = sessionAudioLanguage(audioTarget);
+    const dubbing = audioTarget !== null && typeof audioTarget === 'object';
+    /** Dub mode: a ready source whose file turned out to have no English
+     *  track waits here while the others keep racing, and plays (original
+     *  audio, English captions) only if none of them has the dub. */
+    let heldBack: { racer: Racer; ready: PlaybackSessionStatus; startAt: number } | null = null;
     const queue: { stream: Stream; index: number }[] = [];
     const queued = new Set<string>();
     const enqueue = (stream: Stream, index: number) => {
       const key = streamKey(stream);
       if (queued.has(key)) return;
       if (auto && failedSourcesRef.current.has(stream.infoHash)) return;
-      if (auto && !isAutomaticSource(stream, originalLanguage)) {
-        lastError = 'No suitable original-language source is available.';
+      if (auto && !isAutomaticSource(stream, audioTarget)) {
+        lastError = dubbing
+          ? 'No source with English audio is available.'
+          : 'No suitable original-language source is available.';
         return;
       }
       queued.add(key);
@@ -463,7 +529,18 @@ export function WatchScreen({
         window.clearInterval(timer);
         abort.signal.removeEventListener('abort', onAbort);
         for (const racer of [...racers]) retire(racer);
+        if (heldBack) closeSession(connection, heldBack.ready.id);
         resolve(result);
+      };
+      const play = (racer: Racer, ready: PlaybackSessionStatus, startAt: number) => {
+        if (heldBack?.ready.id === ready.id) heldBack = null;
+        finish(true);
+        // Core may know the title is shorter than the saved progress
+        // assumed (the picture ends before the container says). A resume
+        // point past the real end means the title was finished.
+        const end = ready.durationSeconds ?? 0;
+        const resumeAt = end > 0 && startAt >= end - RESUME_END_EPSILON ? 0 : startAt;
+        attachSession(connection, racer.stream, racer.index, list.length, auto, resumeAt, ready, abort, stale);
       };
       const onAbort = () => finish(false);
       abort.signal.addEventListener('abort', onAbort);
@@ -492,6 +569,10 @@ export function WatchScreen({
           return;
         }
         if (!moreDone) return;
+        if (heldBack && !stale()) {
+          play(heldBack.racer, heldBack.ready, heldBack.startAt);
+          return;
+        }
         if (!stale()) {
           setStatus('error');
           setError(lastError);
@@ -510,6 +591,7 @@ export function WatchScreen({
             fileIndex: stream.fileIdx ?? null,
             resumeSeconds: startAt,
             hevc: supportsHevcRemux(),
+            audioLanguage,
           });
           racer.sessionId = created.id;
           if (racer.done || settled || stale()) {
@@ -526,13 +608,22 @@ export function WatchScreen({
           if (racer.done || settled || stale()) return;
           racers.delete(racer);
           racer.done = true;
-          finish(true);
-          // Core may know the title is shorter than the saved progress
-          // assumed (the picture ends before the container says). A resume
-          // point past the real end means the title was finished.
-          const end = ready.durationSeconds ?? 0;
-          const resumeAt = end > 0 && startAt >= end - RESUME_END_EPSILON ? 0 : startAt;
-          attachSession(connection, stream, racer.index, list.length, auto, resumeAt, ready, abort, stale);
+          if (dubbing && auto && !hasAudio(ready, audioLanguage)) {
+            shipClientLog(connection, 'info', 'dub_missing', {
+              name: stream.name,
+              source_title: stream.title,
+              held: heldBack == null,
+            });
+            if (heldBack) {
+              closeSession(connection, ready.id);
+            } else {
+              heldBack = { racer, ready, startAt };
+            }
+            launch();
+            giveUpOrContinue();
+            return;
+          }
+          play(racer, ready, startAt);
         } catch (reason) {
           if (racer.done || settled) return;
           if (stale() || abort.signal.aborted) {
@@ -613,6 +704,18 @@ export function WatchScreen({
     const fileIndex = ready.fileIndex ?? stream.fileIdx ?? 0;
     const id = ready.torrentId ?? ready.infoHash ?? '';
     activeSourceRef.current = { ...stream, fileIdx: fileIndex };
+    const audioTracks = ready.audioTracks ?? [];
+    const playing = audioTracks.find((track) => track.index === ready.audioIndex);
+    setPlayingAudio(audioTracks.length > 0 ? { tracks: audioTracks, language: playing?.language ?? null } : null);
+    const wanted = sessionAudioLanguage(audioTargetRef.current);
+    const dubbing = audioTargetRef.current !== null && typeof audioTargetRef.current === 'object';
+    const dubMissing = dubbing && !hasAudio(ready, wanted);
+    rememberableRef.current = !dubMissing;
+    setAudioNotice(
+      dubMissing
+        ? `No English audio in this release. Playing ${languageName(originalLanguage) ?? 'the original'} with English subtitles.`
+        : null,
+    );
     shipClientLog(connection, 'info', 'stream_selected', {
       index,
       total,
@@ -627,6 +730,8 @@ export function WatchScreen({
       filename: ready.fileName,
       info_hash: stream.infoHash,
       session: ready.id,
+      audio_language: playing?.language ?? undefined,
+      audio_tracks: audioTracks.length || undefined,
     });
 
     // Release-exact subtitles and intro/credits windows load beside
@@ -701,11 +806,35 @@ export function WatchScreen({
         ? Promise.resolve(warmed)
         : fetchStreams(mediaType, imdbId, season, episode)
       ).catch(() => [] as Stream[]);
+      foundRef.current = foundPromise;
       const connection = await core.connect().catch(() => null);
       if (cancelled) return;
+      const dubTarget = audioTargetFor('dub', originalLanguage);
+      const dubbable = offersDub(originalLanguage);
+      const hasDub = (found: Stream[]) =>
+        dubbable && rankForPlayback(found, null, connection, { originalLanguage, audio: dubTarget, season, episode }).length > 0;
+      void foundPromise.then((found) => {
+        if (!cancelled) setDubAvailable(hasDub(found));
+      });
+      // First visit to a title not made in English: ask original or dub
+      // before anything starts, but only when an English source exists.
+      let choice = loadAudioChoice(mediaType, mediaId);
+      if (choice === null && dubbable) {
+        const found = await foundPromise;
+        if (cancelled) return;
+        if (hasDub(found)) {
+          choice = await new Promise<AudioChoice>((resolve) => setAudioPrompt(() => resolve));
+          if (cancelled) return;
+          setAudioPrompt(null);
+          saveAudioChoice(mediaType, mediaId, choice);
+        }
+      }
+      const audio = audioTargetFor(choice, originalLanguage);
+      audioTargetRef.current = audio;
+      setAudioChoice(choice);
       const savedSource = loadSource(itemKey);
       const rank = (found: Stream[], saved: Stream | null) =>
-        rankForPlayback(found, saved, connection, { originalLanguage, season, episode });
+        rankForPlayback(found, saved, connection, { originalLanguage, audio, season, episode });
       sourceRefreshRef.current = foundPromise.then((found) => rank(found, savedSource));
       try {
         const preferred = rank([], savedSource);
@@ -765,7 +894,9 @@ export function WatchScreen({
           setError(
             airDate && isUpcomingAirDate(airDate)
               ? "This episode hasn't come out yet."
-              : 'No suitable original-language sources were found for this title.',
+              : typeof audio === 'object' && audio !== null
+                ? 'No sources with English audio were found for this title.'
+                : 'No suitable original-language sources were found for this title.',
           );
           return;
         }
@@ -779,6 +910,7 @@ export function WatchScreen({
 
     return () => {
       cancelled = true;
+      setAudioPrompt(null);
       startAbortRef.current?.abort();
       releaseSession();
     };
@@ -1208,6 +1340,77 @@ export function WatchScreen({
     failOver();
   }
 
+  // The viewer switched between the original and the English dub in the
+  // player. The same file restarts on the other track when it has one;
+  // otherwise the title's sources are re-ranked for the new language and
+  // raced from the current position.
+  function switchAudio(next: AudioChoice) {
+    if (next === audioChoice) return;
+    const target = audioTargetFor(next, originalLanguage);
+    const wanted = sessionAudioLanguage(target);
+    const position = lastPositionRef.current;
+    const active = activeSourceRef.current;
+    playerFlushRef.current?.();
+    const sameFile = active != null
+      && (playingAudio?.tracks ?? []).some((track) => track.language === wanted);
+    const commit = () => {
+      saveAudioChoice(mediaType, mediaId, next);
+      setAudioChoice(next);
+      audioTargetRef.current = target;
+      if (next === 'dub' && !captionPrefs.enabled) setActiveSubtitleId(null);
+      if (playbackConnection.current) {
+        shipClientLog(playbackConnection.current, 'info', 'audio_switched', {
+          choice: next,
+          same_file: sameFile,
+          position: Math.round(position) || undefined,
+        });
+      }
+    };
+    if (sameFile && active) {
+      commit();
+      const list = [active, ...sources.filter((stream) => streamKey(stream) !== streamKey(active))];
+      setSources(list);
+      void start(list, 0, false, position);
+      return;
+    }
+    const attempt = attemptRef.current;
+    void (foundRef.current ?? Promise.resolve([] as Stream[])).then((found) => {
+      if (attemptRef.current !== attempt) return;
+      const ranked = rankForPlayback(found, null, playbackConnection.current, {
+        originalLanguage,
+        audio: target,
+        season,
+        episode,
+      }).filter((stream) => !failedSourcesRef.current.has(stream.infoHash));
+      if (ranked.length === 0) {
+        setAudioNotice(next === 'dub'
+          ? 'No source with English audio is available for this title.'
+          : 'No original-language source is available for this title.');
+        return;
+      }
+      commit();
+      setSources(ranked);
+      void start(ranked, 0, true, position);
+    });
+  }
+
+  useEffect(() => {
+    if (!audioNotice) return;
+    const timer = window.setTimeout(() => setAudioNotice(null), AUDIO_NOTICE_MS);
+    return () => window.clearTimeout(timer);
+  }, [audioNotice]);
+
+  const originalName = languageName(originalLanguage) ?? 'Original';
+  // The in-player audio menu: offered when the title has a dub on offer
+  // and either the file already carries both tracks or a dub source exists.
+  const audioOptions = offersDub(originalLanguage)
+    && (dubAvailable || (playingAudio?.tracks.some((track) => track.language === DUB_LANGUAGE) ?? false))
+    ? [
+        { value: 'original', label: `${originalName} (original)` },
+        { value: 'dub', label: 'English' },
+      ]
+    : undefined;
+
   const backdrop = backdropUrl(backdropPath, 'w780');
   const busy = status === 'loading' || status === 'starting';
 
@@ -1252,7 +1455,9 @@ export function WatchScreen({
           onPlaybackProgress={savePlaybackProgress}
           downloadedRanges={downloadedRanges}
           onPlaying={() => {
-            if (activeSourceRef.current) rememberSource(itemKey, activeSourceRef.current);
+            if (activeSourceRef.current && rememberableRef.current) {
+              rememberSource(itemKey, activeSourceRef.current);
+            }
             reportFirstFrame();
           }}
           flushRef={playerFlushRef}
@@ -1262,6 +1467,9 @@ export function WatchScreen({
           onCreditsReached={markDoneAtCredits}
           sections={skipSegments?.sections}
           onSeekIntent={recordSeekIntent}
+          audioOptions={audioOptions}
+          activeAudio={audioChoice ?? 'original'}
+          onPickAudio={(value) => switchAudio(value === 'dub' ? 'dub' : 'original')}
           onError={() => {
             if (cacheClearingRef.current) return;
             const session = sessionRef.current;
@@ -1273,7 +1481,14 @@ export function WatchScreen({
           }}
           onStall={reportStall}
           />
-
+          {audioNotice ? (
+            <div
+              role="status"
+              className="pointer-events-none absolute left-1/2 top-6 z-30 -translate-x-1/2 rounded-full bg-black/75 px-5 py-2.5 text-center text-sm text-white shadow-2xl backdrop-blur-md"
+            >
+              {audioNotice}
+            </div>
+          ) : null}
         </div>
       ) : (
         <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-6">
@@ -1298,11 +1513,18 @@ export function WatchScreen({
           <div className="relative flex w-full max-w-xl flex-col items-center text-center">
             <LogoLoader
               title={title}
-              progress={busy ? Math.min(progress, 1) : null}
+              progress={busy && !audioPrompt ? Math.min(progress, 1) : null}
               logoPath={logoPath}
             />
 
-            {busy ? null : (
+            {audioPrompt ? (
+              <AudioPrompt
+                originalName={originalName}
+                onPick={(choice) => audioPrompt(choice)}
+              />
+            ) : busy ? (
+              audioNotice ? <p className="mt-9 text-sm leading-6 text-white/70">{audioNotice}</p> : null
+            ) : (
               <>
                 <p className="mt-9 leading-7 text-white/80">{error}</p>
                 <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
@@ -1341,6 +1563,44 @@ export function WatchScreen({
         </div>
       )}
 
+    </div>
+  );
+}
+
+/** First visit to a title not made in English: listen to the original
+ *  with English subtitles (the default), or the English dub. */
+function AudioPrompt({
+  originalName,
+  onPick,
+}: {
+  originalName: string;
+  onPick: (choice: AudioChoice) => void;
+}) {
+  const firstRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => firstRef.current?.focus(), []);
+  return (
+    <div className="mt-9 flex w-full flex-col items-center" role="group" aria-label="Audio language">
+      <p className="text-lg font-semibold text-white">How would you like to watch?</p>
+      <p className="mt-1.5 text-sm text-white/60">You can change this later in the player settings.</p>
+      <div className="mt-6 flex w-full max-w-sm flex-col gap-3">
+        <button
+          ref={firstRef}
+          type="button"
+          onClick={() => onPick('original')}
+          className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-white px-6 py-3.5 text-black transition-colors hover:bg-white/85"
+        >
+          <span className="font-semibold">{originalName} (original)</span>
+          <span className="text-sm text-black/60">With English subtitles</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onPick('dub')}
+          className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-control px-6 py-3.5 text-white transition-colors hover:bg-control-hover"
+        >
+          <span className="font-semibold">English</span>
+          <span className="text-sm text-white/55">Dubbed audio</span>
+        </button>
+      </div>
     </div>
   );
 }

@@ -30,6 +30,14 @@ const AUDIO_LANGUAGE_HINTS: [string, RegExp][] = [
 ];
 const ORIGINAL_AUDIO_RE = /\b(?:original[ ._-]?(?:audio|language))\b/i;
 const MULTI_AUDIO_RE = /\b(?:multi|dual[ ._-]?audio)\b/i;
+/** Dual/multi-audio markers, including the bare scene tag `DUAL` and the
+ *  abbreviated `DUAL-AU`. Only the dub ranking reads the bare forms. */
+const DUAL_AUDIO_RE = /\b(?:multi|dual(?:[ ._-]?au(?:dio)?)?)\b/i;
+/** Language names that describe subtitles, not audio: "(EN subs)",
+ *  "Sub (Rus Eng)", "Eng Subs". Removed before looking for a dub's
+ *  language in the release name. */
+const SUBTITLE_MENTION_RE =
+  /\b(?:en|eng|english)[ ._-]?subs?\b|\bm?subs?[ ._-]*(?:\([^)\n]*\)|(?:en|eng|english)\b)/gi;
 /** Named dubs (DUBLADO = Portuguese dubbed, etc.). Checked before flags —
  *  Torrentio often stamps 🇬🇧 on a dub because English subs are present. */
 const DUBBED_AUDIO_RE = /\b(?:dublado|dublada|dublagem|dubbed|dubbing)\b/i;
@@ -148,7 +156,42 @@ function isForeignRelease(hint: string, native: string): boolean {
   return foreignScript || (VOICEOVER_RE.test(hint) && !VOICEOVER_LANGUAGES.includes(native));
 }
 
-function audioLanguageRank(stream: Stream, nativeLanguage: string | null): number {
+/** The audio the viewer wants: the title's original language (a bare
+ *  ISO 639-1 code, or null when unknown), or a dub of it. */
+export type AudioTarget = string | null | { dub: string; original: string | null };
+
+/** Dub mode: how sure the release carries the dub's audio. 0 = the name
+ *  says so ("GER-ENG", "English German"), 1 = a flag suggests it,
+ *  2 = an unlabelled dual/multi-audio release, 3 = original audio only or
+ *  another audience's release. Core picks the dub track inside the file and
+ *  falls back to the original when the guess was wrong. */
+function dubLanguageRank(stream: Stream, dub: string, original: string | null): number {
+  const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
+  if (HARDSUB_RE.test(hint) || CJK_HARDSUB_RE.test(hint)) return 3;
+  if (isForeignRelease(hint, dub)) return 3;
+  const spoken = hint.replace(SUBTITLE_MENTION_RE, ' ');
+  const dubHint = AUDIO_LANGUAGE_HINTS.find(([code]) => code === dub)?.[1];
+  if (dubHint?.test(spoken)) return 0;
+
+  const dual = DUAL_AUDIO_RE.test(hint);
+  const originalHint = AUDIO_LANGUAGE_HINTS.find(([code]) => code === original)?.[1];
+  // "German" alone in the name: the original track only, whatever flags
+  // Torrentio adds for bundled subtitles.
+  if (!dual && originalHint?.test(spoken)) return 3;
+  const flags = flaggedLanguages(hint);
+  const subtitlesExplainFlag = spoken !== hint;
+  if (flags.has(dub) && !subtitlesExplainFlag) return 1;
+  if ([...flags].some((code) => code !== dub && code !== original)) return 3;
+  if (dual) return 2;
+  if (DUBBED_AUDIO_RE.test(hint)) return 1;
+  return 3;
+}
+
+function audioLanguageRank(stream: Stream, target: AudioTarget): number {
+  if (target !== null && typeof target === 'object') {
+    return dubLanguageRank(stream, target.dub.toLowerCase(), target.original?.toLowerCase() ?? null);
+  }
+  const nativeLanguage = target;
   const hint = `${stream.name} ${stream.title} ${stream.filename ?? ''}`;
   // Burned-in subtitles ruin a release regardless of its audio language.
   if (HARDSUB_RE.test(hint) || CJK_HARDSUB_RE.test(hint)) return 3;
@@ -293,7 +336,7 @@ export function isOversizedStream(stream: Stream): boolean {
 export function rankStreams(
   streams: Stream[],
   capabilities: PlaybackCapabilities,
-  nativeLanguage: string | null = null,
+  nativeLanguage: AudioTarget = null,
   episode?: EpisodeHint | null,
 ): Stream[] {
   return streams
@@ -328,7 +371,7 @@ export function rankStreams(
  * quickly. Preview never enters Core's ffmpeg remux path. */
 export function rankPreviewStreams(
   streams: Stream[],
-  nativeLanguage: string | null = null,
+  nativeLanguage: AudioTarget = null,
   episode?: EpisodeHint | null,
 ): Stream[] {
   const direct = streams.filter(
@@ -370,7 +413,7 @@ export function streamKey(stream: Stream): string {
 /** Automatic fallback must not silently change the title's audio language
  * or replace a proper release with a cinema capture or 3D encode. Unknown audio remains
  * eligible: most original-language releases do not label their language. */
-export function isAutomaticSource(stream: Stream, nativeLanguage: string | null): boolean {
+export function isAutomaticSource(stream: Stream, nativeLanguage: AudioTarget): boolean {
   return !isOversizedStream(stream)
     && capturedReleaseRank(stream) === 0
     && stereo3dRank(stream) === 0

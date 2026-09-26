@@ -104,6 +104,9 @@ export function VideoPlayer({
   onNextEpisode,
   onCreditsReached,
   sections,
+  audioOptions,
+  activeAudio,
+  onPickAudio,
 }: {
   fullscreenTargetRef: RefObject<HTMLDivElement | null>;
   topRightControls?: ReactNode;
@@ -119,6 +122,11 @@ export function VideoPlayer({
   onCreditsReached?: () => void;
   /** Every classified section, drawn as colored bands on the scrub bar. */
   sections?: SkipSection[];
+  /** Audio languages on offer (original / English dub). Picking one
+   *  restarts playback on the parent's side. */
+  audioOptions?: { value: string; label: string }[];
+  activeAudio?: string;
+  onPickAudio?: (value: string) => void;
   src: string;
   /** True when `src` is a Core VOD HLS playlist. */
   hls?: boolean;
@@ -1591,6 +1599,12 @@ export function VideoPlayer({
                   onToggleSections={toggleSections}
                   sectionColors={sectionColors}
                   onPickSectionColor={pickSectionColor}
+                  audioOptions={audioOptions}
+                  activeAudio={activeAudio}
+                  onPickAudio={(value) => {
+                    setSettingsOpen(false);
+                    if (value !== activeAudio) onPickAudio?.(value);
+                  }}
                 />
               ) : null}
             </div>

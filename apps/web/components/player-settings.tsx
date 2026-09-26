@@ -18,6 +18,7 @@ import type { PlayerSubtitle } from './video-player';
 
 type Panel =
   | 'root'
+  | 'audio'
   | 'subtitles'
   | 'language'
   | 'size'
@@ -51,6 +52,9 @@ export function PlayerSettings({
   onToggleSections,
   sectionColors,
   onPickSectionColor,
+  audioOptions,
+  activeAudio,
+  onPickAudio,
 }: {
   subtitles: PlayerSubtitle[];
   activeSubtitleId: string | null;
@@ -68,6 +72,10 @@ export function PlayerSettings({
   /** Every section kind resolved to a concrete color (defaults applied). */
   sectionColors?: Record<SectionKind, string>;
   onPickSectionColor?: (kind: SectionKind, color: string) => void;
+  /** Audio languages on offer (original, English dub); hidden when absent. */
+  audioOptions?: { value: string; label: string }[];
+  activeAudio?: string;
+  onPickAudio?: (value: string) => void;
 }) {
   const [panel, setPanel] = useState<Panel>('root');
   const [coloring, setColoring] = useState<SectionKind>('intro');
@@ -161,6 +169,20 @@ export function PlayerSettings({
             ))}
           </div>
         </>
+      ) : panel === 'audio' ? (
+        <>
+          <PaneHeader label="Audio" onBack={() => setPanel('root')} />
+          <div className="border-t border-white/8 py-1">
+            {(audioOptions ?? []).map((option) => (
+              <OptionRow
+                key={option.value}
+                label={option.label}
+                active={option.value === activeAudio}
+                onClick={() => onPickAudio?.(option.value)}
+              />
+            ))}
+          </div>
+        </>
       ) : panel === 'framing' ? (
         <>
           <PaneHeader label="Framing" onBack={() => setPanel('root')} />
@@ -248,6 +270,24 @@ export function PlayerSettings({
               <IoChevronForward size={14} className="shrink-0" />
             </span>
           </button>
+          {audioOptions && audioOptions.length > 1 ? (
+            <>
+              <div className="border-t border-white/8" />
+              <button
+                type="button"
+                onClick={() => setPanel('audio')}
+                className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+              >
+                <span>Audio</span>
+                <span className="flex min-w-0 items-center gap-1 text-white/45">
+                  <span className="truncate">
+                    {audioOptions.find((option) => option.value === activeAudio)?.label ?? ''}
+                  </span>
+                  <IoChevronForward size={14} className="shrink-0" />
+                </span>
+              </button>
+            </>
+          ) : null}
           <div className="border-t border-white/8" />
           <button
             type="button"

@@ -547,6 +547,15 @@ export async function getSkipSegments(
 
 export type SessionPhase = 'resolving' | 'probing' | 'ready' | 'failed' | 'closed';
 
+/** One audio track in the playing file. `language` is ISO 639-1 when Core
+ *  recognises the tag ("ger" → "de"). */
+export interface SessionAudioTrack {
+  index: number;
+  codec?: string | null;
+  language?: string | null;
+  default: boolean;
+}
+
 export interface PlaybackSessionStatus {
   id: string;
   phase: SessionPhase;
@@ -569,6 +578,9 @@ export interface PlaybackSessionStatus {
     starvedSeconds?: number | null;
     restarts: number;
   };
+  /** The file's audio tracks and the one playing (older Cores omit both). */
+  audioTracks?: SessionAudioTrack[];
+  audioIndex?: number;
   timeline: {
     resolvedMs?: number;
     initializedMs?: number;
@@ -603,6 +615,8 @@ export async function createSession(
     fileIndex?: number | null;
     resumeSeconds?: number;
     hevc: boolean;
+    /** ISO 639-1 audio language to play: the original, or "en" for a dub. */
+    audioLanguage?: string | null;
   },
 ): Promise<PlaybackSessionStatus> {
   const response = await engineFetch(engine, '/v1/sessions', {

@@ -12,7 +12,8 @@ import { playbackKey } from './library';
 import { supportsHevcRemux } from './media-compatibility';
 import { loadSource, preferSource } from './source-affinity';
 import { fetchStreams } from './stream-cache';
-import { isAutomaticSource, rankStreams } from './stream-select';
+import { isAutomaticSource, rankStreams, type AudioTarget } from './stream-select';
+import { savedAudioTarget } from './audio-choice';
 
 /** One warm-up per title per window: page revisits and re-renders are free. */
 const PREFETCH_TTL_MS = 10 * 60_000;
@@ -24,6 +25,9 @@ export interface PrefetchTarget {
   imdbId: string | null;
   title: string;
   originalLanguage: string | null;
+  /** The audio the viewer chose (original or English dub); defaults to the
+   *  title's saved choice. */
+  audio?: AudioTarget;
   season?: number | null;
   episode?: number | null;
 }
@@ -35,8 +39,9 @@ export function rankForPlayback(
   found: Stream[],
   saved: Stream | null,
   connection: Pick<LocalEngineConnection, 'transcode'> | null,
-  target: Pick<PrefetchTarget, 'originalLanguage' | 'season' | 'episode'>,
+  target: Pick<PrefetchTarget, 'originalLanguage' | 'audio' | 'season' | 'episode'>,
 ): Stream[] {
+  const audio = target.audio === undefined ? target.originalLanguage : target.audio;
   const candidates = saved
     ? [
         saved,
@@ -50,11 +55,11 @@ export function rankForPlayback(
   const ranked = rankStreams(
     candidates,
     { transcode: connection?.transcode ?? false, hevc: supportsHevcRemux() },
-    target.originalLanguage,
+    audio,
     target.season != null && target.episode != null
       ? { season: target.season, episode: target.episode }
       : null,
-  ).filter((stream) => isAutomaticSource(stream, target.originalLanguage));
+  ).filter((stream) => isAutomaticSource(stream, audio));
   return preferSource(ranked, saved);
 }
 
@@ -74,7 +79,10 @@ export async function prefetchTitle(
     target.season ?? undefined,
     target.episode ?? undefined,
   ).catch(() => [] as Stream[]);
-  const choice = rankForPlayback(found, loadSource(key), connection, target)[0];
+  const audio = target.audio === undefined
+    ? savedAudioTarget(target.mediaType, target.mediaId, target.originalLanguage)
+    : target.audio;
+  const choice = rankForPlayback(found, loadSource(key), connection, { ...target, audio })[0];
   if (!choice) return;
   prefetchSource(connection, {
     magnet: buildMagnet(choice),

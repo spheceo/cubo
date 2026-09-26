@@ -26,7 +26,7 @@ use crate::mp4_index::{self, ByteMap};
 use crate::remuxer::{RemuxInput, RemuxStatus, Remuxer};
 use crate::segment_plan::SegmentPlan;
 use crate::store::CoreStore;
-use crate::transcode::{MediaProbe, TranscodeManager};
+use crate::transcode::{AudioTrack, MediaProbe, TranscodeManager};
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
@@ -61,6 +61,10 @@ pub struct CreateSessionRequest {
     /// Whether the browser can decode HEVC through MSE.
     #[serde(default)]
     pub hevc: bool,
+    /// The viewer's audio language (ISO 639-1): the title's original
+    /// language, or "en" for an English dub. Absent keeps the probe's pick.
+    #[serde(default)]
+    pub audio_language: Option<String>,
     /// Extra peers to connect to immediately (tests, local seeds).
     #[serde(default)]
     pub peers: Vec<SocketAddr>,
@@ -148,6 +152,8 @@ struct Inner {
     mode: Option<Mode>,
     duration: Option<f64>,
     remuxer: Option<Arc<Remuxer>>,
+    audio_tracks: Vec<AudioTrack>,
+    audio_index: Option<u32>,
     timeline: Timeline,
     last_seen: Instant,
     position: f64,
@@ -197,6 +203,11 @@ pub struct SessionStatus {
     pub torrent: Option<TorrentProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remux: Option<RemuxStatus>,
+    /// The file's audio tracks and the one playing, once ready.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio_tracks: Vec<AudioTrack>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_index: Option<u32>,
     pub timeline: Timeline,
 }
 
@@ -530,6 +541,8 @@ impl SessionManager {
                 mode: None,
                 duration: None,
                 remuxer: None,
+                audio_tracks: Vec::new(),
+                audio_index: None,
                 timeline: Timeline::default(),
                 last_seen: Instant::now(),
                 position: request.resume_seconds.unwrap_or(0.0).max(0.0),
@@ -636,17 +649,20 @@ impl SessionManager {
     }
 
     pub fn status(&self, session: &PlaybackSession) -> SessionStatus {
-        let (phase, failure, source, mode, duration, remuxer, timeline) = session.update(|inner| {
-            (
-                inner.phase,
-                inner.failure.clone(),
-                inner.source.clone(),
-                inner.mode,
-                inner.duration,
-                inner.remuxer.clone(),
-                inner.timeline.clone(),
-            )
-        });
+        let (phase, failure, source, mode, duration, remuxer, audio_tracks, audio_index, timeline) =
+            session.update(|inner| {
+                (
+                    inner.phase,
+                    inner.failure.clone(),
+                    inner.source.clone(),
+                    inner.mode,
+                    inner.duration,
+                    inner.remuxer.clone(),
+                    inner.audio_tracks.clone(),
+                    inner.audio_index,
+                    inner.timeline.clone(),
+                )
+            });
         let torrent = source.as_ref().map(|source| {
             let stats = source.handle.stats();
             let (download_mbps, peers) = stats
@@ -674,6 +690,8 @@ impl SessionManager {
             file_name: source.as_ref().map(|source| source.file_name.clone()),
             torrent,
             remux: remuxer.map(|remuxer| remuxer.status()),
+            audio_tracks,
+            audio_index,
             timeline,
         }
     }
@@ -755,6 +773,7 @@ impl SessionManager {
             .await;
         let probed = session.elapsed_ms();
         session.update(|inner| inner.timeline.probed_ms = Some(probed));
+        let probe = probe.with_audio_language(request.audio_language.as_deref());
 
         let mode = choose_mode(&probe, &source.file_name, request.hevc)?;
         let container_duration = index
@@ -827,6 +846,8 @@ impl SessionManager {
             inner.mode = Some(mode);
             inner.duration = duration;
             inner.remuxer = remuxer.clone();
+            inner.audio_tracks = probe.audio_tracks.clone();
+            inner.audio_index = probe.audio_stream_index;
             inner.phase = Phase::Ready;
             inner.timeline.ready_ms = Some(ready);
             false
@@ -844,6 +865,8 @@ impl SessionManager {
             file = %source.file_name,
             video = probe.video_codec.as_deref().unwrap_or("-"),
             audio = probe.audio_codec.as_deref().unwrap_or("-"),
+            audio_index = probe.audio_stream_index.map(i64::from).unwrap_or(-1),
+            audio_language = request.audio_language.as_deref().unwrap_or("-"),
             ready_ms = ready,
             "playback session ready"
         );
@@ -1310,7 +1333,11 @@ fn choose_mode(probe: &MediaProbe, file_name: &str, hevc_capable: bool) -> Resul
         "vp8" | "vp9" | "av1" => is_webm,
         _ => false,
     };
-    let direct_audio = matches!(audio, None | Some("aac" | "mp3" | "opus" | "vorbis"));
+    // A browser opening the file plays its first audio track; any other
+    // choice (the dub the viewer asked for, or the original behind it)
+    // needs the remux to map it.
+    let direct_audio =
+        matches!(audio, None | Some("aac" | "mp3" | "opus" | "vorbis")) && probe.audio_is_first();
     if direct_video && direct_audio {
         return Ok(Mode::Direct);
     }
@@ -1403,6 +1430,7 @@ mod tests {
             video_codec: Some(video.into()),
             audio_codec: Some(audio.into()),
             audio_stream_index: Some(1),
+            audio_tracks: vec![],
             duration_seconds: Some(100.0),
             format_name: Some(format.into()),
             chapters: vec![],
@@ -1424,6 +1452,19 @@ mod tests {
     fn mp4_with_browser_codecs_plays_directly() {
         let mode = choose_mode(&probe("h264", "aac", "mov,mp4,m4a,3gp,3g2,mj2"), "a.mp4", false).unwrap();
         assert_eq!(mode, Mode::Direct);
+    }
+
+    #[test]
+    fn mp4_playing_its_second_audio_track_is_remuxed() {
+        let mut dual = probe("h264", "aac", "mov,mp4,m4a,3gp,3g2,mj2");
+        dual.audio_tracks = vec![
+            AudioTrack { index: 1, codec: Some("aac".into()), language: Some("de".into()), default: true },
+            AudioTrack { index: 2, codec: Some("aac".into()), language: Some("en".into()), default: false },
+        ];
+        let original = dual.clone().with_audio_language(Some("de"));
+        assert_eq!(choose_mode(&original, "a.mp4", false).unwrap(), Mode::Direct);
+        let dub = dual.with_audio_language(Some("en"));
+        assert_eq!(choose_mode(&dub, "a.mp4", false).unwrap(), Mode::Hls);
     }
 
     #[test]

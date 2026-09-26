@@ -189,6 +189,20 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   if the bitrate were constant, minutes away from the playhead. The bar
   draws only the watchable span from the playhead to the first missing
   piece (`lib/download-bar.ts`); raw torrent ranges are islands.
+- Titles not made in English ask once per title, before the first play,
+  whether to watch the original (with English subtitles, the default) or
+  an English dub. The prompt only appears when an English-audio source
+  exists (`lib/audio-choice.ts`). The choice drives ranking (dub mode
+  prefers named English audio such as "GER-ENG", then 🇬🇧 flags that
+  subtitles don't explain, then unlabelled DUAL/MULTI releases) and is
+  sent to Core as `audioLanguage`. Core plays that track, or falls back to
+  the default track (never the English preference) when the file lacks it.
+  In dub mode, a ready file without English is held back while the other
+  sources race. It only plays, with a notice, if none of them has English,
+  and it is never remembered as that episode's source. MP4s whose chosen
+  track is not the first audio track are remuxed. The player's settings
+  menu switches audio: the same file restarts when it has both tracks,
+  otherwise sources are re-ranked and raced from the current position.
 - Foreign-script titles (Cyrillic, CJK, …) and Russian voice-over studios
   are dubs for other-language originals unless the release says it carries
   the original track; Chinese burned-in caption markers (中英双字 …) are
