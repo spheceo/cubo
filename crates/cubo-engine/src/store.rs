@@ -362,6 +362,15 @@ impl CoreStore {
         Ok(snapshot)
     }
 
+    pub async fn reset_cache_directory(&self) -> Result<CoreData, String> {
+        let _writer = self.persist_lock.lock().await;
+        let mut data = self.data.lock().await;
+        data.cache.directory = None;
+        let snapshot = data.clone();
+        self.persist_locked(data).await?;
+        Ok(snapshot)
+    }
+
     pub async fn touch_cache(
         &self,
         torrent_id: Option<u64>,
@@ -419,7 +428,10 @@ impl CoreStore {
         let _writer = self.persist_lock.lock().await;
         let mut data = self.data.lock().await;
         data.cache_entries.retain(|entry| {
-            entry.files.iter().any(|file| std::path::Path::new(file).exists())
+            entry
+                .files
+                .iter()
+                .any(|file| std::path::Path::new(file).exists())
         });
         for entry in data.cache_entries.iter_mut() {
             entry.torrent_id = None;

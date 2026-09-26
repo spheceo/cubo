@@ -21,6 +21,7 @@ import {
   normalizeCoreEndpoint,
   pairWithCore,
   PairingRequiredError,
+  resetCacheDirectory,
   updateCacheDirectory,
   updateCacheLimit,
   type LocalEngineConnection,
@@ -475,6 +476,7 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
   const [busy, setBusy] = useState(false);
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [confirmingDirectory, setConfirmingDirectory] = useState(false);
+  const [confirmingResetDirectory, setConfirmingResetDirectory] = useState(false);
   const [pickingDirectory, setPickingDirectory] = useState(false);
   const [directoryDraft, setDirectoryDraft] = useState('');
   const [directoryError, setDirectoryError] = useState<string | null>(null);
@@ -541,6 +543,21 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
     } catch (caught) {
       setDirectoryError(
         caught instanceof Error ? caught.message : 'Could not change the cache folder',
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetDirectory() {
+    setBusy(true);
+    setDirectoryError(null);
+    try {
+      await resetCacheDirectory(connection);
+      await loadCache();
+    } catch (caught) {
+      setDirectoryError(
+        caught instanceof Error ? caught.message : 'Could not reset the cache folder',
       );
     } finally {
       setBusy(false);
@@ -614,6 +631,19 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
             >
               Change folder
             </button>
+            {cache && cache.directory !== cache.defaultDirectory ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setDirectoryError(null);
+                  setConfirmingResetDirectory(true);
+                }}
+                className="inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full bg-control px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-35"
+              >
+                Reset to default
+              </button>
+            ) : null}
           </div>
           {directoryError ? (
             <p className="mt-2 text-sm text-white/70">{directoryError}</p>
@@ -710,6 +740,19 @@ function StorageSection({ connection }: { connection: LocalEngineConnection }) {
           onConfirm={() => {
             setConfirmingDirectory(false);
             void changeDirectory();
+          }}
+        />
+      ) : null}
+
+      {confirmingResetDirectory ? (
+        <ConfirmDialog
+          title="Reset the cache folder?"
+          description={`Everything currently cached will be deleted, then new downloads will go to ${cache?.defaultDirectory ?? 'the default folder'}.`}
+          confirmLabel="Clear and reset"
+          onCancel={() => setConfirmingResetDirectory(false)}
+          onConfirm={() => {
+            setConfirmingResetDirectory(false);
+            void resetDirectory();
           }}
         />
       ) : null}

@@ -34,12 +34,12 @@ use crate::cache;
 use crate::pairing::{PairAttempt, PairingManager};
 use crate::paths::home_dir;
 use crate::remuxer::RemuxError;
-use crate::session::{CreateSessionRequest, Mode as SessionMode, Phase as SessionPhase, SessionManager};
+use crate::session::{
+    CreateSessionRequest, Mode as SessionMode, Phase as SessionPhase, SessionManager,
+};
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
 use crate::system;
-use crate::transcode::{
-    chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager,
-};
+use crate::transcode::{chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager};
 use crate::update::UpdateManager;
 
 const CORE_PORT: u16 = 8765;
@@ -82,6 +82,7 @@ struct BridgeState {
     allowed_hosts: Arc<StdRwLock<Vec<String>>>,
     bridge_port: u16,
     download_dir: Arc<RwLock<PathBuf>>,
+    default_download_dir: PathBuf,
     cache_swap: Arc<RwLock<()>>,
     /// True while the cache volume has no more than 1 GiB free. The web UI
     /// reads this from /v1/cache and shows a banner; maintenance pauses
@@ -164,7 +165,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                     "configured cache folder holds files Cubo did not create; using the default cache folder"
                 );
                 tokio::fs::create_dir_all(&default_dir).await.map_err(|e| e.to_string())?;
-                download_dir = default_dir;
+                download_dir = default_dir.clone();
             }
             // Downloads survive restarts: sessions re-add a source from its
             // saved metadata and rqbit's saved piece records, so a title
@@ -236,6 +237,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 allowed_hosts: allowed_hosts.clone(),
                 bridge_port,
                 download_dir: download_dir.clone(),
+                default_download_dir: default_dir,
                 cache_swap: Arc::new(RwLock::new(())),
                 disk_pressure: Arc::new(AtomicBool::new(false)),
                 store,
@@ -711,7 +713,10 @@ fn bridge_router(state: BridgeState) -> Router {
         )
         .route("/v1/sessions", post(create_session))
         .route("/v1/prefetch", post(prefetch_source))
-        .route("/v1/sessions/{id}", get(session_status).delete(close_session))
+        .route(
+            "/v1/sessions/{id}",
+            get(session_status).delete(close_session),
+        )
         .route("/v1/sessions/{id}/heartbeat", post(session_heartbeat))
         .route("/v1/sessions/{id}/close", post(close_session_beacon))
         .route("/v1/sessions/{id}/stream", get(session_stream))
@@ -726,7 +731,10 @@ fn bridge_router(state: BridgeState) -> Router {
         )
         .route("/v1/cache", get(cache_status).delete(clear_cache))
         .route("/v1/cache/settings", put(update_cache_settings))
-        .route("/v1/cache/directory", put(update_cache_directory))
+        .route(
+            "/v1/cache/directory",
+            put(update_cache_directory).delete(reset_cache_directory),
+        )
         .route("/v1/cache/{id}", axum::routing::delete(delete_cache_item))
         .route("/v1/client-log", post(client_log))
         .route("/v1/update", get(update_status).post(download_update))
@@ -1157,6 +1165,62 @@ async fn update_cache_directory(
     }
 }
 
+async fn reset_cache_directory(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !is_authorized(&state, &headers) {
+        return unauthorized();
+    }
+
+    let _swap = state.cache_swap.write().await;
+    if state.is_playback_active() {
+        return bridge_error(
+            StatusCode::CONFLICT,
+            "Pause playback before changing the cache folder.".into(),
+        );
+    }
+
+    let old_dir = state.current_download_dir().await;
+    let default_dir = &state.default_download_dir;
+    if !paths_match(&old_dir, default_dir) {
+        if let Err(error) = std::fs::create_dir_all(default_dir) {
+            return bridge_error(StatusCode::BAD_REQUEST, error.to_string());
+        }
+        match cache_dir_is_claimed(default_dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                return bridge_error(
+                    StatusCode::BAD_REQUEST,
+                    "The default cache folder contains files Cubo does not own.".into(),
+                )
+            }
+            Err(error) => return bridge_error(StatusCode::BAD_REQUEST, error),
+        }
+        if let Err(error) = empty_cache(&state, &old_dir).await {
+            return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+        let default_path = default_dir.clone();
+        match tokio::task::spawn_blocking(move || wipe_dir_contents(&default_path)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            Err(error) => {
+                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            }
+        }
+    }
+
+    match state.store.reset_cache_directory().await {
+        Ok(snapshot) => {
+            let _ = std::fs::write(default_dir.join(CACHE_CLAIM), b"");
+            *state.download_dir.write().await = default_dir.clone();
+            Json(json!({
+                "maxBytes": snapshot.cache.max_bytes,
+                "directory": default_dir.to_string_lossy(),
+            }))
+            .into_response()
+        }
+        Err(error) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
 async fn cache_status(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
     if !is_authorized(&state, &headers) {
         return unauthorized();
@@ -1171,6 +1235,7 @@ async fn cache_status(State(state): State<BridgeState>, headers: HeaderMap) -> R
             "usedBytes": used_bytes,
             "maxBytes": snapshot.cache.max_bytes,
             "directory": download_dir.to_string_lossy(),
+            "defaultDirectory": state.default_download_dir.to_string_lossy(),
             "itemCount": snapshot.cache_entries.len(),
             "entries": snapshot.cache_entries,
             "diskFreeBytes": free_bytes,
@@ -2049,7 +2114,12 @@ async fn fill_remote_skip_segments(
                 url.push_str(&format!("&season={season}&episode={episode}"));
             }
         }
-        if let Ok(response) = client.get(&url).timeout(Duration::from_secs(8)).send().await {
+        if let Ok(response) = client
+            .get(&url)
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+        {
             if let Ok(body) = response.json::<serde_json::Value>().await {
                 for (key, kind, label) in [
                     ("intro", "intro", "Intro"),
@@ -2094,7 +2164,12 @@ async fn fill_remote_skip_segments(
     } else {
         url.push_str("&is_movie=true");
     }
-    if let Ok(response) = client.get(&url).timeout(Duration::from_secs(8)).send().await {
+    if let Ok(response) = client
+        .get(&url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
         if let Ok(body) = response.json::<serde_json::Value>().await {
             for (key, kind, label) in [
                 ("intro", "intro", "Intro"),
@@ -2401,7 +2476,10 @@ async fn session_stream(
         return bridge_error(StatusCode::NOT_FOUND, "playback session not found".into());
     };
     if session.mode() != Some(SessionMode::Direct) {
-        return bridge_error(StatusCode::CONFLICT, "this session does not play directly".into());
+        return bridge_error(
+            StatusCode::CONFLICT,
+            "this session does not play directly".into(),
+        );
     }
     let Some(url) = state.sessions.source_stream_url(&session) else {
         return bridge_error(StatusCode::CONFLICT, "playback session is not ready".into());
@@ -2489,7 +2567,10 @@ async fn session_hls(
         Ok(bytes) => (
             [
                 (CONTENT_TYPE, "video/mp4"),
-                (HeaderName::from_static("cache-control"), "private, max-age=600"),
+                (
+                    HeaderName::from_static("cache-control"),
+                    "private, max-age=600",
+                ),
             ],
             bytes,
         )
@@ -2871,7 +2952,12 @@ mod tests {
         let pairing = Arc::new(PairingManager::load(&test_dir).expect("load test pairing manager"));
         let pairing_dir = test_dir.clone();
         let transcode = Arc::new(TranscodeManager::new());
-        let sessions = crate::session::SessionManager::for_tests(&pairing_dir, transcode.clone(), store.clone()).await;
+        let sessions = crate::session::SessionManager::for_tests(
+            &pairing_dir,
+            transcode.clone(),
+            store.clone(),
+        )
+        .await;
         let state = BridgeState {
             rqbit_port: 1,
             token: "test-session-token".into(),
@@ -2879,7 +2965,8 @@ mod tests {
             web_origin: Some(format!("http://127.0.0.1:{web_port}").into()),
             allowed_hosts: Arc::new(StdRwLock::new(vec!["kenobi.test".into()])),
             bridge_port: port,
-            download_dir: Arc::new(RwLock::new(test_dir)),
+            download_dir: Arc::new(RwLock::new(test_dir.clone())),
+            default_download_dir: test_dir,
             cache_swap: Arc::new(RwLock::new(())),
             disk_pressure: Arc::new(AtomicBool::new(false)),
             store,
@@ -3137,6 +3224,7 @@ pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64
         allowed_hosts: Arc::new(StdRwLock::new(vec![])),
         bridge_port,
         download_dir: download_lock,
+        default_download_dir: download_dir,
         cache_swap: Arc::new(RwLock::new(())),
         disk_pressure: Arc::new(AtomicBool::new(false)),
         store: store.clone(),
@@ -3150,9 +3238,12 @@ pub(crate) async fn spawn_test_core(root: &std::path::Path, cache_max_bytes: u64
     tokio::spawn(async move { cache_maintenance_loop(maintenance).await });
     let router = bridge_router(state);
     tokio::spawn(async move {
-        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     TestCore {
         base_url: format!("http://127.0.0.1:{bridge_port}"),

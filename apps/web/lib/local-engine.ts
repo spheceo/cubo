@@ -114,6 +114,7 @@ export interface CacheStatus {
   usedBytes: number;
   maxBytes: number;
   directory: string;
+  defaultDirectory: string;
   itemCount: number;
   entries: CacheEntry[];
   diskFreeBytes?: number;
@@ -867,6 +868,13 @@ export async function updateCacheDirectory(
   });
   if (!response.ok) {
     throw new Error(await readEngineError(response, 'Could not change the cache folder'));
+  }
+}
+
+export async function resetCacheDirectory(engine: LocalEngineConnection): Promise<void> {
+  const response = await engineFetch(engine, '/v1/cache/directory', { method: 'DELETE' });
+  if (!response.ok) {
+    throw new Error(await readEngineError(response, 'Could not reset the cache folder'));
   }
 }
 

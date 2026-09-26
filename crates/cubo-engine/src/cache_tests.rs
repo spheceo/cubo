@@ -16,6 +16,50 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
     path
 }
 
+#[tokio::test]
+async fn reset_cache_directory_returns_to_default_and_clears_override() {
+    let root = temp_dir("reset-directory");
+    let custom = root.join("custom");
+    fs::create_dir_all(&custom).unwrap();
+    let core = spawn_test_core(&root, 10 * 1024 * 1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let directory_url = format!("{}/v1/cache/directory", core.base_url);
+
+    let changed = client
+        .put(&directory_url)
+        .bearer_auth(&core.token)
+        .json(&json!({ "directory": custom }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+    fs::write(custom.join("cached.mp4"), b"cached").unwrap();
+
+    let reset = client
+        .delete(&directory_url)
+        .bearer_auth(&core.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    let status: serde_json::Value = client
+        .get(format!("{}/v1/cache", core.base_url))
+        .bearer_auth(&core.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expected = root.join("downloads").to_string_lossy().into_owned();
+    assert_eq!(status["directory"], expected);
+    assert_eq!(status["defaultDirectory"], expected);
+    assert!(!custom.join("cached.mp4").exists());
+    let store = CoreStore::load(root.join("cubo-state.json")).await.unwrap();
+    assert!(store.cache_snapshot().await.cache.directory.is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn wipe_dir_contents_removes_nested_cache_files() {
     let root = temp_dir("wipe");
@@ -156,7 +200,8 @@ async fn fixture_state(
     let piece_state = root.join("piece-state");
     fs::create_dir_all(&piece_state).unwrap();
     fs::write(piece_state.join("fixture.bitv"), b"pieces").unwrap();
-    let sessions = crate::session::SessionManager::for_tests(root, transcode.clone(), store.clone()).await;
+    let sessions =
+        crate::session::SessionManager::for_tests(root, transcode.clone(), store.clone()).await;
     let state = BridgeState {
         rqbit_port,
         token: "fixture-token".into(),
@@ -164,7 +209,8 @@ async fn fixture_state(
         web_origin: None,
         allowed_hosts: Arc::new(StdRwLock::new(vec![])),
         bridge_port: 0,
-        download_dir: Arc::new(RwLock::new(downloads)),
+        download_dir: Arc::new(RwLock::new(downloads.clone())),
+        default_download_dir: downloads,
         cache_swap: Arc::new(RwLock::new(())),
         disk_pressure: Arc::new(AtomicBool::new(false)),
         store,
@@ -182,19 +228,9 @@ async fn clear_removes_downloads_and_piece_records_before_forgetting_entries() {
     let root = temp_dir("clear-all");
     let (state, server) = fixture_state(&root, false).await;
     let downloads = state.current_download_dir().await;
-    assert!(
-        cache_size(downloads.clone())
-            .await
-            .unwrap()
-            > 0
-    );
+    assert!(cache_size(downloads.clone()).await.unwrap() > 0);
     empty_cache(&state, &downloads).await.unwrap();
-    assert_eq!(
-        cache_size(downloads)
-            .await
-            .unwrap(),
-        0
-    );
+    assert_eq!(cache_size(downloads).await.unwrap(), 0);
     assert!(state.store.cache_snapshot().await.cache_entries.is_empty());
     assert!(!root.join("piece-state").exists());
     assert!(root.join("state.json").exists());
