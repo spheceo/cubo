@@ -1599,10 +1599,9 @@ fn cache_entry_id(entry: &store::CacheEntry) -> String {
         .unwrap_or_else(|| entry.info_hash.clone())
 }
 
-/// Which torrents may download. While a session plays, its torrent gets the
-/// bandwidth and everything else pauses; with nothing playing, cached titles
-/// finish in the background. Prefetch warm-ups stay parked, and everything
-/// pauses when the disk is nearly full.
+/// Only playback sessions and prefetch warm-ups may transfer. Cached torrents
+/// pause when idle, so they cannot keep downloading or uploading in the
+/// background. Everything pauses when the disk is nearly full.
 async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     let torrents = rqbit_list_torrents(state).await?;
     let download_dir = state.current_download_dir().await;
@@ -1614,14 +1613,8 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
         );
     }
     let live = state.sessions.live_torrent_ids();
-    let sessions_active = !live.is_empty();
-    // A prefetch's warm-up stays parked until someone actually plays it.
-    let parked = state.sessions.parked_torrent_ids();
     for torrent in torrents {
-        if critical
-            || (sessions_active && !live.contains(&torrent))
-            || (parked.contains(&torrent) && !live.contains(&torrent))
-        {
+        if critical || !live.contains(&torrent) {
             let _ = rqbit_pause(state, &torrent).await;
         } else {
             let _ = rqbit_start(state, &torrent).await;
