@@ -220,7 +220,7 @@ function WeekView({ byDay, today }: { byDay: Map<string, ScheduleEntry[]>; today
               <div className="mt-3 space-y-4">
                 {items.map((entry) => (
                   <Link key={entry.key} href={titleHref({ id: entry.showId, mediaType: 'tv' })} className="group block">
-                    <div className="aspect-video overflow-hidden rounded-lg bg-surface">
+                    <div className="relative aspect-video overflow-hidden rounded-lg bg-surface">
                       {entry.backdropPath ? (
                         <img
                           src={backdropUrl(entry.backdropPath, 'w780')}
@@ -229,9 +229,13 @@ function WeekView({ byDay, today }: { byDay: Map<string, ScheduleEntry[]>; today
                           className="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                         />
                       ) : null}
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/55 transition-colors group-hover:bg-black/45">
+                        <span className="text-3xl font-bold tracking-tight text-white xl:text-4xl">
+                          {episodeCode(entry)}
+                        </span>
+                      </div>
                     </div>
                     <p className="mt-2 truncate text-sm font-medium">{entry.title}</p>
-                    <p className="truncate text-xs text-faint">{episodeCode(entry)}</p>
                   </Link>
                 ))}
               </div>
