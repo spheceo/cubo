@@ -48,6 +48,8 @@ export function PlayerSettings({
   onPickCaptionColor,
   framing = 'fit',
   onPickFraming,
+  autoSkipIntro = true,
+  onToggleAutoSkipIntro,
   sectionsVisible = true,
   onToggleSections,
   sectionColors,
@@ -65,6 +67,9 @@ export function PlayerSettings({
   onPickCaptionColor: (color: CaptionColor) => void;
   framing?: FramingMode;
   onPickFraming?: (mode: FramingMode) => void;
+  /** Whether detected intros skip themselves from a show's second episode. */
+  autoSkipIntro?: boolean;
+  onToggleAutoSkipIntro?: (enabled: boolean) => void;
   /** Whether intro/credits/etc. bands are drawn on the timeline. Detection
    *  and skip actions keep working either way — this is purely display. */
   sectionsVisible?: boolean;
@@ -270,6 +275,32 @@ export function PlayerSettings({
               <IoChevronForward size={14} className="shrink-0" />
             </span>
           </button>
+          {onToggleAutoSkipIntro ? (
+            <>
+              <div className="border-t border-white/8" />
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoSkipIntro}
+                onClick={() => onToggleAutoSkipIntro(!autoSkipIntro)}
+                className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+              >
+                <span>Auto-skip intro</span>
+                <span
+                  aria-hidden
+                  className={`relative inline-flex h-4.5 w-8 shrink-0 items-center rounded-full transition-colors ${
+                    autoSkipIntro ? 'bg-white' : 'bg-white/20'
+                  }`}
+                >
+                  <span
+                    className={`absolute size-3.5 rounded-full transition-[left,background-color] ${
+                      autoSkipIntro ? 'left-4 bg-black' : 'left-0.5 bg-white/80'
+                    }`}
+                  />
+                </span>
+              </button>
+            </>
+          ) : null}
           {audioOptions && audioOptions.length > 1 ? (
             <>
               <div className="border-t border-white/8" />

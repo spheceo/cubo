@@ -5,8 +5,6 @@ import {
   IoExpand,
   IoPause,
   IoPlay,
-  IoPlayBack,
-  IoPlayForward,
   IoPlaySkipForward,
   IoSettingsSharp,
   IoVolumeHigh,
@@ -28,6 +26,7 @@ import {
   type FramingMode,
 } from '@/lib/framing-prefs';
 import { cancelAutoplayUnmute, playInBackground } from '@/lib/background-playback';
+import { loadAutoSkipIntroPref, saveAutoSkipIntroPref } from '@/lib/intro-skip-prefs';
 import {
   loadSectionPrefs,
   saveSectionPrefs,
@@ -49,6 +48,8 @@ const HIDE_DELAY_MS = 2600;
 const SKIP_SECONDS = 10;
 /** Seconds the Next episode fill takes to complete before auto-advancing. */
 const AUTO_NEXT_MS = 6_000;
+/** Seconds the Skip intro fill takes to complete before auto-skipping. */
+const AUTO_SKIP_INTRO_MS = 4_000;
 
 export type BufferedRange = {
   start: number;
@@ -100,6 +101,7 @@ export function VideoPlayer({
   flushRef,
   topRightControls,
   introWindow,
+  introAutoSkipEligible = false,
   creditsWindow,
   onNextEpisode,
   onCreditsReached,
@@ -113,6 +115,9 @@ export function VideoPlayer({
   /** Detected intro window in absolute source seconds. A Skip intro button
    *  shows while the playhead is inside it; `end` null means unbounded. */
   introWindow?: { start: number; end: number | null } | null;
+  /** True from a show's second episode on: the viewer's auto-skip pref may
+   *  then skip the intro on its own, once per episode. */
+  introAutoSkipEligible?: boolean;
   /** Detected credits/outro window in absolute source seconds. */
   creditsWindow?: { start: number; end: number | null } | null;
   /** Offered during the credits window when a follow-up episode exists;
@@ -227,6 +232,13 @@ export function VideoPlayer({
       saveSectionPrefs(next);
       return next;
     });
+  }, []);
+
+  // Auto-skipping intros is a viewer pref like framing.
+  const [autoSkipIntro, setAutoSkipIntro] = useState(() => loadAutoSkipIntroPref());
+  const toggleAutoSkipIntro = useCallback((enabled: boolean) => {
+    setAutoSkipIntro(enabled);
+    saveAutoSkipIntroPref(enabled);
   }, []);
 
   const goBack = useCallback(() => {
@@ -742,7 +754,14 @@ export function VideoPlayer({
     if (inIntro && controlsVisible) setIntroControlsSeen(true);
     if (!inIntro) setIntroControlsSeen(false);
   }, [inIntro, controlsVisible]);
-  const showIntroSkip = inIntro && (controlsVisible || !introControlsSeen);
+  // From episode 2 on, the skipper counts down and skips by itself, the
+  // same fill sweep as Next episode. It runs once per intro window: after
+  // an auto-skip or a Watch intro, rewinding into it only offers the button.
+  const introKey = introWindow ? `${introWindow.start}-${introWindow.end}` : null;
+  const [introAutoHandled, setIntroAutoHandled] = useState<string | null>(null);
+  const introAutoActive =
+    inIntro && introAutoSkipEligible && autoSkipIntro && introAutoHandled !== introKey;
+  const showIntroSkip = inIntro && (introAutoActive || controlsVisible || !introControlsSeen);
 
   // The credits window is a takeover: the skip elements own the frame and
   // the chrome cannot be raised until the viewer picks Watch credits (or
@@ -955,6 +974,37 @@ export function VideoPlayer({
     seekToAbsolute(Math.max(0, Math.min(fullDuration || Infinity, head + seconds)));
     revealControls();
   }, [resolveDuration, revealControls, seekToAbsolute]);
+
+  const skipIntro = useCallback(() => {
+    const end = introWindow?.end;
+    setIntroAutoHandled(introKey);
+    if (end != null) seekToAbsolute(end);
+  }, [introWindow, introKey, seekToAbsolute]);
+
+  const introFillRef = useRef<HTMLSpanElement | null>(null);
+  const introFillPos = useRef(0);
+  useEffect(() => {
+    if (introAutoActive) return;
+    introFillPos.current = 0;
+    if (introFillRef.current) introFillRef.current.style.transform = 'scaleX(0)';
+  }, [introAutoActive]);
+  useEffect(() => {
+    if (!introAutoActive || !playing) return;
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      introFillPos.current = Math.min(1, introFillPos.current + (now - last) / AUTO_SKIP_INTRO_MS);
+      last = now;
+      if (introFillRef.current) introFillRef.current.style.transform = `scaleX(${introFillPos.current})`;
+      if (introFillPos.current >= 1) {
+        skipIntro();
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [introAutoActive, playing, skipIntro]);
 
   const focusPlayer = useCallback(() => {
     const active = document.activeElement;
@@ -1268,7 +1318,7 @@ export function VideoPlayer({
           chrome down until a choice is made. */}
       {inIntro && introWindow?.end != null ? (
         <div
-          className={`absolute right-4 z-20 transition-[bottom,opacity] duration-300 sm:right-6 ${
+          className={`absolute right-4 z-20 flex items-center gap-3 transition-[bottom,opacity] duration-300 sm:right-6 ${
             showIntroSkip
               ? controlsVisible
                 ? 'bottom-24'
@@ -1276,16 +1326,32 @@ export function VideoPlayer({
               : 'pointer-events-none bottom-6 opacity-0'
           }`}
         >
+          {introAutoActive ? (
+            <button
+              type="button"
+              onClick={() => setIntroAutoHandled(introKey)}
+              className="cursor-pointer rounded-full border border-white/30 bg-black/60 px-3.5 py-2 text-[0.8rem] font-medium text-white/90 backdrop-blur-md transition-colors hover:border-white/50 hover:text-white"
+            >
+              Watch intro
+            </button>
+          ) : null}
           <button
             type="button"
-            onClick={() => {
-              const end = introWindow?.end;
-              if (end != null) seekToAbsolute(end);
-            }}
-            className="flex cursor-pointer items-center gap-2 rounded-full bg-white px-4 py-2 text-[0.8rem] font-medium text-black transition-colors hover:bg-white/85"
+            onClick={skipIntro}
+            className={`relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full px-4 py-2 text-[0.8rem] font-medium text-black transition-colors ${
+              introAutoActive ? 'bg-white/70' : 'bg-white hover:bg-white/85'
+            }`}
           >
-            Skip intro
-            <IoPlaySkipForward size={15} aria-hidden />
+            {introAutoActive ? (
+              <span
+                aria-hidden
+                ref={introFillRef}
+                className="absolute inset-0 origin-left bg-white"
+                style={{ transform: 'scaleX(0)' }}
+              />
+            ) : null}
+            <span className="relative">Skip intro</span>
+            <IoPlaySkipForward size={15} className="relative" aria-hidden />
           </button>
         </div>
       ) : null}
@@ -1525,10 +1591,10 @@ export function VideoPlayer({
           </ControlButton>
 
           <ControlButton label="Back 10 seconds" onClick={() => seekBy(-SKIP_SECONDS)}>
-            <IoPlayBack size={21} />
+            <SeekIcon direction="back" />
           </ControlButton>
           <ControlButton label="Forward 10 seconds" onClick={() => seekBy(SKIP_SECONDS)}>
-            <IoPlayForward size={21} />
+            <SeekIcon direction="forward" />
           </ControlButton>
 
           <div className="group/vol flex items-center gap-2">
@@ -1595,6 +1661,8 @@ export function VideoPlayer({
                   onPickCaptionColor={onPickCaptionColor}
                   framing={framing}
                   onPickFraming={pickFraming}
+                  autoSkipIntro={autoSkipIntro}
+                  onToggleAutoSkipIntro={toggleAutoSkipIntro}
                   sectionsVisible={showSections}
                   onToggleSections={toggleSections}
                   sectionColors={sectionColors}
@@ -1658,6 +1726,42 @@ export function VideoPlayer({
         </div>
       ) : null}
     </div>
+  );
+}
+
+/** Circular arrow with the jump length inside — reads as "10 seconds back"
+ *  or "forward" at a glance, unlike media-track skip glyphs. */
+function SeekIcon({ direction }: { direction: 'back' | 'forward' }) {
+  const back = direction === 'back';
+  return (
+    <svg width={22} height={22} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <g transform={back ? undefined : 'matrix(-1 0 0 1 24 0)'}>
+        <path
+          d="M4.6 9.2A8.25 8.25 0 1 1 3.75 12.75"
+          stroke="currentColor"
+          strokeWidth={1.9}
+          strokeLinecap="round"
+        />
+        <path
+          d="M4.1 4.6 4.6 9.2 9.1 8.4"
+          stroke="currentColor"
+          strokeWidth={1.9}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </g>
+      <text
+        x={12}
+        y={15.6}
+        textAnchor="middle"
+        fontSize={9.5}
+        fontWeight={700}
+        fill="currentColor"
+        style={{ fontFamily: 'inherit', letterSpacing: '-0.04em' }}
+      >
+        {SKIP_SECONDS}
+      </text>
+    </svg>
   );
 }
 

@@ -24,6 +24,7 @@ import { Dropdown } from '@/components/dropdown';
 import { EpisodeRow } from '@/components/episode-list';
 import { apiUrl } from '@/lib/api';
 import { isUpcomingAirDate } from '@/lib/air-date';
+import { introAutoSkipEligible } from '@/lib/intro-skip-prefs';
 import { queryClient, streamQueries, tmdbQueries } from '@/lib/queries';
 import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
@@ -1462,6 +1463,7 @@ export function WatchScreen({
           }}
           flushRef={playerFlushRef}
           introWindow={skipSegments?.intro ?? null}
+          introAutoSkipEligible={introAutoSkipEligible(mediaType, episode)}
           creditsWindow={skipSegments?.credits ?? null}
           onNextEpisode={nextEpisode ? goToNextEpisode : undefined}
           onCreditsReached={markDoneAtCredits}

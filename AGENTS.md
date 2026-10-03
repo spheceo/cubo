@@ -208,6 +208,16 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   the original track; Chinese burned-in caption markers (中英双字 …) are
   hardsubs. A 🇬🇧 flag beside other flags proves nothing.
 
+- From a show's second episode on, detected intros skip themselves after a
+  short countdown on the Skip intro button (Watch intro cancels), once per
+  intro window. The player settings toggle "Auto-skip intro" turns it off;
+  episode 1 always plays its intro.
+- Air-date labels past tomorrow always carry the date ("Airs Fri, Oct 9"):
+  a bare weekday reads as the past when that day already went by this week.
+- The Library schedule (`release-schedule.tsx`) covers every TV show in the
+  history, not just Continue Watching, built from the cached TMDB details
+  and next-episode season queries. Keep it to Week / Month / List views.
+
 - Featured heroes rotate across eligible catalog titles (last decade only),
   using recent history shared across Home, Movies, and TV. Each page holds
   its choice for several hours across refreshes; never revert to always

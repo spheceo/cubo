@@ -3,6 +3,7 @@ import { MediaCard } from '@cubo/ui';
 import { useEffect } from 'react';
 import { ContinueWatching } from '@/components/continue-watching';
 import { Link } from '@/components/link';
+import { ReleaseSchedule } from '@/components/release-schedule';
 import { asMediaSummary } from '@/lib/format';
 import { watchHistoryItems } from '@/lib/library';
 import { useCacheStatus } from '@/lib/use-cache-status';
@@ -62,6 +63,7 @@ export function LibraryScreen() {
       </header>
 
       <ContinueWatching className="" />
+      <ReleaseSchedule history={history} />
       <SavedGrid title="Watch Later" items={watchLater} />
       <HistoryGrid items={watchHistoryItems(history)} />
 

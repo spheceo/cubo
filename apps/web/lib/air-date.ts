@@ -19,21 +19,39 @@ export function isUpcomingAirDate(airDate: string): boolean {
   return parsed.getTime() >= startOfToday().getTime();
 }
 
-/** "Airs Today", "Airs Tomorrow", "Airs Tuesday", or "Airs Aug 26". */
+/** Whole calendar days from today to `date` (negative in the past). */
+export function daysFromToday(date: Date): number {
+  return Math.round((date.getTime() - startOfToday().getTime()) / 86_400_000);
+}
+
+/** "Oct 9", or "Oct 9, 2027" outside the current year. */
+function formatShortDate(date: Date): string {
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return date.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(sameYear ? {} : { year: 'numeric' }),
+  });
+}
+
+/** "Airs Today", "Airs Tomorrow", "Airs Fri, Oct 9", or "Airs Oct 16".
+ *  A bare weekday is ambiguous — on a Saturday, "Friday" reads as
+ *  yesterday — so anything past tomorrow carries its date. */
 export function formatAirsLabel(airDate: string): string | null {
   const parsed = parseCalendarDate(airDate);
   if (!parsed) return null;
-  const diffDays = Math.round((parsed.getTime() - startOfToday().getTime()) / 86_400_000);
+  const diffDays = daysFromToday(parsed);
   if (diffDays < 0) return null;
   if (diffDays === 0) return 'Airs Today';
   if (diffDays === 1) return 'Airs Tomorrow';
   if (diffDays < 7) {
-    return `Airs ${parsed.toLocaleDateString(undefined, { weekday: 'long' })}`;
+    const weekday = parsed.toLocaleDateString(undefined, { weekday: 'short' });
+    return `Airs ${weekday}, ${formatShortDate(parsed)}`;
   }
-  return `Airs ${parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
+  return `Airs ${formatShortDate(parsed)}`;
 }
 
-/** Season 1: "E2 Airs Sunday". Later seasons: "S2 E2 Airs Sunday". */
+/** Season 1: "E2 Airs Fri, Oct 9". Later seasons: "S2 E2 Airs Fri, Oct 9". */
 export function formatNextEpisodeLabel(episode: {
   seasonNumber: number;
   episodeNumber: number;
