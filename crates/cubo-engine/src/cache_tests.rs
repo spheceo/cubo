@@ -168,10 +168,22 @@ async fn fixture_state(
             "/torrents",
             get(|| async { Json(json!({"torrents": [{"id": 1, "info_hash": "fixture"}]})) }),
         )
+        // Like rqbit: only the fixture torrent is managed, looking up anything
+        // else is a 404, and deleting anything else is a 500.
+        .route(
+            "/torrents/{id}",
+            get(|Path(id): Path<String>| async move {
+                if id == "1" || id == "fixture" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            }),
+        )
         .route(
             "/torrents/{id}/delete",
-            post(move || async move {
-                if fail_delete {
+            post(move |Path(id): Path<String>| async move {
+                if fail_delete || (id != "1" && id != "fixture") {
                     StatusCode::INTERNAL_SERVER_ERROR
                 } else {
                     StatusCode::OK
@@ -246,6 +258,45 @@ async fn failed_download_deletion_is_not_reported_as_success() {
     assert!(empty_cache(&state, &downloads).await.is_err());
     assert_eq!(state.store.cache_snapshot().await.cache_entries.len(), 1);
     assert!(downloads.join("episode.mkv").exists());
+    server.abort();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn eviction_removes_entries_rqbit_forgot_before_the_title_just_watched() {
+    let root = temp_dir("evict-orphans");
+    let (state, server) = fixture_state(&root, false).await;
+    let downloads = state.current_download_dir().await;
+    // Recorded before a restart: rqbit no longer manages it, so its delete
+    // answers 500. It is the least recently used entry and must go first.
+    let orphan = downloads.join("watched-last-week.mkv");
+    fs::write(&orphan, vec![1u8; 256 * 1024]).unwrap();
+    state
+        .store
+        .touch_cache(
+            None,
+            "orphan".into(),
+            None,
+            None,
+            vec![orphan.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    state
+        .store
+        .touch_cache(Some(1), "fixture".into(), None, None, vec![])
+        .await
+        .unwrap();
+    state.store.set_cache_limit_unclamped(128 * 1024).await;
+
+    enforce_cache_limit(&state).await.unwrap();
+
+    assert!(!orphan.exists());
+    assert!(downloads.join("episode.mkv").exists());
+    let entries = state.store.cache_snapshot().await.cache_entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].info_hash, "fixture");
     server.abort();
     fs::remove_dir_all(root).unwrap();
 }

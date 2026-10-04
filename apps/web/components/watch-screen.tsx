@@ -337,6 +337,7 @@ export function WatchScreen({
   }
   const lastCoreSaveRef = useRef(0);
   const unsavedWatchSeconds = useRef(0);
+  const sessionWatch = useRef({ key: '', seconds: 0 });
   const playerFlushRef = useRef<(() => void) | null>(null);
   const claimedReadyKey = useRef<string | null>(null);
   const itemKey = playbackKey(mediaType, mediaId, season, episode);
@@ -1098,6 +1099,8 @@ export function WatchScreen({
       lastDurationRef.current = durationSeconds;
       const progressUpdatedAt = savePlayhead(itemKey, positionSeconds, durationSeconds, activeInfoHashRef.current);
       unsavedWatchSeconds.current += Math.max(0, watchedDeltaSeconds);
+      if (sessionWatch.current.key !== itemKey) sessionWatch.current = { key: itemKey, seconds: 0 };
+      sessionWatch.current.seconds += Math.max(0, watchedDeltaSeconds);
       const connection = playbackConnection.current;
       if (!connection) return;
       const now = performance.now();
@@ -1122,6 +1125,7 @@ export function WatchScreen({
         progressUpdatedAt,
         progressDeviceId: playheadDeviceId(),
         watchedDeltaSeconds: unsavedWatchSeconds.current,
+        sessionWatchSeconds: sessionWatch.current.seconds,
         sessionStarted,
         watchHref: `/watch/${mediaType}/${mediaId}${season != null && episode != null ? `?season=${season}&episode=${episode}` : ''}`,
         detailHref: backHref,

@@ -10,6 +10,9 @@ const MAX_HISTORY_ITEMS: usize = 500;
 /// Playback progress ticks arrive every few seconds; the state file is
 /// rewritten at most this often, with a trailing flush for the final tick.
 const PERSIST_MIN_INTERVAL_MS: u64 = 3_000;
+/// Seconds an earlier episode must actually play in one sitting before it
+/// takes a show back from the later episode the viewer is on.
+const EPISODE_TAKEOVER_SECONDS: f64 = 60.0;
 
 #[derive(Clone)]
 pub struct CoreStore {
@@ -165,6 +168,10 @@ pub struct PlaybackUpdate {
     pub duration_seconds: f64,
     #[serde(default)]
     pub watched_delta_seconds: f64,
+    /// Seconds played since the client opened this episode. Absent from
+    /// legacy clients, whose updates always count as the show's progress.
+    #[serde(default)]
+    pub session_watch_seconds: Option<f64>,
     #[serde(default)]
     pub progress_updated_at: Option<u64>,
     #[serde(default)]
@@ -246,6 +253,7 @@ impl CoreStore {
         // Keep genuinely unfinished titles available, including long endings.
         let completed =
             progress >= 0.98 && update.duration_seconds - update.position_seconds <= 60.0;
+        let last_watched_at = held_back_recency(&data.history, &update).unwrap_or(now);
 
         let item = LibraryItem {
             key: update.key.clone(),
@@ -263,7 +271,7 @@ impl CoreStore {
             duration_seconds: update.duration_seconds.max(0.0),
             progress,
             completed,
-            last_watched_at: now,
+            last_watched_at,
             progress_updated_at: update.progress_updated_at,
             progress_device_id: update.progress_device_id,
             watch_href: update.watch_href,
@@ -516,6 +524,32 @@ pub(crate) fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// The show's current episode is its most recently watched row. Briefly
+/// reopening an earlier one (a stale tab on another device, a refresh, an
+/// immediate back) saves that episode's playhead but must not take the show
+/// over from the later episode being watched. Returns the recency to keep
+/// instead of now, until the earlier episode has really been played.
+fn held_back_recency(history: &[LibraryItem], update: &PlaybackUpdate) -> Option<u64> {
+    if update.session_watch_seconds? >= EPISODE_TAKEOVER_SECONDS {
+        return None;
+    }
+    let opened = (update.season?, update.episode?);
+    let current = history
+        .iter()
+        .filter(|entry| entry.media_type == update.media_type && entry.media_id == update.media_id)
+        .max_by_key(|entry| entry.last_watched_at)?;
+    if current.key == update.key || (current.season?, current.episode?) <= opened {
+        return None;
+    }
+    Some(
+        history
+            .iter()
+            .find(|entry| entry.key == update.key)
+            .map(|entry| entry.last_watched_at)
+            .unwrap_or_else(|| current.last_watched_at.saturating_sub(1)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +628,63 @@ mod tests {
         second.progress_device_id = Some("phone".into());
         store.record_playback(second).await.unwrap();
         assert_eq!(store.snapshot().await.history[0].position_seconds, 600.0);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    fn episode(episode: u32, position: f64, session_watch_seconds: Option<f64>) -> PlaybackUpdate {
+        serde_json::from_value(serde_json::json!({
+            "key": format!("tv:7:1:{episode}"), "mediaId": 7, "mediaType": "tv",
+            "title": "Show", "season": 1, "episode": episode,
+            "positionSeconds": position, "durationSeconds": 3600,
+            "sessionWatchSeconds": session_watch_seconds,
+            "watchHref": "/watch/tv/7", "detailHref": "/tv/7"
+        }))
+        .unwrap()
+    }
+
+    fn current_episode(snapshot: &CoreData) -> Option<u32> {
+        snapshot
+            .history
+            .iter()
+            .filter(|entry| entry.media_id == 7)
+            .max_by_key(|entry| entry.last_watched_at)
+            .and_then(|entry| entry.episode)
+    }
+
+    #[tokio::test]
+    async fn briefly_reopening_an_earlier_episode_keeps_the_show_on_the_later_one() {
+        let (store, directory) = test_store().await;
+        store.record_playback(episode(3, 3300.0, Some(900.0))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.record_playback(episode(4, 1000.0, Some(900.0))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Another device opens episode 3 and backs out after two seconds;
+        // a never-watched episode 1 is opened just as briefly.
+        store.record_playback(episode(3, 3302.0, Some(2.0))).await.unwrap();
+        store.record_playback(episode(1, 2.0, Some(2.0))).await.unwrap();
+        let snapshot = store.snapshot().await;
+        assert_eq!(current_episode(&snapshot), Some(4));
+        let reopened = snapshot.history.iter().find(|entry| entry.key == "tv:7:1:3").unwrap();
+        assert_eq!(reopened.position_seconds, 3302.0);
+
+        // Watching it for real makes it the show's episode again.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.record_playback(episode(3, 3400.0, Some(90.0))).await.unwrap();
+        assert_eq!(current_episode(&store.snapshot().await), Some(3));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_episodes_and_legacy_clients_take_over_immediately() {
+        let (store, directory) = test_store().await;
+        store.record_playback(episode(4, 1000.0, Some(900.0))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.record_playback(episode(5, 3.0, Some(2.0))).await.unwrap();
+        assert_eq!(current_episode(&store.snapshot().await), Some(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store.record_playback(episode(2, 10.0, None)).await.unwrap();
+        assert_eq!(current_episode(&store.snapshot().await), Some(2));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

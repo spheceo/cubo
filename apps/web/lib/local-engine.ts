@@ -105,6 +105,10 @@ export interface PlaybackUpdate {
   progressUpdatedAt?: number;
   progressDeviceId?: string;
   watchedDeltaSeconds: number;
+  /** Seconds actually played since this episode was opened. Core lets an
+   *  earlier episode take a show back from a later one only after real
+   *  playback, so a brief reopen does not become the show's progress. */
+  sessionWatchSeconds?: number;
   sessionStarted: boolean;
   watchHref: string;
   detailHref: string;

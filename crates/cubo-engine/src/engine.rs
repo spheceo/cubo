@@ -1342,13 +1342,27 @@ async fn rqbit_delete(state: &BridgeState, id: &str) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
-        Ok(())
-    } else {
-        Err(format!(
-            "rqbit could not delete torrent {id} ({})",
-            response.status()
-        ))
+        return Ok(());
     }
+    // rqbit answers deleting a torrent it does not manage with a 500 ("no
+    // such torrent in db"), not a 404. Treating that as a refusal made every
+    // entry from before a restart unevictable, so the budget fell on the
+    // title just watched instead. Ask whether rqbit knows the torrent at all.
+    let status = response.status();
+    let lookup = state
+        .client
+        .get(format!(
+            "http://127.0.0.1:{}/torrents/{}",
+            state.rqbit_port,
+            urlencoding::encode(id)
+        ))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if lookup.status() == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(format!("rqbit could not delete torrent {id} ({status})"))
 }
 
 /// Removes an entry's recorded files from disk and prunes the empty folders

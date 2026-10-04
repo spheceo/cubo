@@ -163,6 +163,14 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   observations from the same browser. `lastWatchedAt` remains server receipt
   time for library recency. Do not compare observation clocks across devices.
   Legacy clients without these optional fields retain their existing behavior.
+- An earlier episode only takes a show back from the later one being watched
+  after a minute of real playback in one sitting (`sessionWatchSeconds`);
+  until then Core saves its playhead but keeps its old `lastWatchedAt`, so a
+  stale tab, refresh, or immediate back does not rewind the show.
+- rqbit answers deleting a torrent it does not manage with a 500, not a 404.
+  `rqbit_delete` checks the torrent is unknown before treating that as done;
+  otherwise pre-restart cache entries can never be evicted and the budget
+  falls on the title just watched.
 - Command-line tests cover ordering and selection; they do not establish real
   first-frame latency, browser seek behavior, or actual audio language. Cold
   startup still depends on peer availability. A/V sync, playlist mapping,
