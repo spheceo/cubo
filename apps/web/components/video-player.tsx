@@ -97,6 +97,7 @@ export function VideoPlayer({
   onPlaying,
   onError,
   onStall,
+  onBuffering,
   downloadedRanges = null,
   flushRef,
   topRightControls,
@@ -168,6 +169,9 @@ export function VideoPlayer({
   onPlaying?: () => void;
   /** A mid-playback buffering pause ended (not startup, seeks or pauses). */
   onStall?: (stall: { positionSeconds: number; durationMs: number }) => void;
+  /** The loading overlay appeared (true) or cleared (false): startup,
+   *  seeks and mid-play stalls alike, never while paused. */
+  onBuffering?: (buffering: boolean) => void;
   /** Absolute stretches Core has on disk. When given, the bar draws the
    *  watchable span from the playhead instead of the browser's buffered
    *  ranges: for direct files the browser only knows bytes and places them
@@ -282,6 +286,8 @@ export function VideoPlayer({
   onErrorRef.current = onError;
   const onStallRef = useRef(onStall);
   onStallRef.current = onStall;
+  const onBufferingRef = useRef(onBuffering);
+  onBufferingRef.current = onBuffering;
   /** Read once per source by the session hls.js setup (its start position). */
   const initialTimeRef = useRef(initialTime);
   initialTimeRef.current = initialTime;
@@ -770,6 +776,11 @@ export function VideoPlayer({
   const creditsTakeover = inCredits && !creditsDismissed;
   const creditsTakeoverRef = useRef(creditsTakeover);
   creditsTakeoverRef.current = creditsTakeover;
+  const buffering = (waiting || pendingSeek != null) && !blocked && !heldPaused;
+  useEffect(() => {
+    onBufferingRef.current?.(buffering);
+  }, [buffering]);
+
   const keepControls = !creditsTakeover && (settingsOpen || heldPaused || blocked);
   useEffect(() => {
     if (!creditsTakeover) return;
@@ -1292,7 +1303,7 @@ export function VideoPlayer({
         onError={onError}
       />
 
-      {(waiting || pendingSeek != null) && !blocked && !heldPaused ? (
+      {buffering ? (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
           <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
         </div>

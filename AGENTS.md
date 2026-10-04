@@ -180,6 +180,12 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   top pick runs alone for a few seconds, backups join while nothing is
   visibly downloading, the first ready plays and the rest are closed. Never
   go back to one-at-a-time attempts behind Core's resolve timeout.
+- A source alive but too slow is a failure: when the loading overlay has
+  been up for 20 s and the torrent downloads below the file's own byte rate
+  (size / duration), an automatic session fails over to the next ranked
+  source at the same position (`checkStarved` in `watch-screen.tsx`). Only
+  measured throughput decides, never seeders, and only while an untried
+  source remains; a manually picked source is never switched.
 - Core never re-resolves a known source from the swarm: a torrent rqbit
   already manages is reused, otherwise saved metadata
   (`<data>/torrent-meta/<hash>.torrent`) is added from disk. rqbit resolves

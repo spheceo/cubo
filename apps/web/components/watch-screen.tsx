@@ -114,6 +114,9 @@ type Status = 'loading' | 'starting' | 'ready' | 'error';
 
 /** Heartbeat cadence; Core closes sessions it has not heard from in minutes. */
 const HEARTBEAT_MS = 5_000;
+/** A loading overlay this long on a source downloading slower than the
+ *  video plays moves on to the next ranked source at the same position. */
+const STARVED_SWITCH_MS = 20_000;
 /** Same-source recoveries (Core restarted, player gave up on a healthy
  *  session) allowed per window before the source counts as failed. */
 const RECOVERY_LIMIT = 3;
@@ -322,6 +325,8 @@ export function WatchScreen({
   /** Last position the player reported — lets a source fallback resume in place. */
   const lastPositionRef = useRef(0);
   const activeSourceRef = useRef<Stream | null>(null);
+  const activeAutoRef = useRef(false);
+  const bufferingSinceRef = useRef<number | null>(null);
   const activeInfoHashRef = useRef<string | null>(null);
   const lastDurationRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
@@ -385,6 +390,7 @@ export function WatchScreen({
     setError(null);
     setNeedsCore(false);
     setVideoUrl(null);
+    bufferingSinceRef.current = null;
     setDownloadedRanges(null);
     setVideoDurationHint(null);
     setProgress(0);
@@ -706,6 +712,7 @@ export function WatchScreen({
     const fileIndex = ready.fileIndex ?? stream.fileIdx ?? 0;
     const id = ready.torrentId ?? ready.infoHash ?? '';
     activeSourceRef.current = { ...stream, fileIdx: fileIndex };
+    activeAutoRef.current = auto;
     const audioTracks = ready.audioTracks ?? [];
     const playing = audioTracks.find((track) => track.index === ready.audioIndex);
     setPlayingAudio(audioTracks.length > 0 ? { tracks: audioTracks, language: playing?.language ?? null } : null);
@@ -770,8 +777,10 @@ export function WatchScreen({
   // `start` closes over fresh state every render; a ref keeps the effect below
   // from restarting playback whenever unrelated state changes.
   const startRef = useRef(start);
+  const checkStarvedRef = useRef(checkStarved);
   useEffect(() => {
     startRef.current = start;
+    checkStarvedRef.current = checkStarved;
   });
 
   useEffect(() => {
@@ -931,6 +940,7 @@ export function WatchScreen({
           if (sessionRef.current?.id === session.id) setDownloadedRanges(ranges);
         })
         .catch(() => undefined);
+      void checkStarvedRef.current(session);
     };
     beat();
     const interval = window.setInterval(beat, HEARTBEAT_MS);
@@ -1307,6 +1317,39 @@ export function WatchScreen({
     }
   }
 
+  // A remembered or top-ranked source can be alive but useless: one peer
+  // trickling far below the video's bitrate leaves the viewer on a spinner
+  // indefinitely, at startup or mid-play. Measured throughput (never seeder
+  // counts) decides, and only while an untried source remains.
+  async function checkStarved(session: { connection: LocalEngineConnection; id: string }) {
+    const since = bufferingSinceRef.current;
+    if (since == null || performance.now() - since < STARVED_SWITCH_MS) return;
+    if (!activeAutoRef.current) return;
+    const alternative = sources.some(
+      (stream) => streamKey(stream) !== activeKey && !failedSourcesRef.current.has(stream.infoHash),
+    );
+    if (!alternative) return;
+    const sessionStatus = await getSession(session.connection, session.id).catch(() => null);
+    const torrent = sessionStatus?.torrent;
+    if (!torrent || torrent.finished || sessionRef.current?.id !== session.id) return;
+    const duration = sessionStatus?.durationSeconds || lastDurationRef.current;
+    const fileBytes = activeSourceRef.current?.sizeBytes || torrent.totalBytes;
+    if (!duration || !fileBytes) return;
+    // downloadMbps is rqbit's MiB/s.
+    const neededMbps = fileBytes / duration / (1024 * 1024);
+    if (torrent.downloadMbps >= neededMbps) return;
+    if (bufferingSinceRef.current !== since) return;
+    bufferingSinceRef.current = null;
+    shipClientLog(session.connection, 'warn', 'source_starved', {
+      download_mbps: torrent.downloadMbps,
+      needed_mbps: neededMbps,
+      peers: torrent.peers,
+      waited_ms: Math.round(performance.now() - since),
+      position: Math.round(lastPositionRef.current) || undefined,
+    });
+    failOver();
+  }
+
   // A session-backed player gave up. Ask Core before blaming the source:
   // Core restarting (session unknown) or a player-side hiccup on a healthy
   // session resumes the same source in place; only a source Core itself
@@ -1486,6 +1529,9 @@ export function WatchScreen({
             failOver();
           }}
           onStall={reportStall}
+          onBuffering={(buffering) => {
+            bufferingSinceRef.current = buffering ? bufferingSinceRef.current ?? performance.now() : null;
+          }}
           />
           {audioNotice ? (
             <div
