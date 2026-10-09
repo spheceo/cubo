@@ -42,6 +42,10 @@
 
 - The captions button and the Subtitles settings row only show when the
   title has subtitle tracks.
+- Subtitle cues honour a leftover ASS `{\anN}` tag: 7–9 go to the top
+  (below the top chrome when it shows), 4–6 to the middle, left/centre/right
+  by column. Every other `{\…}` override is stripped, and `\N` becomes a
+  line break.
 - The player chrome never fades while a menu is open (settings, the
   Episodes drawer via `menuOpen`); moving over it does not re-arm the
   fade, which resumes once the menu closes.

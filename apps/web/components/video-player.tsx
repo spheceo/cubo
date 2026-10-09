@@ -300,7 +300,7 @@ export function VideoPlayer({
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
   const [pipSupported, setPipSupported] = useState(false);
-  const [activeCueText, setActiveCueText] = useState<string | null>(null);
+  const [activeCue, setActiveCue] = useState<SubtitleCue | null>(null);
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
 
@@ -323,7 +323,7 @@ export function VideoPlayer({
   const refreshCueRef = useRef<() => void>(() => undefined);
   useEffect(() => {
     subtitleCuesRef.current = [];
-    setActiveCueText(null);
+    setActiveCue(null);
     if (!activeSubtitleId) return;
     const track = subtitles.find((entry) => entry.id === activeSubtitleId);
     if (!track) return;
@@ -349,8 +349,7 @@ export function VideoPlayer({
       const cues = subtitleCuesRef.current;
       if (!video || cues.length === 0) return;
       const cue = findActiveCue(cues, video.currentTime);
-      const text = cue?.text ?? null;
-      setActiveCueText((previous) => (previous === text ? previous : text));
+      setActiveCue((previous) => (previous === cue ? previous : cue));
     };
     const tick = () => {
       update();
@@ -1808,16 +1807,22 @@ export function VideoPlayer({
 
       {/* Subtitle overlay — Cubo-rendered instead of native tracks so cues
           stay aligned with absolute movie time and can be styled freely.
-          Sits low by default and eases up above the controls while shown. */}
-      {activeCueText ? (
+          Sits low by default and eases up above the controls while shown;
+          an ASS `\anN` tag moves it to the top or middle (e.g. to clear an
+          on-screen name card) and clears the top chrome the same way. */}
+      {activeCue ? (
         <div
           aria-live="off"
-          className={`pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-[8%] transition-transform duration-300 ease-out ${
-            controlsVisible ? '-translate-y-[7.5rem]' : '-translate-y-[6.5rem]'
-          }`}
+          className={`pointer-events-none absolute inset-x-0 z-10 flex px-[8%] transition-transform duration-300 ease-out ${
+            cueRow(activeCue.align) === 'top'
+              ? `top-0 ${controlsVisible ? 'translate-y-[5.5rem]' : 'translate-y-[2.5rem]'}`
+              : cueRow(activeCue.align) === 'middle'
+                ? 'top-1/2 -translate-y-1/2'
+                : `bottom-0 ${controlsVisible ? '-translate-y-[7.5rem]' : '-translate-y-[6.5rem]'}`
+          } ${CUE_COLUMN_CLASS[cueColumn(activeCue.align)]}`}
         >
           <span
-            className={`whitespace-pre-line text-center font-medium leading-snug [text-shadow:0_1px_2px_rgba(0,0,0,0.9),0_0_12px_rgba(0,0,0,0.6)] ${
+            className={`whitespace-pre-line font-medium leading-snug [text-shadow:0_1px_2px_rgba(0,0,0,0.9),0_0_12px_rgba(0,0,0,0.6)] ${
               captionSize === 'small'
                 ? '[font-size:clamp(0.95rem,0.95rem+1vh,1.5rem)]'
                 : captionSize === 'large'
@@ -1826,13 +1831,34 @@ export function VideoPlayer({
             }`}
             style={{ color: captionHex }}
           >
-            {activeCueText}
+            {activeCue.text}
           </span>
         </div>
       ) : null}
     </div>
   );
 }
+
+type CueRow = 'top' | 'middle' | 'bottom';
+type CueColumn = 'left' | 'center' | 'right';
+
+/** Numpad layout of ASS `\anN`: 7–9 top, 4–6 middle, 1–3 bottom. */
+function cueRow(align: number | undefined): CueRow {
+  if (align === undefined) return 'bottom';
+  return align >= 7 ? 'top' : align >= 4 ? 'middle' : 'bottom';
+}
+
+function cueColumn(align: number | undefined): CueColumn {
+  if (align === undefined) return 'center';
+  const column = (align - 1) % 3;
+  return column === 0 ? 'left' : column === 2 ? 'right' : 'center';
+}
+
+const CUE_COLUMN_CLASS: Record<CueColumn, string> = {
+  left: 'justify-start text-left',
+  center: 'justify-center text-center',
+  right: 'justify-end text-right',
+};
 
 function ControlButton({
   label,

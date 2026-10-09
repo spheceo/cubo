@@ -8,7 +8,19 @@ export type SubtitleCue = {
   start: number;
   end: number;
   text: string;
+  /** ASS `\anN` placement, numpad layout: 1–3 bottom, 4–6 middle, 7–9 top;
+   *  left, centre, right within each row. Absent means bottom centre. */
+  align?: number;
 };
+
+/** The last `\anN` override wins, as in libass. */
+function assAlignment(text: string): number | undefined {
+  let align: number | undefined;
+  for (const block of text.matchAll(/\{\\[^}]*\}/g)) {
+    for (const match of block[0].matchAll(/\\an([1-9])/g)) align = Number(match[1]);
+  }
+  return align;
+}
 
 const ENTITIES: Record<string, string> = {
   '&amp;': '&',
@@ -57,16 +69,19 @@ export function parseSubtitleCues(source: string): SubtitleCue[] {
 
     // Strip voice/ styling tags and leftover ASS overrides (`{\an8}`, `\N`
     // from subtitles converted out of .ass); keep the text and its line breaks.
-    const text = lines
-      .slice(timingIndex + 1)
-      .join('\n')
+    // `\anN` placement is kept on the cue so the overlay can honour it.
+    const body = lines.slice(timingIndex + 1).join('\n');
+    const align = assAlignment(body);
+    const text = body
       .replace(/<[^>]+>/g, '')
       .replace(/\{\\[^}]*\}/g, '')
       .replace(/\\N/g, '\n')
       .trim();
     if (!text) continue;
 
-    cues.push({ start, end, text: decodeEntities(text) });
+    const cue: SubtitleCue = { start, end, text: decodeEntities(text) };
+    if (align !== undefined && align !== 2) cue.align = align;
+    cues.push(cue);
   }
 
   cues.sort((a, b) => a.start - b.start || b.end - a.end);
