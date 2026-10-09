@@ -55,11 +55,14 @@ export function parseSubtitleCues(source: string): SubtitleCue[] {
     const end = timestampSeconds(rawEnd.trim().split(/\s+/)[0] ?? '');
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
 
-    // Strip voice/ styling tags; keep the text and its line breaks.
+    // Strip voice/ styling tags and leftover ASS overrides (`{\an8}`, `\N`
+    // from subtitles converted out of .ass); keep the text and its line breaks.
     const text = lines
       .slice(timingIndex + 1)
       .join('\n')
       .replace(/<[^>]+>/g, '')
+      .replace(/\{\\[^}]*\}/g, '')
+      .replace(/\\N/g, '\n')
       .trim();
     if (!text) continue;
 
