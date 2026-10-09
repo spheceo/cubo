@@ -316,18 +316,22 @@ export function PlayerSettings({
               </button>
             </>
           ) : null}
-          <div className="border-t border-white/8" />
-          <button
-            type="button"
-            onClick={() => setPanel('subtitles')}
-            className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
-          >
-            <span>Subtitles</span>
-            <span className="flex min-w-0 items-center gap-1 text-white/45">
-              <span className="truncate">{active?.label ?? 'Off'}</span>
-              <IoChevronForward size={14} className="shrink-0" />
-            </span>
-          </button>
+          {subtitles.length > 0 ? (
+            <>
+              <div className="border-t border-white/8" />
+              <button
+                type="button"
+                onClick={() => setPanel('subtitles')}
+                className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+              >
+                <span>Subtitles</span>
+                <span className="flex min-w-0 items-center gap-1 text-white/45">
+                  <span className="truncate">{active?.label ?? 'Off'}</span>
+                  <IoChevronForward size={14} className="shrink-0" />
+                </span>
+              </button>
+            </>
+          ) : null}
         </>
       )}
     </div>

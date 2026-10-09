@@ -30,7 +30,7 @@ import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
 import { resetWindowScroll } from './scroll-to-top';
 import { watchOrigin } from './watch-origin';
-import { VideoPlayer, type BufferedRange, type PlayerSubtitle } from './video-player';
+import { VideoPlayer, type BufferedRange, type PlayerFailure, type PlayerSubtitle } from './video-player';
 import {
   closeSession,
   createSession,
@@ -79,7 +79,10 @@ import {
   type AudioChoice,
 } from '@/lib/audio-choice';
 import { ProgressWriter } from '@/lib/progress-writer';
+import { needsReencode, rememberReencode } from '@/lib/decode-fallback';
+import { detectRecapPreview, recapWindow, withRecapPreview, type RecapPreview } from '@/lib/recap-preview';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
+import { loadSubtitleCues } from '@/lib/subtitles';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
 import { fetchStreams } from '@/lib/stream-cache';
 import { onCacheClear } from '@/lib/cache-events';
@@ -199,6 +202,8 @@ export function WatchScreen({
   /** Intro/credits windows for the file actually playing — per-source, so a
    *  fallback switch clears the previous file's timings. */
   const [skipSegments, setSkipSegments] = useState<SkipSegments | null>(null);
+  /** "Previously on…" / "Coming soon on…" found in the English subtitles. */
+  const [subtitleRecap, setSubtitleRecap] = useState<RecapPreview | null>(null);
   const [resumeAt, setResumeAt] = useState(0);
   /** What Core has on disk for the current session, for the download bar. */
   const [downloadedRanges, setDownloadedRanges] = useState<BufferedRange[] | null>(null);
@@ -600,6 +605,7 @@ export function WatchScreen({
             resumeSeconds: startAt,
             hevc: supportsHevcRemux(),
             audioLanguage,
+            transcodeVideo: needsReencode(stream),
           });
           racer.sessionId = created.id;
           if (racer.done || settled || stale()) {
@@ -731,6 +737,7 @@ export function WatchScreen({
       auto,
       resume: startAt || undefined,
       direct_play: ready.mode === 'direct',
+      video_transcode: ready.videoTranscode || undefined,
       name: stream.name,
       source_title: stream.title,
       quality: stream.quality,
@@ -1053,6 +1060,30 @@ export function WatchScreen({
     return () => window.clearInterval(timer);
   }, [status, nextEpisode, imdbId, mediaType, mediaId, title, originalLanguage, videoDurationHint]);
 
+  // Episodes narrate their recap and teaser ("Previously on…", "Coming
+  // soon on…"); the English subtitles say where both start even when no
+  // crowd database has timings for the show.
+  const introSegment = skipSegments?.intro ?? null;
+  useEffect(() => {
+    setSubtitleRecap(null);
+    if (mediaType !== 'tv' || !videoDurationHint) return;
+    const track = subtitleTracks.find((entry) => /^en(g|-|$)/i.test(entry.language));
+    if (!track) return;
+    let cancelled = false;
+    const duration = videoDurationHint;
+    void loadSubtitleCues(track.src).then((cues) => {
+      if (!cancelled) setSubtitleRecap(detectRecapPreview(cues, duration, introSegment));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, subtitleTracks, videoDurationHint, introSegment]);
+  const playerSkips = useMemo(
+    () => (subtitleRecap ? withRecapPreview(skipSegments, subtitleRecap) : skipSegments),
+    [skipSegments, subtitleRecap],
+  );
+  const playerRecap = useMemo(() => recapWindow(playerSkips), [playerSkips]);
+
   useEffect(() => {
     if (!imdbId) return;
     let cancelled = false;
@@ -1354,7 +1385,10 @@ export function WatchScreen({
   // Core restarting (session unknown) or a player-side hiccup on a healthy
   // session resumes the same source in place; only a source Core itself
   // failed moves down the list.
-  async function recoverSession(session: { connection: LocalEngineConnection; id: string }) {
+  async function recoverSession(
+    session: { connection: LocalEngineConnection; id: string },
+    failure?: PlayerFailure,
+  ) {
     const attempt = attemptRef.current;
     let sessionStatus: PlaybackSessionStatus | null = null;
     let gone = false;
@@ -1371,8 +1405,22 @@ export function WatchScreen({
       error: sessionStatus?.error?.message,
       starved_seconds: sessionStatus?.remux?.starvedSeconds ?? undefined,
       position: lastPositionRef.current || undefined,
+      player_decode: failure?.decode || undefined,
+      player_error: failure?.detail,
+      video_transcode: sessionStatus?.videoTranscode || undefined,
     });
-    const healthy = gone || sessionStatus?.phase === 'ready';
+    // The browser could not decode this file's picture. Restarting it as
+    // is fails the same way, so the same source comes back re-encoded.
+    const active = activeSourceRef.current;
+    if (failure?.decode && sessionStatus?.phase === 'ready' && !sessionStatus.videoTranscode && active) {
+      rememberReencode(active);
+      const index = sources.findIndex((stream) => streamKey(stream) === streamKey(active));
+      if (index >= 0) {
+        void start(sources, index, activeAutoRef.current, lastPositionRef.current);
+        return;
+      }
+    }
+    const healthy = gone || (sessionStatus?.phase === 'ready' && !failure?.decode);
     const now = Date.now();
     const key = activeKey ?? '';
     const recoveries =
@@ -1509,21 +1557,22 @@ export function WatchScreen({
             reportFirstFrame();
           }}
           flushRef={playerFlushRef}
-          introWindow={skipSegments?.intro ?? null}
+          introWindow={playerSkips?.intro ?? null}
+          recapWindow={playerRecap}
           introAutoSkipEligible={introAutoSkipEligible(mediaType, episode)}
-          creditsWindow={skipSegments?.credits ?? null}
+          creditsWindow={playerSkips?.credits ?? null}
           onNextEpisode={nextEpisode ? goToNextEpisode : undefined}
           onCreditsReached={markDoneAtCredits}
-          sections={skipSegments?.sections}
+          sections={playerSkips?.sections}
           onSeekIntent={recordSeekIntent}
           audioOptions={audioOptions}
           activeAudio={audioChoice ?? 'original'}
           onPickAudio={(value) => switchAudio(value === 'dub' ? 'dub' : 'original')}
-          onError={() => {
+          onError={(failure) => {
             if (cacheClearingRef.current) return;
             const session = sessionRef.current;
             if (session) {
-              void recoverSession(session);
+              void recoverSession(session, failure);
               return;
             }
             failOver();

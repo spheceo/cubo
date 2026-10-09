@@ -19,7 +19,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use librqbit::http_api::{HttpApi, HttpApiOptions};
-use librqbit::{Api, DhtSessionConfig, Session, SessionOptions};
+use librqbit::{Api, DhtSessionConfig, ListenerMode, ListenerOptions, Session, SessionOptions};
 use librqbit_dualstack_sockets::TcpListener as RqbitListener;
 use serde::Deserialize;
 use serde_json::json;
@@ -339,42 +339,59 @@ enum BindAttempt {
     Failed(String),
 }
 
+/// Port Core prefers for incoming peer connections (TCP and uTP).
+const PEER_PORT: u16 = 48765;
+
+/// Starts rqbit. Core accepts incoming peers over TCP and uTP and asks the
+/// router to forward the port (UPnP), like any desktop torrent client.
+/// Without a listener only peers Core can dial ever connect: seeders behind
+/// NAT stay out of reach and the same swarm streams far slower here than in
+/// other apps. Ports already taken (another Core, a DHT socket in use) fall
+/// back to free ones.
 async fn open_rqbit_session(
     download_dir: PathBuf,
     piece_state_dir: PathBuf,
 ) -> Result<Arc<Session>, String> {
-    match Session::new_with_opts(
-        download_dir.clone(),
-        SessionOptions {
+    let attempts = [(PEER_PORT, false), (0, false), (0, true)];
+    let mut last_error = None;
+    for (peer_port, ephemeral_dht) in attempts {
+        let options = SessionOptions {
             bitv_folder: Some(piece_state_dir.clone()),
-            ..Default::default()
-        },
-    )
-    .await
-    {
-        Ok(session) => Ok(session),
-        Err(error) if is_addr_in_use(&error) => {
-            tracing::info!(
-                target: "engine",
-                "DHT UDP port already in use; starting without a persisted socket"
-            );
-            Session::new_with_opts(
-                download_dir,
-                SessionOptions {
-                    bitv_folder: Some(piece_state_dir),
-                    dht: Some(DhtSessionConfig {
-                        port: Some(0),
-                        persistence: None,
-                        ..Default::default()
-                    }),
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpAndUtp,
+                listen_addr: (Ipv6Addr::UNSPECIFIED, peer_port).into(),
+                enable_upnp_port_forwarding: true,
+                ..Default::default()
+            }),
+            dht: Some(if ephemeral_dht {
+                DhtSessionConfig {
+                    port: Some(0),
+                    persistence: None,
                     ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| format!("rqbit session init failed: {error:#}"))
+                }
+            } else {
+                DhtSessionConfig::default()
+            }),
+            ..Default::default()
+        };
+        match Session::new_with_opts(download_dir.clone(), options).await {
+            Ok(session) => return Ok(session),
+            Err(error) if is_addr_in_use(&error) => {
+                tracing::info!(
+                    target: "engine",
+                    peer_port,
+                    ephemeral_dht,
+                    "torrent ports already in use; trying free ones"
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(format!("rqbit session init failed: {error:#}")),
         }
-        Err(error) => Err(format!("rqbit session init failed: {error:#}")),
     }
+    Err(format!(
+        "rqbit session init failed: {:#}",
+        last_error.expect("at least one attempt")
+    ))
 }
 
 fn is_addr_in_use(error: &anyhow::Error) -> bool {

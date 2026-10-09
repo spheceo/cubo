@@ -31,6 +31,11 @@ const COPYABLE_AUDIO: [&str; 3] = ["aac", "mp3", "opus"];
 #[derive(Debug, Clone)]
 pub struct MediaProbe {
     pub video_codec: Option<String>,
+    /// Interlaced video (broadcast HDTV captures). Browsers on macOS cannot
+    /// decode interlaced H.264 at all, so these always re-encode.
+    pub interlaced: bool,
+    /// Coded height of the video, for sizing a re-encode.
+    pub video_height: Option<u32>,
     /// Codec of the audio stream the remux will actually use.
     pub audio_codec: Option<String>,
     /// Absolute index of the chosen audio stream, for `-map 0:N`. Releases
@@ -202,6 +207,12 @@ pub fn chapter_skip_segments(
     (intro, credits)
 }
 
+/// ffprobe's `field_order`: `progressive`, `unknown`, or a field order
+/// (`tt`, `bb`, `tb`, `bt`) for interlaced video.
+fn is_interlaced(field_order: &str) -> bool {
+    matches!(field_order, "tt" | "bb" | "tb" | "bt")
+}
+
 impl MediaProbe {
     pub fn video_copyable(&self) -> bool {
         self.video_codec
@@ -349,6 +360,8 @@ struct FfprobeStream {
     index: Option<u32>,
     codec_type: Option<String>,
     codec_name: Option<String>,
+    field_order: Option<String>,
+    height: Option<u32>,
     #[serde(default)]
     tags: FfprobeTags,
     #[serde(default)]
@@ -484,11 +497,14 @@ impl TranscodeManager {
             ProbeError::Failed(format!("unexpected ffprobe output: {error}"))
         })?;
 
-        let video_codec = parsed
+        let video = parsed
             .streams
             .iter()
-            .find(|stream| stream.codec_type.as_deref() == Some("video"))
-            .and_then(|stream| stream.codec_name.clone());
+            .find(|stream| stream.codec_type.as_deref() == Some("video"));
+        let video_codec = video.and_then(|stream| stream.codec_name.clone());
+        let interlaced = video
+            .and_then(|stream| stream.field_order.as_deref())
+            .is_some_and(is_interlaced);
         let audio = pick_audio_stream(&parsed.streams);
         let duration_seconds = parsed
             .format
@@ -499,6 +515,7 @@ impl TranscodeManager {
         tracing::info!(
             target: "probe",
             video_codec = video_codec.as_deref().unwrap_or("-"),
+            interlaced,
             audio_codec = audio.and_then(|stream| stream.codec_name.clone()).as_deref().unwrap_or("-"),
             audio_stream_index = audio.and_then(|stream| stream.index).unwrap_or(u32::MAX),
             duration_seconds = duration_seconds.unwrap_or(0.0),
@@ -517,6 +534,8 @@ impl TranscodeManager {
             .collect();
         Ok(MediaProbe {
             video_codec,
+            interlaced,
+            video_height: video.and_then(|stream| stream.height),
             audio_codec: audio.and_then(|stream| stream.codec_name.clone()),
             audio_stream_index: audio.and_then(|stream| stream.index),
             audio_tracks: audio_tracks(&parsed.streams),
@@ -596,6 +615,8 @@ mod tests {
         fn dual() -> MediaProbe {
             MediaProbe {
                 video_codec: Some("hevc".into()),
+                interlaced: false,
+                video_height: Some(1080),
                 audio_codec: Some("aac".into()),
                 audio_stream_index: Some(2),
                 audio_tracks: vec![

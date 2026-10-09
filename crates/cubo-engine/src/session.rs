@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 
 use crate::mkv_index::{self, ByteSource, MkvIndex};
 use crate::mp4_index::{self, ByteMap};
-use crate::remuxer::{RemuxInput, RemuxStatus, Remuxer};
+use crate::remuxer::{RemuxInput, RemuxStatus, Remuxer, VideoTranscode};
 use crate::segment_plan::SegmentPlan;
 use crate::store::CoreStore;
 use crate::transcode::{AudioTrack, MediaProbe, TranscodeManager};
@@ -45,6 +45,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A remux that has had room to convert but received no source data for
 /// this long means the swarm stopped delivering.
 const STALL_FAILURE: Duration = Duration::from_secs(120);
+/// How long a closed session's torrent keeps its peers before pausing, in
+/// case the client opens a replacement session on the same source.
+const PAUSE_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +68,11 @@ pub struct CreateSessionRequest {
     /// language, or "en" for an English dub. Absent keeps the probe's pick.
     #[serde(default)]
     pub audio_language: Option<String>,
+    /// Re-encode the video instead of copying it. The client asks for this
+    /// after the browser failed to decode the source's own bitstream (some
+    /// releases carry frames Apple's hardware decoder rejects mid-stream).
+    #[serde(default)]
+    pub transcode_video: bool,
     /// Extra peers to connect to immediately (tests, local seeds).
     #[serde(default)]
     pub peers: Vec<SocketAddr>,
@@ -154,6 +162,7 @@ struct Inner {
     remuxer: Option<Arc<Remuxer>>,
     audio_tracks: Vec<AudioTrack>,
     audio_index: Option<u32>,
+    video_transcode: bool,
     timeline: Timeline,
     last_seen: Instant,
     position: f64,
@@ -208,6 +217,9 @@ pub struct SessionStatus {
     pub audio_tracks: Vec<AudioTrack>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_index: Option<u32>,
+    /// The video is re-encoded rather than copied (interlaced source, or
+    /// the client asked after a decode failure).
+    pub video_transcode: bool,
     pub timeline: Timeline,
 }
 
@@ -491,7 +503,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn close_all(&self) {
+    pub async fn close_all(self: &Arc<Self>) {
         let sessions: Vec<Arc<PlaybackSession>> =
             self.sessions.lock().unwrap().drain().map(|(_, session)| session).collect();
         for session in sessions {
@@ -501,7 +513,7 @@ impl SessionManager {
 
     /// Closes sessions playing a torrent (by rqbit id or info hash) that the
     /// viewer is deleting from the cache.
-    pub async fn close_torrent(&self, id_or_hash: &str) {
+    pub async fn close_torrent(self: &Arc<Self>, id_or_hash: &str) {
         let matching: Vec<String> = self
             .sessions
             .lock()
@@ -543,6 +555,7 @@ impl SessionManager {
                 remuxer: None,
                 audio_tracks: Vec::new(),
                 audio_index: None,
+                video_transcode: false,
                 timeline: Timeline::default(),
                 last_seen: Instant::now(),
                 position: request.resume_seconds.unwrap_or(0.0).max(0.0),
@@ -570,7 +583,7 @@ impl SessionManager {
         session
     }
 
-    pub async fn close(&self, id: &str) -> bool {
+    pub async fn close(self: &Arc<Self>, id: &str) -> bool {
         let Some(session) = self.sessions.lock().unwrap().remove(id) else {
             return false;
         };
@@ -578,7 +591,7 @@ impl SessionManager {
         true
     }
 
-    async fn shut_down(&self, session: &PlaybackSession) {
+    async fn shut_down(self: &Arc<Self>, session: &PlaybackSession) {
         if let Some(task) = session.startup.lock().unwrap().take() {
             task.abort();
         }
@@ -597,19 +610,27 @@ impl SessionManager {
         // it unless another live session is watching the same torrent. A
         // source that never played (it lost a startup race, or the viewer
         // backed out at once) stays parked rather than downloading in full
-        // once nothing is playing.
+        // once nothing is playing. Pausing drops every peer, and the client
+        // replaces a session on the same source when it recovers from a
+        // player error or switches audio, so wait to see whether one
+        // follows before pausing.
         if let Some(source) = source {
-            if !self.live_info_hashes().contains(&source.info_hash) {
-                if !served {
-                    self.parked.lock().unwrap().insert(source.torrent_id);
+            let manager = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PAUSE_GRACE).await;
+                if manager.live_info_hashes().contains(&source.info_hash) {
+                    return;
                 }
-                let _ = self.rqbit.pause(&source.handle).await;
-            }
+                if !served {
+                    manager.parked.lock().unwrap().insert(source.torrent_id);
+                }
+                let _ = manager.rqbit.pause(&source.handle).await;
+            });
         }
         tracing::info!(target: "session", session = %session.id, "playback session closed");
     }
 
-    async fn sweep(&self) {
+    async fn sweep(self: &Arc<Self>) {
         let sessions: Vec<Arc<PlaybackSession>> =
             self.sessions.lock().unwrap().values().cloned().collect();
         for session in sessions {
@@ -649,7 +670,7 @@ impl SessionManager {
     }
 
     pub fn status(&self, session: &PlaybackSession) -> SessionStatus {
-        let (phase, failure, source, mode, duration, remuxer, audio_tracks, audio_index, timeline) =
+        let (phase, failure, source, mode, duration, remuxer, audio_tracks, audio_index, video_transcode, timeline) =
             session.update(|inner| {
                 (
                     inner.phase,
@@ -660,6 +681,7 @@ impl SessionManager {
                     inner.remuxer.clone(),
                     inner.audio_tracks.clone(),
                     inner.audio_index,
+                    inner.video_transcode,
                     inner.timeline.clone(),
                 )
             });
@@ -692,6 +714,7 @@ impl SessionManager {
             remux: remuxer.map(|remuxer| remuxer.status()),
             audio_tracks,
             audio_index,
+            video_transcode,
             timeline,
         }
     }
@@ -775,7 +798,12 @@ impl SessionManager {
         session.update(|inner| inner.timeline.probed_ms = Some(probed));
         let probe = probe.with_audio_language(request.audio_language.as_deref());
 
-        let mode = choose_mode(&probe, &source.file_name, request.hevc)?;
+        let video_transcode = request.transcode_video || probe.interlaced;
+        let mode = if video_transcode {
+            Mode::Hls
+        } else {
+            choose_mode(&probe, &source.file_name, request.hevc)?
+        };
         let container_duration = index
             .as_ref()
             .and_then(|index| index.duration_seconds)
@@ -824,6 +852,10 @@ impl SessionManager {
                         audio_stream_index: probe.audio_stream_index,
                         audio_copy: probe.audio_copyable(),
                         hevc: probe.video_codec.as_deref() == Some("hevc"),
+                        transcode: video_transcode.then(|| VideoTranscode {
+                            deinterlace: probe.interlaced,
+                            height: probe.video_height,
+                        }),
                         origin,
                     },
                     plan,
@@ -848,6 +880,7 @@ impl SessionManager {
             inner.remuxer = remuxer.clone();
             inner.audio_tracks = probe.audio_tracks.clone();
             inner.audio_index = probe.audio_stream_index;
+            inner.video_transcode = video_transcode;
             inner.phase = Phase::Ready;
             inner.timeline.ready_ms = Some(ready);
             false
@@ -867,6 +900,7 @@ impl SessionManager {
             audio = probe.audio_codec.as_deref().unwrap_or("-"),
             audio_index = probe.audio_stream_index.map(i64::from).unwrap_or(-1),
             audio_language = request.audio_language.as_deref().unwrap_or("-"),
+            video_transcode,
             ready_ms = ready,
             "playback session ready"
         );
@@ -1428,6 +1462,8 @@ mod tests {
     fn probe(video: &str, audio: &str, format: &str) -> MediaProbe {
         MediaProbe {
             video_codec: Some(video.into()),
+            interlaced: false,
+            video_height: Some(1080),
             audio_codec: Some(audio.into()),
             audio_stream_index: Some(1),
             audio_tracks: vec![],

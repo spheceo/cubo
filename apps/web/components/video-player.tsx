@@ -56,6 +56,11 @@ export type BufferedRange = {
   end: number;
 };
 
+export type PlayerFailure = {
+  decode: boolean;
+  detail?: string;
+};
+
 /** True when `time` sits inside a buffered range. */
 function timeRangesCover(ranges: TimeRanges, time: number, slack = 0.35): boolean {
   for (let index = 0; index < ranges.length; index += 1) {
@@ -103,6 +108,7 @@ export function VideoPlayer({
   topRightControls,
   introWindow,
   introAutoSkipEligible = false,
+  recapWindow,
   creditsWindow,
   onNextEpisode,
   onCreditsReached,
@@ -119,6 +125,8 @@ export function VideoPlayer({
   /** True from a show's second episode on: the viewer's auto-skip pref may
    *  then skip the intro on its own, once per episode. */
   introAutoSkipEligible?: boolean;
+  /** "Previously on…" recap window; offers Skip recap like the intro. */
+  recapWindow?: { start: number; end: number | null } | null;
   /** Detected credits/outro window in absolute source seconds. */
   creditsWindow?: { start: number; end: number | null } | null;
   /** Offered during the credits window when a follow-up episode exists;
@@ -165,7 +173,9 @@ export function VideoPlayer({
   ) => void;
   /** Persist an intentional jump before asynchronous seeking begins. */
   onSeekIntent?: (absoluteSeconds: number) => void;
-  onError: () => void;
+  /** Playback failed. `decode` means the browser could not decode the
+   *  media itself (as opposed to loading it). */
+  onError: (failure?: PlayerFailure) => void;
   onPlaying?: () => void;
   /** A mid-playback buffering pause ended (not startup, seeks or pauses). */
   onStall?: (stall: { positionSeconds: number; durationMs: number }) => void;
@@ -684,7 +694,10 @@ export function VideoPlayer({
           instance.recoverMediaError();
           return;
         }
-        onErrorRef.current();
+        onErrorRef.current({
+          decode: data.type === Hls.ErrorTypes.MEDIA_ERROR,
+          detail: data.details,
+        });
       });
     });
 
@@ -741,6 +754,15 @@ export function VideoPlayer({
     introWindow.end != null &&
     shownTime >= introWindow.start &&
     shownTime < introWindow.end;
+  const inRecap =
+    !inIntro &&
+    recapWindow != null &&
+    recapWindow.end != null &&
+    shownTime >= recapWindow.start &&
+    shownTime < recapWindow.end;
+  // The intro and recap share one skipper: same placement and reveal rules.
+  const leadWindow = inIntro ? introWindow : inRecap ? recapWindow : null;
+  const inLead = leadWindow != null;
   const inCredits =
     creditsWindow != null &&
     shownTime >= creditsWindow.start &&
@@ -757,9 +779,9 @@ export function VideoPlayer({
   // fades out with them and only comes back on a manual raise.
   const [introControlsSeen, setIntroControlsSeen] = useState(false);
   useEffect(() => {
-    if (inIntro && controlsVisible) setIntroControlsSeen(true);
-    if (!inIntro) setIntroControlsSeen(false);
-  }, [inIntro, controlsVisible]);
+    if (inLead && controlsVisible) setIntroControlsSeen(true);
+    if (!inLead) setIntroControlsSeen(false);
+  }, [inLead, controlsVisible]);
   // From episode 2 on, the skipper counts down and skips by itself, the
   // same fill sweep as Next episode. It runs once per intro window: after
   // an auto-skip or a Watch intro, rewinding into it only offers the button.
@@ -767,7 +789,7 @@ export function VideoPlayer({
   const [introAutoHandled, setIntroAutoHandled] = useState<string | null>(null);
   const introAutoActive =
     inIntro && introAutoSkipEligible && autoSkipIntro && introAutoHandled !== introKey;
-  const showIntroSkip = inIntro && (introAutoActive || controlsVisible || !introControlsSeen);
+  const showIntroSkip = inLead && (introAutoActive || controlsVisible || !introControlsSeen);
 
   // The credits window is a takeover: the skip elements own the frame and
   // the chrome cannot be raised until the viewer picks Watch credits (or
@@ -991,6 +1013,14 @@ export function VideoPlayer({
     setIntroAutoHandled(introKey);
     if (end != null) seekToAbsolute(end);
   }, [introWindow, introKey, seekToAbsolute]);
+  const skipLead = useCallback(() => {
+    if (inIntro) {
+      skipIntro();
+      return;
+    }
+    const end = recapWindow?.end;
+    if (end != null) seekToAbsolute(end);
+  }, [inIntro, skipIntro, recapWindow, seekToAbsolute]);
 
   const introFillRef = useRef<HTMLSpanElement | null>(null);
   const introFillPos = useRef(0);
@@ -1106,6 +1136,7 @@ export function VideoPlayer({
           toggleMute();
           break;
         case 'c':
+          if (subtitles.length === 0) break;
           take();
           toggleCaptions();
           break;
@@ -1128,6 +1159,7 @@ export function VideoPlayer({
     toggleMute,
     toggleFullscreen,
     toggleCaptions,
+    subtitles,
     revealControls,
   ]);
 
@@ -1300,7 +1332,13 @@ export function VideoPlayer({
           setVolume(event.currentTarget.volume);
           setMuted(event.currentTarget.muted);
         }}
-        onError={onError}
+        onError={(event) => {
+          const error = event.currentTarget.error;
+          onError({
+            decode: error?.code === MediaError.MEDIA_ERR_DECODE,
+            detail: error?.message || (error ? `code ${error.code}` : undefined),
+          });
+        }}
       />
 
       {buffering ? (
@@ -1327,7 +1365,7 @@ export function VideoPlayer({
           The intro skipper reveals itself once on window entry, then binds
           to the controls. The credits elements are a takeover that keeps the
           chrome down until a choice is made. */}
-      {inIntro && introWindow?.end != null ? (
+      {leadWindow?.end != null ? (
         <div
           className={`absolute right-4 z-20 flex items-center gap-3 transition-[bottom,opacity] duration-300 sm:right-6 ${
             showIntroSkip
@@ -1348,7 +1386,7 @@ export function VideoPlayer({
           ) : null}
           <button
             type="button"
-            onClick={skipIntro}
+            onClick={skipLead}
             className={`relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full px-4 py-2 text-[0.8rem] font-medium text-black transition-colors ${
               introAutoActive ? 'bg-white/70' : 'bg-white hover:bg-white/85'
             }`}
@@ -1361,7 +1399,7 @@ export function VideoPlayer({
                 style={{ transform: 'scaleX(0)' }}
               />
             ) : null}
-            <span className="relative">Skip intro</span>
+            <span className="relative">{inIntro ? 'Skip intro' : 'Skip recap'}</span>
             <IoPlaySkipForward size={15} className="relative" aria-hidden />
           </button>
         </div>
@@ -1645,12 +1683,14 @@ export function VideoPlayer({
           </p>
 
           <div className="ml-auto flex items-center gap-1.5 sm:gap-2.5">
-            <ControlButton
-              label={captionsOn ? 'Turn off captions' : 'Turn on captions'}
-              onClick={toggleCaptions}
-            >
-              {captionsOn ? <MdClosedCaption size={21} /> : <MdClosedCaptionOff size={21} />}
-            </ControlButton>
+            {subtitles.length > 0 ? (
+              <ControlButton
+                label={captionsOn ? 'Turn off captions' : 'Turn on captions'}
+                onClick={toggleCaptions}
+              >
+                {captionsOn ? <MdClosedCaption size={21} /> : <MdClosedCaptionOff size={21} />}
+              </ControlButton>
+            ) : null}
 
             <div ref={settingsRef} className="relative">
               <ControlButton

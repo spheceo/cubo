@@ -22,6 +22,10 @@
 //! - `-noaccurate_seek`: audio starts at the landing keyframe together with
 //!   copied video instead of being trimmed to the seek target — the A/V
 //!   sync fix from the previous pipeline, still required here.
+//! - Re-encoded video (`VideoTranscode`) keeps that contract with
+//!   `-force_key_frames source`: output keyframes land exactly on the
+//!   source's, so fragments still split on the planned boundaries. No
+//!   B-frames, so decode time equals presentation time.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -60,8 +64,56 @@ pub struct RemuxInput {
     pub audio_stream_index: Option<u32>,
     pub audio_copy: bool,
     pub hevc: bool,
+    /// Re-encode the video to H.264 instead of copying it.
+    pub transcode: Option<VideoTranscode>,
     /// Source time of playlist zero (the first keyframe; usually 0).
     pub origin: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VideoTranscode {
+    /// Interlaced source: deinterlace to one frame per frame.
+    pub deinterlace: bool,
+    /// Source height, to size the bitrate.
+    pub height: Option<u32>,
+}
+
+impl VideoTranscode {
+    fn bitrate(&self) -> &'static str {
+        match self.height.unwrap_or(1080) {
+            height if height > 1080 => "16M",
+            height if height > 720 => "8M",
+            height if height > 480 => "5M",
+            _ => "3M",
+        }
+    }
+
+    fn args(&self) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        let mut filters = Vec::new();
+        if self.deinterlace {
+            filters.push("yadif");
+        }
+        filters.push("format=yuv420p");
+        args.extend(["-vf".into(), filters.join(",")]);
+        if cfg!(target_os = "macos") {
+            // The hardware encoder runs several times faster than real
+            // time on any Apple Silicon Mac; allow_sw covers Macs without it.
+            args.extend(
+                ["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-profile:v", "high", "-b:v", self.bitrate()]
+                    .map(String::from),
+            );
+        } else {
+            args.extend(
+                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-maxrate", self.bitrate(), "-bufsize", "16M"]
+                    .map(String::from),
+            );
+        }
+        // Keyframes only where the source has them (the plan's boundaries);
+        // ffmpeg's default GOP of 12 would cut a fragment every few frames.
+        args.extend(["-g", "1000", "-force_key_frames", "source", "-bf", "0"].map(String::from));
+        args
+    }
 }
 
 #[derive(Debug)]
@@ -374,10 +426,17 @@ impl Remuxer {
             Some(index) => command.args(["-map", &format!("0:{index}")]),
             None => command.args(["-map", "0:a:0?"]),
         };
-        command.args(["-c:v", "copy"]);
-        if input.hevc {
-            // Browsers only accept HEVC in MP4 with the hvc1 tag.
-            command.args(["-tag:v", "hvc1"]);
+        match input.transcode {
+            Some(transcode) => {
+                command.args(transcode.args());
+            }
+            None => {
+                command.args(["-c:v", "copy"]);
+                if input.hevc {
+                    // Browsers only accept HEVC in MP4 with the hvc1 tag.
+                    command.args(["-tag:v", "hvc1"]);
+                }
+            }
         }
         if input.audio_copy {
             command.args(["-c:a", "copy"]);
@@ -630,6 +689,10 @@ mod tests {
     use crate::test_support::{ffmpeg, fixture_mkv, fragment_times, FixtureSpec};
 
     async fn remuxer_for(spec: FixtureSpec) -> Option<Arc<Remuxer>> {
+        remuxer_with(spec, None).await
+    }
+
+    async fn remuxer_with(spec: FixtureSpec, transcode: Option<VideoTranscode>) -> Option<Arc<Remuxer>> {
         let ffmpeg = ffmpeg()?;
         let path = fixture_mkv(spec)?;
         let bytes = std::fs::read(&path).ok()?;
@@ -643,6 +706,7 @@ mod tests {
                 audio_stream_index: None,
                 audio_copy: false,
                 hevc: spec.hevc,
+                transcode,
                 origin: 0.0,
             },
             plan,
@@ -704,6 +768,31 @@ mod tests {
             check(&remuxer, &init, count / 2).await;
             check(&remuxer, &init, count / 2 + 1).await;
             assert!(remuxer.status().restarts >= 2);
+            remuxer.close();
+        }
+    }
+
+    /// Re-encoded video must file into the same plan as copied video, from
+    /// any job, so a decode-failure fallback keeps seeking exact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcoded_segments_match_the_plan_across_seek_jobs() {
+        for (spec, deinterlace) in [
+            (FixtureSpec::default(), false),
+            (FixtureSpec { hevc: true, keyframe_every: 5.3, ..FixtureSpec::default() }, true),
+        ] {
+            let transcode = VideoTranscode { deinterlace, height: Some(240) };
+            let Some(remuxer) = remuxer_with(spec, Some(transcode)).await else {
+                eprintln!("skipping: ffmpeg or fixture unavailable");
+                return;
+            };
+            let count = remuxer.plan().len();
+            let init = remuxer.init_segment(Duration::from_secs(60)).await.unwrap();
+            assert!(init.windows(4).any(|window| window == b"avc1"), "re-encode is not H.264");
+            for index in 0..3 {
+                check(&remuxer, &init, index).await;
+            }
+            check(&remuxer, &init, count - 2).await;
+            check(&remuxer, &init, count / 2).await;
             remuxer.close();
         }
     }

@@ -186,6 +186,28 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
   source at the same position (`checkStarved` in `watch-screen.tsx`). Only
   measured throughput decides, never seeders, and only while an untried
   source remains; a manually picked source is never switched.
+- Some files carry video the browser cannot decode although the codec is
+  supported (Apple's hardware decoder rejects frames in BBC 50 fps WEB-DLs;
+  interlaced HDTV captures never decode). A decode error (video element
+  `MEDIA_ERR_DECODE` or a fatal hls.js media error) restarts the same
+  source with `transcodeVideo`, which Core re-encodes to H.264
+  (`h264_videotoolbox` on macOS, libx264 elsewhere), and the source is
+  remembered (`decode-fallback.ts`) so later visits re-encode at once.
+  Interlaced sources always re-encode, deinterlaced. Re-encodes use
+  `-force_key_frames source`, no B-frames, so segments keep the plan.
+  Restarting such a file unchanged only loops; never treat it as healthy.
+- Core listens for incoming peers (TCP + uTP on 48765, falling back to a
+  free port) with UPnP. Without a listener, seeders behind NAT never reach
+  Core and the same swarm streams far slower than in other clients.
+- A closed session pauses its torrent only after a grace period with no
+  live session on it: recovery and audio switches open a replacement on
+  the same torrent, and an immediate pause drops every peer.
+- Recaps and previews come from Core's sections when it has them,
+  otherwise from the English subtitles' narrator lead-ins ("Previously
+  on…", "Coming soon on…", `recap-preview.ts`). Skip recap shares the
+  intro skipper (no auto-skip); a preview opens the credits prompt.
+- The captions button and the Subtitles settings row only show when the
+  title has subtitle tracks.
 - Core never re-resolves a known source from the swarm: a torrent rqbit
   already manages is reused, otherwise saved metadata
   (`<data>/torrent-meta/<hash>.torrent`) is added from disk. rqbit resolves

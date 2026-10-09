@@ -586,6 +586,8 @@ export interface PlaybackSessionStatus {
   /** The file's audio tracks and the one playing (older Cores omit both). */
   audioTracks?: SessionAudioTrack[];
   audioIndex?: number;
+  /** Core re-encodes the picture instead of copying it (older Cores omit). */
+  videoTranscode?: boolean;
   timeline: {
     resolvedMs?: number;
     initializedMs?: number;
@@ -622,6 +624,8 @@ export async function createSession(
     hevc: boolean;
     /** ISO 639-1 audio language to play: the original, or "en" for a dub. */
     audioLanguage?: string | null;
+    /** Re-encode the picture: the browser failed to decode this source. */
+    transcodeVideo?: boolean;
   },
 ): Promise<PlaybackSessionStatus> {
   const response = await engineFetch(engine, '/v1/sessions', {
