@@ -109,7 +109,9 @@ export function VideoPlayer({
   introWindow,
   introAutoSkipEligible = false,
   recapWindow,
+  skipRecapOnEntry = false,
   creditsWindow,
+  creditsKind = 'credits',
   onNextEpisode,
   onCreditsReached,
   sections,
@@ -127,8 +129,14 @@ export function VideoPlayer({
   introAutoSkipEligible?: boolean;
   /** "Previously on…" recap window; offers Skip recap like the intro. */
   recapWindow?: { start: number; end: number | null } | null;
+  /** The viewer came straight from the previous episode: jump past the
+   *  recap without offering anything, once. Rewinding into it later only
+   *  offers Skip recap. */
+  skipRecapOnEntry?: boolean;
   /** Detected credits/outro window in absolute source seconds. */
   creditsWindow?: { start: number; end: number | null } | null;
+  /** What the end window is: the credits, or a "Next time on…" preview. */
+  creditsKind?: 'credits' | 'preview';
   /** Offered during the credits window when a follow-up episode exists;
    *  without one the credits action leaves the player instead. */
   onNextEpisode?: () => void;
@@ -754,12 +762,16 @@ export function VideoPlayer({
     introWindow.end != null &&
     shownTime >= introWindow.start &&
     shownTime < introWindow.end;
-  const inRecap =
+  const inRecapWindow =
     !inIntro &&
     recapWindow != null &&
     recapWindow.end != null &&
     shownTime >= recapWindow.start &&
     shownTime < recapWindow.end;
+  const recapKey = recapWindow ? `${recapWindow.start}-${recapWindow.end}` : null;
+  const [recapEntryHandled, setRecapEntryHandled] = useState<string | null>(null);
+  const skipRecapNow = inRecapWindow && skipRecapOnEntry && recapEntryHandled !== recapKey;
+  const inRecap = inRecapWindow && !skipRecapNow;
   // The intro and recap share one skipper: same placement and reveal rules.
   const leadWindow = inIntro ? introWindow : inRecap ? recapWindow : null;
   const inLead = leadWindow != null;
@@ -1013,6 +1025,12 @@ export function VideoPlayer({
     setIntroAutoHandled(introKey);
     if (end != null) seekToAbsolute(end);
   }, [introWindow, introKey, seekToAbsolute]);
+  useEffect(() => {
+    const end = recapWindow?.end;
+    if (!skipRecapNow || end == null) return;
+    setRecapEntryHandled(recapKey);
+    seekToAbsolute(end);
+  }, [skipRecapNow, recapWindow, recapKey, seekToAbsolute]);
   const skipLead = useCallback(() => {
     if (inIntro) {
       skipIntro();
@@ -1415,7 +1433,7 @@ export function VideoPlayer({
             onClick={() => setCreditsDismissed(true)}
             className="cursor-pointer rounded-full border border-white/30 bg-black/60 px-3.5 py-2 text-[0.8rem] font-medium text-white/90 backdrop-blur-md transition-colors hover:border-white/50 hover:text-white"
           >
-            Watch credits
+            {creditsKind === 'preview' ? 'Watch preview' : 'Watch credits'}
           </button>
           <button
             type="button"

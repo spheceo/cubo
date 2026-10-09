@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { detectRecapPreview, recapWindow, withRecapPreview } from './recap-preview';
+import { detectRecapPreview, endWindow, recapWindow, withRecapPreview } from './recap-preview';
 import type { SubtitleCue } from './subtitles';
 
 const cue = (start: number, end: number, text: string): SubtitleCue => ({ start, end, text });
@@ -44,14 +44,27 @@ test('no lead-in, no recap; a recap that never pauses is not trusted', () => {
   assert.equal(detectRecapPreview(endless, 3000).recap, null);
 });
 
-test('the preview opens the credits prompt and both become timeline sections', () => {
+test('the preview ends the episode before the credits while a next episode exists', () => {
   const merged = withRecapPreview(
     { intro: null, credits: { start: 3480, end: null }, sections: [] },
     detectRecapPreview(traitors, 3493),
   );
-  assert.equal(merged?.credits?.start, 3443.28);
   assert.deepEqual(merged?.sections.map((section) => section.kind), ['recap', 'preview']);
   assert.deepEqual(recapWindow(merged), { start: 3.96, end: 91.92, source: 'subtitles' });
+  assert.deepEqual(endWindow(merged, true), {
+    window: { start: 3443.28, end: null, source: 'subtitles' },
+    kind: 'preview',
+  });
+  // The last episode plays its teaser; only the real credits prompt.
+  assert.deepEqual(endWindow(merged, false), { window: { start: 3480, end: null }, kind: 'credits' });
+});
+
+test('credits that come before the preview stay the end of the episode', () => {
+  const merged = withRecapPreview(
+    { intro: null, credits: { start: 3400, end: null }, sections: [] },
+    detectRecapPreview(traitors, 3493),
+  );
+  assert.equal(endWindow(merged, true)?.kind, 'credits');
 });
 
 test('Core sections win over subtitle guesses', () => {

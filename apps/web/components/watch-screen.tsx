@@ -18,7 +18,7 @@ import { IoClose, IoList } from 'react-icons/io5';
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery } from '@tanstack/react-query';
-import { useNavigate } from 'react-router';
+import { useLocation, useNavigate } from 'react-router';
 import { Link } from '@/components/link';
 import { Dropdown } from '@/components/dropdown';
 import { EpisodeRow } from '@/components/episode-list';
@@ -80,7 +80,7 @@ import {
 } from '@/lib/audio-choice';
 import { ProgressWriter } from '@/lib/progress-writer';
 import { needsReencode, rememberReencode } from '@/lib/decode-fallback';
-import { detectRecapPreview, recapWindow, withRecapPreview, type RecapPreview } from '@/lib/recap-preview';
+import { detectRecapPreview, endWindow, recapWindow, withRecapPreview, type RecapPreview } from '@/lib/recap-preview';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
 import { loadSubtitleCues } from '@/lib/subtitles';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
@@ -183,6 +183,20 @@ export function WatchScreen({
   const core = useCore();
   const refreshLibrary = core.refreshLibrary;
   const navigate = useNavigate();
+  const location = useLocation();
+  /** Arrived here from the previous episode's Next episode: the viewer just
+   *  watched what the recap recaps. Read once per navigation, then cleared
+   *  from the history entry so a reload or a later visit plays it. */
+  const continuedEpisode = useMemo(
+    () => (location.state as { continuedEpisode?: boolean } | null)?.continuedEpisode === true,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [location.key],
+  );
+  useEffect(() => {
+    if (!continuedEpisode) return;
+    const entry = window.history.state as { usr?: unknown } | null;
+    if (entry?.usr) window.history.replaceState({ ...entry, usr: null }, '');
+  }, [continuedEpisode]);
 
   const [sources, setSources] = useState<Stream[]>([]);
   const [status, setStatus] = useState<Status>('loading');
@@ -1083,6 +1097,8 @@ export function WatchScreen({
     [skipSegments, subtitleRecap],
   );
   const playerRecap = useMemo(() => recapWindow(playerSkips), [playerSkips]);
+  const hasNextEpisode = nextEpisode != null;
+  const playerEnd = useMemo(() => endWindow(playerSkips, hasNextEpisode), [playerSkips, hasNextEpisode]);
 
   useEffect(() => {
     if (!imdbId) return;
@@ -1260,7 +1276,9 @@ export function WatchScreen({
     if (!nextEpisode) return;
     const target = nextEpisode;
     void finishPlayback().finally(() => {
-      navigate(`/watch/tv/${mediaId}?season=${target.season}&episode=${target.episode}`);
+      navigate(`/watch/tv/${mediaId}?season=${target.season}&episode=${target.episode}`, {
+        state: { continuedEpisode: true },
+      });
     });
   }, [nextEpisode, finishPlayback, navigate, mediaId]);
 
@@ -1559,8 +1577,10 @@ export function WatchScreen({
           flushRef={playerFlushRef}
           introWindow={playerSkips?.intro ?? null}
           recapWindow={playerRecap}
+          skipRecapOnEntry={continuedEpisode}
           introAutoSkipEligible={introAutoSkipEligible(mediaType, episode)}
-          creditsWindow={playerSkips?.credits ?? null}
+          creditsWindow={playerEnd?.window ?? null}
+          creditsKind={playerEnd?.kind ?? 'credits'}
           onNextEpisode={nextEpisode ? goToNextEpisode : undefined}
           onCreditsReached={markDoneAtCredits}
           sections={playerSkips?.sections}

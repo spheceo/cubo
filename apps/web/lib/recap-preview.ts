@@ -74,8 +74,7 @@ function findPreview(cues: SubtitleCue[], durationSeconds: number): SkipSegmentW
 }
 
 /** Skip windows with subtitle-detected recaps and previews filled in where
- *  Core found none. A preview ends the episode, so it opens the credits
- *  prompt (Next episode) when it comes before the credits. */
+ *  Core found none. */
 export function withRecapPreview(segments: SkipSegments | null, found: RecapPreview): SkipSegments | null {
   if (!found.recap && !found.preview) return segments;
   const base: SkipSegments = segments ?? { intro: null, credits: null, sections: [] };
@@ -84,15 +83,28 @@ export function withRecapPreview(segments: SkipSegments | null, found: RecapPrev
   if (found.recap && !has('recap')) {
     sections.push({ ...found.recap, kind: 'recap', label: 'Recap' });
   }
-  let credits = base.credits;
   if (found.preview && !has('preview')) {
     sections.push({ ...found.preview, kind: 'preview', label: 'Preview' });
   }
-  const preview = sections.find((section) => section.kind === 'preview');
-  if (preview && (!credits || preview.start < credits.start)) {
-    credits = { start: preview.start, end: null, source: preview.source };
+  return { ...base, sections };
+}
+
+export interface EndWindow {
+  window: SkipSegmentWindow;
+  kind: 'credits' | 'preview';
+}
+
+/** Where the episode is over and the Next episode prompt takes over. A
+ *  "Next time on…" preview ends it when it comes before the credits, but
+ *  only while there is a next episode to go to: on the last one the teaser
+ *  is the only look ahead there is, so it simply plays. */
+export function endWindow(segments: SkipSegments | null, hasNextEpisode: boolean): EndWindow | null {
+  const credits = segments?.credits ?? null;
+  const preview = segments?.sections.find((section) => section.kind === 'preview');
+  if (preview && hasNextEpisode && (!credits || preview.start < credits.start)) {
+    return { window: { start: preview.start, end: null, source: preview.source }, kind: 'preview' };
   }
-  return { ...base, credits, sections };
+  return credits ? { window: credits, kind: 'credits' } : null;
 }
 
 /** The recap to offer a skip for: Core's (chapters, crowd data) first. */
