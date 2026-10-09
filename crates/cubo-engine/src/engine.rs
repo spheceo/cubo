@@ -42,10 +42,14 @@ use crate::system;
 use crate::transcode::{chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager};
 use crate::update::UpdateManager;
 
-const CORE_PORT: u16 = 8765;
-/// How many ports after `CORE_PORT` to try when the preferred one is taken
-/// (e.g. `cubo persist` already owns :8765 and `just dev` should not kill it).
-const CORE_PORT_SCAN: u16 = 20;
+/// The installed Core (release builds, `cubo persist`) always owns 8765.
+pub const PROD_CORE_PORT: u16 = 8765;
+/// A development Core (debug builds, `just dev`) gets its own fixed slot, so
+/// it runs beside the installed one and the web app always knows where.
+pub const DEV_CORE_PORT: u16 = 8764;
+/// This build's slot. There is no scanning: a busy slot means that Core is
+/// already running, and starting a second one is refused.
+pub const CORE_PORT: u16 = if cfg!(debug_assertions) { DEV_CORE_PORT } else { PROD_CORE_PORT };
 /// Persist often starts at login before Tailscale has an address. Retry soon,
 /// then keep polling so a later connect still gets :8765 on the tailnet IP.
 const TAILSCALE_REBIND_FIRST: Duration = Duration::from_secs(2);
@@ -58,7 +62,7 @@ const WEB_PROXY_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = ["http://localhost:4200", "http://127.0.0.1:4200"];
 /// Ports a loopback or own-hostname origin may always use, plus the port
 /// this process actually bound (see `OriginPolicy::allowed_ports`).
-const BASE_ALLOWED_ORIGIN_PORTS: [u16; 2] = [CORE_PORT, 4200];
+const BASE_ALLOWED_ORIGIN_PORTS: [u16; 2] = [PROD_CORE_PORT, 4200];
 
 pub struct Engine {
     bridge_port: u16,
@@ -141,6 +145,13 @@ static ENGINE: OnceCell<Engine> = OnceCell::const_new();
 pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
     let engine = ENGINE
         .get_or_try_init(|| async {
+            // Claim this build's port before touching any shared state: a
+            // Core refused because its slot is taken must not reconcile the
+            // cache index or start a torrent engine on the same data.
+            // Tailscale is probed once here so the first bind can include it
+            // when it is already up; a later loop retries if it was not.
+            let tailscale_address = detect_tailscale_ipv4();
+            let (bridge_port, bridge_listeners) = bind_bridges(tailscale_address).await?;
             let state_path = download_dir
                 .parent()
                 .unwrap_or(download_dir.as_path())
@@ -205,10 +216,6 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
                 }
             });
 
-            // Probed once here so the first bind can include Tailscale when
-            // it is already up. A later loop retries if it was not.
-            let tailscale_address = detect_tailscale_ipv4();
-            let (bridge_port, bridge_listeners) = bind_bridges(tailscale_address).await?;
             let bridge_addresses = Arc::new(StdRwLock::new(
                 bridge_listeners
                     .iter()
@@ -339,8 +346,9 @@ enum BindAttempt {
     Failed(String),
 }
 
-/// Port Core prefers for incoming peer connections (TCP and uTP).
-const PEER_PORT: u16 = 48765;
+/// Port Core prefers for incoming peer connections (TCP and uTP), one per
+/// slot like the bridge port.
+const PEER_PORT: u16 = if cfg!(debug_assertions) { 48764 } else { 48765 };
 
 /// Starts rqbit. Core accepts incoming peers over TCP and uTP and asks the
 /// router to forward the port (UPnP), like any desktop torrent client.
@@ -416,28 +424,25 @@ async fn bind_bridges(
         }
     }
 
-    let last = CORE_PORT.saturating_add(CORE_PORT_SCAN - 1);
-    for port in CORE_PORT..=last {
-        match try_bind_port(&addresses, port).await {
-            BindAttempt::Ready(listeners) => {
-                if port != CORE_PORT {
-                    tracing::info!(
-                        target: "engine",
-                        preferred = CORE_PORT,
-                        port,
-                        "preferred port in use; bound the next free port"
-                    );
-                }
-                return Ok((port, listeners));
-            }
-            BindAttempt::Busy => continue,
-            BindAttempt::Failed(error) => return Err(error),
-        }
+    match try_bind_port(&addresses, CORE_PORT).await {
+        BindAttempt::Ready(listeners) => Ok((CORE_PORT, listeners)),
+        BindAttempt::Busy => Err(slot_busy_message(CORE_PORT)),
+        BindAttempt::Failed(error) => Err(error),
     }
+}
 
-    Err(format!(
-        "Cubo Core could not bind {CORE_PORT}-{last}: every port is in use"
-    ))
+fn slot_busy_message(port: u16) -> String {
+    if port == DEV_CORE_PORT {
+        format!(
+            "port {port} is in use. A development Core is probably already running \
+             (dev builds always use {port}; the installed Cubo keeps {PROD_CORE_PORT})."
+        )
+    } else {
+        format!(
+            "port {port} is in use. Cubo is probably already running, for example \
+             through `cubo persist`. Open http://localhost:{port}, or stop it first."
+        )
+    }
 }
 
 async fn try_bind_port(addresses: &[IpAddr], port: u16) -> BindAttempt {
@@ -2835,11 +2840,11 @@ mod tests {
     }
 
     #[test]
-    fn fallback_core_port_is_trusted_for_cors() {
-        let ports = allowed_origin_ports(8766);
-        assert!(ports.contains(&8765));
+    fn bound_core_port_is_trusted_for_cors() {
+        let ports = allowed_origin_ports(DEV_CORE_PORT);
         assert!(ports.contains(&4200));
-        assert!(ports.contains(&8766));
+        assert!(ports.contains(&DEV_CORE_PORT));
+        assert!(allowed_origin_ports(PROD_CORE_PORT).contains(&PROD_CORE_PORT));
     }
 
     #[test]
@@ -2876,7 +2881,7 @@ mod tests {
         let policy = OriginPolicy {
             allowed_origins: allowed_origins(None),
             allowed_hosts: hosts.clone(),
-            allowed_ports: allowed_origin_ports(CORE_PORT),
+            allowed_ports: allowed_origin_ports(PROD_CORE_PORT),
         };
         let late = HeaderValue::from_static("http://100.80.66.124:8765");
         assert!(!policy.allows(&late));
@@ -2892,26 +2897,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_bridges_moves_off_a_busy_preferred_port() {
-        let _occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, CORE_PORT))
-            .await
-            .ok();
-        let (port, listeners) = bind_bridges(None).await.expect("fallback bind");
-        if _occupied.is_some()
-            || TcpListener::bind((Ipv4Addr::LOCALHOST, CORE_PORT))
-                .await
-                .is_err()
-        {
-            assert_ne!(port, CORE_PORT);
-        }
-        assert!(listeners
-            .iter()
-            .any(|listener| listener.local_addr().is_ok_and(|addr| addr.port() == port)));
+    async fn bind_bridges_refuses_a_busy_slot() {
+        // Whether this test or an already-running Core holds the slot, a
+        // second Core must not drift to another port.
+        let _occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, CORE_PORT)).await.ok();
+        let error = bind_bridges(None).await.err().expect("busy slot refused");
+        assert!(error.contains(&CORE_PORT.to_string()), "{error}");
+    }
+
+    #[test]
+    fn each_build_has_its_own_fixed_slot() {
+        assert_eq!(PROD_CORE_PORT, 8765);
+        assert_eq!(DEV_CORE_PORT, 8764);
+        assert_eq!(CORE_PORT, if cfg!(debug_assertions) { DEV_CORE_PORT } else { PROD_CORE_PORT });
     }
 
     #[test]
     fn default_origins_are_restricted() {
-        assert_eq!(CORE_PORT, 8765);
         let origins = allowed_origins(Some("https://cubo.example.com"));
         assert!(origins
             .iter()

@@ -154,9 +154,8 @@ async fn serve(no_open: bool) {
     println!();
     println!("  Cubo is running.");
     println!();
-    if port != 8765 {
-        println!("  Port 8765 is already in use, so this instance moved to {port}.");
-        println!("  The other Cubo (likely `cubo persist`) is still running.");
+    if port == engine::DEV_CORE_PORT {
+        println!("  Development build: port {port}. The installed Cubo keeps 8765.");
         println!();
     }
     println!("  Web app      http://localhost:{port}  (opens automatically)");

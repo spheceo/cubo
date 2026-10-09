@@ -9,7 +9,10 @@ import type {
 import { delayUnthrottled } from '@/lib/background-playback';
 import { announceCacheClear } from './cache-events';
 
+/** The installed Core's fixed port. */
 export const CORE_PORT = 8765;
+/** A development Core's fixed port (`just dev`), beside the installed one. */
+export const DEV_CORE_PORT = 8764;
 const DISCOVERY_TIMEOUT_MS = 4_000;
 const DEVICE_TOKEN_PREFIX = 'cubo.deviceToken:';
 
@@ -164,7 +167,7 @@ function coreFetch(url: string, init: RequestInit = {}) {
 export function currentOriginCoreEndpoint(): string {
   if (typeof window === 'undefined') return '';
   // Vite (:4200) and the marketing site (:4300) are separate processes.
-  // Core-hosted pages — preferred :8765 or a fallback like :8766 — use this origin.
+  // Core-hosted pages — the installed Core on :8765 or a dev Core on :8764 — use this origin.
   if (window.location.port === '4200' || window.location.port === '4300') return '';
   if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
     return '';
@@ -284,8 +287,8 @@ function explainCoreFailure(endpoint: string): string {
   return `Could not reach Cubo Core at ${endpoint}`;
 }
 
-/** `just dev` binds the next free port when persist already owns :8765. */
-const DEV_CORE_PORTS = [CORE_PORT, CORE_PORT + 1, CORE_PORT + 2];
+/** The Vite app talks to a running dev Core first, else the installed one. */
+const DEV_CORE_PORTS = [DEV_CORE_PORT, CORE_PORT];
 
 function isLoopbackName(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
@@ -344,14 +347,9 @@ export async function discoverLocalEngine(
     // IPv6 literals (::1) need brackets in a URL authority.
     const authority = host.includes(':') ? `[${host}]` : host;
     await Promise.all(
-      ports.map(async (port, index) => {
+      ports.map(async (port) => {
         try {
-          found.push(
-            await probeEndpoint(
-              `http://${authority}:${port}`,
-              index === 0 ? DISCOVERY_TIMEOUT_MS : 800,
-            ),
-          );
+          found.push(await probeEndpoint(`http://${authority}:${port}`));
         } catch (reason) {
           if (reason instanceof PairingRequiredError) pairing = reason;
         }

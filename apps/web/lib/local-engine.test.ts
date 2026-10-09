@@ -37,7 +37,7 @@ test('storage errors stay distinguishable from source failures throughout startu
 
 test('Vite on localhost prefers the just-dev Core that advertised :4200', () => {
   const persist = { baseUrl: 'http://127.0.0.1:8765', webUrl: null };
-  const justDev = { baseUrl: 'http://127.0.0.1:8766', webUrl: 'http://127.0.0.1:4200' };
+  const justDev = { baseUrl: 'http://127.0.0.1:8764', webUrl: 'http://127.0.0.1:4200' };
   assert.equal(
     pickDiscoveredCore([persist, justDev], { hostname: 'localhost', port: '4200' }),
     justDev,

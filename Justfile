@@ -1,6 +1,6 @@
 # Cubo task runner. `just` lists recipes.
 
-# Run Cubo Core. Uses :8765, or the next free port if persist already owns it.
+# Run a development Cubo Core on :8764, beside the installed one on :8765.
 dev:
     cargo run -p cubo-cli -- serve --no-open
 

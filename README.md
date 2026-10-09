@@ -45,12 +45,12 @@ Then open that HTTPS URL on any device in the tailnet.
 
 1. Install [just](https://just.systems) and [bun](https://bun.sh), then run `bun install`.
 2. Add `TMDB_API_KEY` to `apps/web/.env.local` (Vite dev catalog only).
-3. Run `just dev` to start Cubo Core (port 8765, or the next free port) and `just web` for the UI.
+3. Run `just dev` to start a development Cubo Core (port 8764) and `just web` for the UI.
 
 Useful commands:
 
 - `just` lists recipes.
-- `just dev` runs Cubo Core on port 8765, or the next free port if persist already owns it.
+- `just dev` runs a development Cubo Core on port 8764; the installed Cubo keeps 8765, so both can run at once.
 - `just web` starts the app at `http://localhost:4200`.
 - `just site` starts the marketing site at `http://localhost:4300`.
 - `just apps` runs the app and marketing site together.

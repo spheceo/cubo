@@ -17,6 +17,21 @@
 - `vendor/librqbit` — rqbit 9.0.1 with Cubo's piece-bitfield extensions
   (`CUBO-PATCH.md`). When upgrading rqbit, port them and run `just soak`.
 
+## Core ports
+
+Two fixed slots, chosen by the build — no port scanning:
+
+- **8765** — release builds: the installed CLI and `cubo persist`.
+- **8764** — debug builds: `just dev` (`cargo run -p cubo-cli`).
+
+A Core whose slot is taken refuses to start and says which Core already
+holds it, so there is never a third Core on a surprise port. The torrent
+peer listener follows the same split (48765 / 48764, falling back to a free
+port only if another app holds it). The Vite app on :4200 checks 8764 first
+and falls back to 8765; it prefers the Core whose `webUrl` is the page
+itself (debug builds advertise `http://127.0.0.1:4200`). Pages served by a
+Core talk to that Core.
+
 ## Task runner
 
 Use [just](https://just.systems) from the repo root (`Justfile`). `just`
@@ -39,5 +54,5 @@ with timestamps; `boot-service.log` for `cubo persist`). The web app ships
 its own events there (`stream_selected`, `session_error`, `source_failed`,
 `source_starved`, `playback_stall`, …). To reproduce without touching the
 real cache, run a dev Core with `HOME` pointed at a scratch directory (it
-takes the next free port after 8765) and copy the relevant
+uses the dev slot, 8764) and copy the relevant
 `torrent-meta/<hash>.torrent` files into it.
