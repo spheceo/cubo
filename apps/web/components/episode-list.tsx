@@ -6,7 +6,8 @@ import {
 } from '@cubo/core';
 import { useQuery } from '@tanstack/react-query';
 import { useRef, useState } from 'react';
-import { IoCalendarOutline, IoCheckmark, IoClose, IoList } from 'react-icons/io5';
+import { IoCalendarOutline, IoCheckmark, IoClose } from 'react-icons/io5';
+import { LuGalleryVerticalEnd } from 'react-icons/lu';
 import { Dropdown } from '@/components/dropdown';
 import { Link } from '@/components/link';
 import { useCore } from '@/components/core-provider';
@@ -61,7 +62,7 @@ export function EpisodeList({
           size === 'lg' ? 'h-14 gap-3 px-7' : 'h-12 gap-2 px-5'
         }`}
       >
-        <IoList size={size === 'lg' ? 22 : 20} />
+        <LuGalleryVerticalEnd size={size === 'lg' ? 22 : 20} />
         Episodes
       </button>
 

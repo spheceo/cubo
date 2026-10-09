@@ -14,7 +14,8 @@ import {
   type SubtitleTrack,
 } from '@cubo/core';
 import { IoIosArrowBack } from 'react-icons/io';
-import { IoClose, IoList } from 'react-icons/io5';
+import { IoClose } from 'react-icons/io5';
+import { LuGalleryVerticalEnd } from 'react-icons/lu';
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -1775,7 +1776,7 @@ function PlayerEpisodes({
         onClick={onOpen}
         className="pointer-events-auto absolute right-4 top-4 z-20 flex h-10 cursor-pointer w-10 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-md transition-colors hover:bg-black/80 sm:right-6 sm:top-6"
       >
-        <IoList size={21} />
+        <LuGalleryVerticalEnd size={21} />
       </button>
       {createPortal(
         <dialog
