@@ -208,7 +208,7 @@ export function EpisodeRow({
         } ${active ? 'bg-control' : ''}`}
       >
         <div
-          className={`relative aspect-video shrink-0 overflow-hidden rounded-xl border bg-surface ${
+          className={`relative aspect-video shrink-0 self-start overflow-hidden rounded-xl border bg-surface ${
             compact ? 'w-28 border-white/10' : 'w-32 border-white/10 sm:w-44'
           }`}
         >
