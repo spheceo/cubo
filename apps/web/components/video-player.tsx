@@ -50,6 +50,8 @@ const SKIP_SECONDS = 10;
 const AUTO_NEXT_MS = 6_000;
 /** Seconds the Skip intro fill takes to complete before auto-skipping. */
 const AUTO_SKIP_INTRO_MS = 4_000;
+/** Matches `.player-menu[data-closing]` in globals.css. */
+const SETTINGS_CLOSE_MS = 140;
 
 export type BufferedRange = {
   start: number;
@@ -755,6 +757,18 @@ export function VideoPlayer({
       document.removeEventListener('pointerdown', closeOnOutside);
       window.removeEventListener('keydown', onKeyDown, true);
     };
+  }, [settingsOpen]);
+
+  // The settings menu stays mounted while its closing animation plays.
+  const [settingsMenu, setSettingsMenu] = useState<'open' | 'closing' | 'closed'>('closed');
+  useEffect(() => {
+    if (settingsOpen) {
+      setSettingsMenu('open');
+      return;
+    }
+    setSettingsMenu((current) => (current === 'closed' ? 'closed' : 'closing'));
+    const timer = window.setTimeout(() => setSettingsMenu('closed'), SETTINGS_CLOSE_MS);
+    return () => window.clearTimeout(timer);
   }, [settingsOpen]);
 
   const shownTime = scrubTime ?? pendingSeek ?? currentTime;
@@ -1736,30 +1750,35 @@ export function VideoPlayer({
               >
                 <IoSettingsSharp size={20} />
               </ControlButton>
-              {settingsOpen ? (
-                <PlayerSettings
-                  subtitles={subtitles}
-                  activeSubtitleId={activeSubtitleId}
-                  onPickSubtitle={onPickSubtitle}
-                  captionSize={captionSize}
-                  onPickCaptionSize={onPickCaptionSize}
-                  captionColor={captionColor}
-                  onPickCaptionColor={onPickCaptionColor}
-                  framing={framing}
-                  onPickFraming={pickFraming}
-                  autoSkipIntro={autoSkipIntro}
-                  onToggleAutoSkipIntro={toggleAutoSkipIntro}
-                  sectionsVisible={showSections}
-                  onToggleSections={toggleSections}
-                  sectionColors={sectionColors}
-                  onPickSectionColor={pickSectionColor}
-                  audioOptions={audioOptions}
-                  activeAudio={activeAudio}
-                  onPickAudio={(value) => {
-                    setSettingsOpen(false);
-                    if (value !== activeAudio) onPickAudio?.(value);
-                  }}
-                />
+              {settingsMenu !== 'closed' ? (
+                <div
+                  className="player-menu absolute bottom-12 right-0 z-20"
+                  data-closing={settingsMenu === 'closing' ? '' : undefined}
+                >
+                  <PlayerSettings
+                    subtitles={subtitles}
+                    activeSubtitleId={activeSubtitleId}
+                    onPickSubtitle={onPickSubtitle}
+                    captionSize={captionSize}
+                    onPickCaptionSize={onPickCaptionSize}
+                    captionColor={captionColor}
+                    onPickCaptionColor={onPickCaptionColor}
+                    framing={framing}
+                    onPickFraming={pickFraming}
+                    autoSkipIntro={autoSkipIntro}
+                    onToggleAutoSkipIntro={toggleAutoSkipIntro}
+                    sectionsVisible={showSections}
+                    onToggleSections={toggleSections}
+                    sectionColors={sectionColors}
+                    onPickSectionColor={pickSectionColor}
+                    audioOptions={audioOptions}
+                    activeAudio={activeAudio}
+                    onPickAudio={(value) => {
+                      setSettingsOpen(false);
+                      if (value !== activeAudio) onPickAudio?.(value);
+                    }}
+                  />
+                </div>
               ) : null}
             </div>
 

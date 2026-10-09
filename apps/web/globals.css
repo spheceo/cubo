@@ -201,3 +201,32 @@
     transition: none;
   }
 }
+
+/* Player settings menu: grows out of the gear on open, eases back on close
+   (`SETTINGS_CLOSE_MS` in video-player.tsx keeps it mounted meanwhile). */
+.player-menu {
+  transform-origin: bottom right;
+  animation: player-menu-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.player-menu[data-closing] {
+  pointer-events: none;
+  animation: player-menu-out 140ms ease-in forwards;
+}
+@keyframes player-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.96);
+  }
+}
+@keyframes player-menu-out {
+  to {
+    opacity: 0;
+    transform: translateY(4px) scale(0.97);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .player-menu,
+  .player-menu[data-closing] {
+    animation: none;
+  }
+}

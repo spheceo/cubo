@@ -103,7 +103,7 @@ export function PlayerSettings({
       <div
         role="dialog"
         aria-label="Playback settings"
-        className="absolute bottom-12 right-0 z-20 w-56 overflow-hidden rounded-xl border border-white/10 bg-black/92 py-1 shadow-2xl backdrop-blur-md"
+        className="relative w-56 overflow-hidden rounded-xl border border-white/10 bg-black/92 py-1 shadow-2xl backdrop-blur-md"
       >
         <PaneHeader label="Subtitles" onBack={() => setPanel('root')} />
         <div className="border-t border-white/8">
@@ -124,7 +124,7 @@ export function PlayerSettings({
     <div
       role="dialog"
       aria-label="Playback settings"
-      className="absolute bottom-12 right-0 z-20 w-56 overflow-hidden rounded-xl border border-white/10 bg-black/92 shadow-2xl backdrop-blur-md"
+      className="relative w-56 overflow-hidden rounded-xl border border-white/10 bg-black/92 shadow-2xl backdrop-blur-md"
     >
       {panel === 'sections' ? (
         <>
