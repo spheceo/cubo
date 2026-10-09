@@ -1,8 +1,8 @@
 /** Cubo's player for direct files and Core's complete VOD HLS playlists. */
 import { watchableSpan } from '@/lib/download-bar';
+import { GrBackTen, GrForwardTen } from 'react-icons/gr';
+import { LuMaximize, LuMinimize } from 'react-icons/lu';
 import {
-  IoContract,
-  IoExpand,
   IoPause,
   IoPlay,
   IoPlaySkipForward,
@@ -1689,10 +1689,10 @@ export function VideoPlayer({
           </ControlButton>
 
           <ControlButton label="Back 10 seconds" onClick={() => seekBy(-SKIP_SECONDS)}>
-            <SeekIcon direction="back" />
+            <GrBackTen size={22} />
           </ControlButton>
           <ControlButton label="Forward 10 seconds" onClick={() => seekBy(SKIP_SECONDS)}>
-            <SeekIcon direction="forward" />
+            <GrForwardTen size={22} />
           </ControlButton>
 
           <div className="group/vol flex items-center gap-2">
@@ -1800,7 +1800,7 @@ export function VideoPlayer({
               label={fullscreen ? 'Exit full screen' : 'Full screen'}
               onClick={toggleFullscreen}
             >
-              {fullscreen ? <IoContract size={21} /> : <IoExpand size={21} />}
+              {fullscreen ? <LuMinimize size={21} /> : <LuMaximize size={21} />}
             </ControlButton>
           </div>
         </div>
@@ -1831,42 +1831,6 @@ export function VideoPlayer({
         </div>
       ) : null}
     </div>
-  );
-}
-
-/** Circular arrow with the jump length inside — reads as "10 seconds back"
- *  or "forward" at a glance, unlike media-track skip glyphs. */
-function SeekIcon({ direction }: { direction: 'back' | 'forward' }) {
-  const back = direction === 'back';
-  return (
-    <svg width={22} height={22} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <g transform={back ? undefined : 'matrix(-1 0 0 1 24 0)'}>
-        <path
-          d="M4.6 9.2A8.25 8.25 0 1 1 3.75 12.75"
-          stroke="currentColor"
-          strokeWidth={1.9}
-          strokeLinecap="round"
-        />
-        <path
-          d="M4.1 4.6 4.6 9.2 9.1 8.4"
-          stroke="currentColor"
-          strokeWidth={1.9}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </g>
-      <text
-        x={12}
-        y={15.6}
-        textAnchor="middle"
-        fontSize={9.5}
-        fontWeight={700}
-        fill="currentColor"
-        style={{ fontFamily: 'inherit', letterSpacing: '-0.04em' }}
-      >
-        {SKIP_SECONDS}
-      </text>
-    </svg>
   );
 }
 
