@@ -1,6 +1,6 @@
 /**
  * Source ranking for playback and previews. Part of the verified-working
- * playback pipeline (see AGENTS.md): direct-play files outrank remux-needing
+ * playback pipeline (see docs/playback.md): direct-play files outrank remux-needing
  * files within a quality tier so the ffmpeg converter stays a fallback.
  */
 import type { Stream } from '@cubo/core';
