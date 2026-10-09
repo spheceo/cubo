@@ -5,7 +5,6 @@ import {
   type SeasonSummary,
 } from '@cubo/core';
 import { useQuery } from '@tanstack/react-query';
-import gsap from 'gsap';
 import { useRef, useState } from 'react';
 import { IoCalendarOutline, IoCheckmark, IoClose, IoList } from 'react-icons/io5';
 import { Dropdown } from '@/components/dropdown';
@@ -14,6 +13,7 @@ import { useCore } from '@/components/core-provider';
 import { formatNextEpisodeLabel } from '@/lib/air-date';
 import { historyForEpisode } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
+import { useDrawerDialog } from '@/lib/use-drawer-dialog';
 
 export function EpisodeList({
   showId,
@@ -29,7 +29,6 @@ export function EpisodeList({
   size?: 'md' | 'lg';
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const panelRef = useRef<HTMLElement>(null);
   const [season, setSeason] = useState(initialSeason);
   const { library } = useCore();
 
@@ -48,51 +47,10 @@ export function EpisodeList({
     if (next !== season) setSeason(next);
   }
 
-  function openDialog() {
-    const dialog = dialogRef.current;
-    const panel = panelRef.current;
-    if (!dialog || !panel) return;
-
-    dialog.showModal();
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-
-    gsap.killTweensOf(panel);
-    gsap.fromTo(
-      panel,
-      { xPercent: -104, autoAlpha: 0.7, scale: 0.985 },
-      {
-        xPercent: 0,
-        autoAlpha: 1,
-        scale: 1,
-        duration: 0.65,
-        ease: 'power4.out',
-        clearProps: 'transform,opacity,visibility',
-      },
-    );
-  }
-
-  function closeDialog() {
-    const dialog = dialogRef.current;
-    const panel = panelRef.current;
-    if (!dialog || !panel) return;
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      dialog.close();
-      return;
-    }
-
-    gsap.killTweensOf(panel);
-    gsap.to(panel, {
-      xPercent: -104,
-      autoAlpha: 0.55,
-      scale: 0.985,
-      duration: 0.42,
-      ease: 'power3.in',
-      onComplete: () => {
-        dialog.close();
-        gsap.set(panel, { clearProps: 'transform,opacity,visibility' });
-      },
-    });
-  }
+  const [open, setOpen] = useState(false);
+  useDrawerDialog(dialogRef, open);
+  const openDialog = () => setOpen(true);
+  const closeDialog = () => setOpen(false);
 
   return (
     <>
@@ -110,7 +68,7 @@ export function EpisodeList({
       <dialog
         ref={dialogRef}
         aria-label="Episodes"
-        className="fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none overflow-hidden bg-transparent p-0 text-white backdrop:bg-black/75"
+        className="drawer-dialog fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none overflow-hidden bg-transparent p-0 text-white backdrop:bg-black/75"
         onCancel={(event) => {
           event.preventDefault();
           closeDialog();
@@ -120,8 +78,7 @@ export function EpisodeList({
         }}
       >
         <section
-          ref={panelRef}
-          className="flex h-dvh w-full max-w-xl flex-col overflow-hidden bg-[#0c0c0c] shadow-[24px_0_80px_rgba(0,0,0,0.55)]"
+          className="drawer-panel flex h-dvh w-full max-w-xl flex-col overflow-hidden bg-[#0c0c0c] shadow-[24px_0_80px_rgba(0,0,0,0.55)]"
         >
           <header className="flex shrink-0 items-center justify-between gap-4 border-b border-white/10 px-6 py-6">
             <div className="flex min-w-0 items-center gap-4">

@@ -83,6 +83,7 @@ import { needsReencode, rememberReencode } from '@/lib/decode-fallback';
 import { detectRecapPreview, endWindow, recapWindow, withRecapPreview, type RecapPreview } from '@/lib/recap-preview';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
 import { loadSubtitleCues } from '@/lib/subtitles';
+import { useDrawerDialog } from '@/lib/use-drawer-dialog';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
 import { fetchStreams } from '@/lib/stream-cache';
 import { onCacheClear } from '@/lib/cache-events';
@@ -1757,11 +1758,8 @@ function PlayerEpisodes({
 
   useEffect(() => setSelectedSeason(season), [season]);
 
+  useDrawerDialog(drawerRef, open);
   useEffect(() => {
-    const dialog = drawerRef.current;
-    if (!dialog) return;
-    if (open && !dialog.open) dialog.showModal();
-    if (!open && dialog.open) dialog.close();
     if (!open && wasOpenRef.current) triggerRef.current?.focus();
     wasOpenRef.current = open;
   }, [open]);
@@ -1783,60 +1781,63 @@ function PlayerEpisodes({
         <dialog
           ref={drawerRef}
           data-player-episodes
+          data-side="right"
           onCancel={(event) => { event.preventDefault(); onClose(); }}
           onClick={(event) => {
-            if (event.target === event.currentTarget && event.clientX < event.currentTarget.getBoundingClientRect().left) onClose();
+            if (event.target === event.currentTarget) onClose();
           }}
-          className="fixed inset-y-0 left-auto right-0 m-0 h-dvh cursor-auto max-h-none w-full max-w-md overflow-hidden border-0 bg-panel p-0 text-white shadow-[-24px_0_80px_rgba(0,0,0,0.55)] backdrop:bg-black/40"
+          className="drawer-dialog fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none cursor-auto overflow-hidden border-0 bg-transparent p-0 text-white backdrop:bg-black/40"
           role="dialog"
           aria-label="Episodes"
         >
-          <div className="flex items-center justify-between border-b border-white/10 px-5 py-5">
-            <div className="flex min-w-0 items-center gap-3">
-              <h2 className="text-lg font-semibold">Episodes</h2>
-              {seasons.length > 1 ? (
-                <Dropdown
-                  value={selectedSeason}
-                  options={seasons.map((entry) => ({
-                    value: entry.seasonNumber,
-                    label: entry.name || `Season ${entry.seasonNumber}`,
-                  }))}
-                  onChange={setSelectedSeason}
-                  ariaLabel="Season"
-                />
-              ) : null}
+          <section className="drawer-panel ml-auto flex h-dvh w-full max-w-md flex-col overflow-hidden bg-panel shadow-[-24px_0_80px_rgba(0,0,0,0.55)]">
+            <div className="flex shrink-0 items-center justify-between border-b border-white/10 px-5 py-5">
+              <div className="flex min-w-0 items-center gap-3">
+                <h2 className="text-lg font-semibold">Episodes</h2>
+                {seasons.length > 1 ? (
+                  <Dropdown
+                    value={selectedSeason}
+                    options={seasons.map((entry) => ({
+                      value: entry.seasonNumber,
+                      label: entry.name || `Season ${entry.seasonNumber}`,
+                    }))}
+                    onChange={setSelectedSeason}
+                    ariaLabel="Season"
+                  />
+                ) : null}
+              </div>
+              <button
+                type="button"
+                aria-label="Close episodes"
+                onClick={onClose}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-control hover:bg-control-hover"
+              >
+                <IoClose size={22} />
+              </button>
             </div>
-            <button
-              type="button"
-              aria-label="Close episodes"
-              onClick={onClose}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-control hover:bg-control-hover"
-            >
-              <IoClose size={22} />
-            </button>
-          </div>
-          <div className="min-h-0 h-[calc(100%-81px)] overflow-y-auto p-3">
-            {episodes.error ? <p className="px-3 py-4 text-faint">Could not load that season.</p> : null}
-            {episodes.isPending ? <p className="px-3 py-4 text-faint">Loading episodes…</p> : null}
-            <ul className="m-0 list-none space-y-2 p-0">
-              {(episodes.data ?? []).map((entry: Episode) => (
-                <EpisodeRow
-                  key={entry.id}
-                  showId={showId}
-                  episode={entry}
-                  compact
-                  active={entry.seasonNumber === season && entry.episodeNumber === episode}
-                  watched={historyForEpisode(
-                    library?.history,
-                    showId,
-                    entry.seasonNumber,
-                    entry.episodeNumber,
-                  )}
-                  onNavigate={onNavigate}
-                />
-              ))}
-            </ul>
-          </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+              {episodes.error ? <p className="px-3 py-4 text-faint">Could not load that season.</p> : null}
+              {episodes.isPending ? <p className="px-3 py-4 text-faint">Loading episodes…</p> : null}
+              <ul className="m-0 list-none space-y-2 p-0">
+                {(episodes.data ?? []).map((entry: Episode) => (
+                  <EpisodeRow
+                    key={entry.id}
+                    showId={showId}
+                    episode={entry}
+                    compact
+                    active={entry.seasonNumber === season && entry.episodeNumber === episode}
+                    watched={historyForEpisode(
+                      library?.history,
+                      showId,
+                      entry.seasonNumber,
+                      entry.episodeNumber,
+                    )}
+                    onNavigate={onNavigate}
+                  />
+                ))}
+              </ul>
+            </div>
+          </section>
         </dialog>,
         document.body,
       )}

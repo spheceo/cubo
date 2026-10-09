@@ -169,3 +169,35 @@
     opacity: 1;
   }
 }
+
+/* Side drawers built on <dialog> (Episodes). `useDrawerDialog` sets
+   data-open a frame after showModal and removes it before close, so the
+   panel slides and the backdrop fades both ways. data-side picks the edge. */
+.drawer-dialog > .drawer-panel {
+  transform: translateX(-104%);
+  transition: transform 320ms cubic-bezier(0.4, 0, 1, 1);
+}
+.drawer-dialog[data-side='right'] > .drawer-panel {
+  transform: translateX(104%);
+}
+.drawer-dialog[data-open] > .drawer-panel {
+  transform: none;
+  transition: transform 520ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.drawer-dialog::backdrop {
+  opacity: 0;
+  transition: opacity 320ms ease-in;
+}
+.drawer-dialog[data-open]::backdrop {
+  opacity: 1;
+  transition: opacity 420ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drawer-dialog > .drawer-panel,
+  .drawer-dialog[data-open] > .drawer-panel,
+  .drawer-dialog::backdrop,
+  .drawer-dialog[data-open]::backdrop {
+    transition: none;
+  }
+}
