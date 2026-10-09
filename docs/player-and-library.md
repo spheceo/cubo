@@ -42,6 +42,9 @@
 
 - The captions button and the Subtitles settings row only show when the
   title has subtitle tracks.
+- The player chrome never fades while a menu is open (settings, the
+  Episodes drawer via `menuOpen`); moving over it does not re-arm the
+  fade, which resumes once the menu closes.
 - Custom UI over native controls: use `ConfirmDialog` and `Dropdown` from
   `apps/web/components` instead of `window.confirm` / `<select>`.
 - No new color tokens without approval; reuse the theme in

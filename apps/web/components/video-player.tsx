@@ -106,6 +106,7 @@ export function VideoPlayer({
   downloadedRanges = null,
   flushRef,
   topRightControls,
+  menuOpen = false,
   introWindow,
   introAutoSkipEligible = false,
   recapWindow,
@@ -121,6 +122,9 @@ export function VideoPlayer({
 }: {
   fullscreenTargetRef: RefObject<HTMLDivElement | null>;
   topRightControls?: ReactNode;
+  /** A menu the owner renders (the Episodes drawer) is open: the chrome
+   *  stays up like it does for the settings menu. */
+  menuOpen?: boolean;
   /** Detected intro window in absolute source seconds. A Skip intro button
    *  shows while the playhead is inside it; `end` null means unbounded. */
   introWindow?: { start: number; end: number | null } | null;
@@ -815,7 +819,9 @@ export function VideoPlayer({
     onBufferingRef.current?.(buffering);
   }, [buffering]);
 
-  const keepControls = !creditsTakeover && (settingsOpen || heldPaused || blocked);
+  const keepControls = !creditsTakeover && (settingsOpen || menuOpen || heldPaused || blocked);
+  const keepControlsRef = useRef(keepControls);
+  keepControlsRef.current = keepControls;
   useEffect(() => {
     if (!creditsTakeover) return;
     if (hideTimer.current) window.clearTimeout(hideTimer.current);
@@ -877,14 +883,25 @@ export function VideoPlayer({
     if (creditsTakeoverRef.current) return;
     setControlsVisible(true);
     if (hideTimer.current) window.clearTimeout(hideTimer.current);
+    // An open menu means the viewer is doing something: moving over it must
+    // not re-arm the fade.
+    if (keepControlsRef.current) return;
     hideTimer.current = window.setTimeout(() => setControlsVisible(false), HIDE_DELAY_MS);
   }, []);
 
+  const keptControls = useRef(keepControls);
   useEffect(() => {
+    const wasKept = keptControls.current;
+    keptControls.current = keepControls;
     if (keepControls) {
       if (hideTimer.current) window.clearTimeout(hideTimer.current);
       setControlsVisible(true);
+      return;
     }
+    if (!wasKept || creditsTakeoverRef.current) return;
+    // Menu closed: the usual fade resumes from here.
+    if (hideTimer.current) window.clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => setControlsVisible(false), HIDE_DELAY_MS);
   }, [keepControls]);
 
   useEffect(

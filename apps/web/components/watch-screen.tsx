@@ -1549,6 +1549,7 @@ export function WatchScreen({
               }}
             />
           ) : null}
+          menuOpen={episodesOpen}
           src={videoUrl}
           hls={videoIsHls}
           durationHint={videoDurationHint}
