@@ -17,15 +17,9 @@ export function useDrawerDialog(ref: RefObject<HTMLDialogElement | null>, open: 
     }
     if (open) {
       if (!dialog.open) dialog.showModal();
-      // Commit the closed pose, let one frame paint it, then slide. Opening
-      // costs the page a render (and the player is decoding video), so a
-      // slide started on the very next frame lost its fast first stretch
-      // and looked like a snap.
-      void dialog.offsetWidth;
-      let frame = requestAnimationFrame(() => {
-        frame = requestAnimationFrame(() => {
-          dialog.dataset.open = 'true';
-        });
+      // One frame in the closed pose so the transition has a start.
+      const frame = requestAnimationFrame(() => {
+        dialog.dataset.open = 'true';
       });
       return () => cancelAnimationFrame(frame);
     }

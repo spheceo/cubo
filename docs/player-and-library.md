@@ -53,6 +53,10 @@
   `apps/web/components` instead of `window.confirm` / `<select>`.
 - No new color tokens without approval; reuse the theme in
   `packages/ui/src/theme.css`.
+- Side drawers (`.drawer-dialog`, `useDrawerDialog`) clip with
+  `overflow: clip`, never `overflow-hidden`: `showModal` focuses the first
+  control and a hidden-overflow dialog scrolls the off-screen panel into
+  view, so a right-side drawer snaps open instead of sliding.
 - Native scrolling only — Lenis was removed on purpose; do not reintroduce
   scroll-hijacking.
 

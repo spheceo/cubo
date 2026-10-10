@@ -69,7 +69,7 @@ export function EpisodeList({
       <dialog
         ref={dialogRef}
         aria-label="Episodes"
-        className="drawer-dialog fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none overflow-hidden bg-transparent p-0 text-white backdrop:bg-black/75"
+        className="drawer-dialog fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none bg-transparent p-0 text-white backdrop:bg-black/75"
         onCancel={(event) => {
           event.preventDefault();
           closeDialog();

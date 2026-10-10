@@ -1834,7 +1834,7 @@ function PlayerEpisodes({
           onClick={(event) => {
             if (event.target === event.currentTarget) onClose();
           }}
-          className="drawer-dialog fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none cursor-auto overflow-hidden border-0 bg-transparent p-0 text-white backdrop:bg-black/40"
+          className="drawer-dialog fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none cursor-auto border-0 bg-transparent p-0 text-white backdrop:bg-black/40"
           role="dialog"
           aria-label="Episodes"
         >

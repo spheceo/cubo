@@ -173,6 +173,13 @@
 /* Side drawers built on <dialog> (Episodes). `useDrawerDialog` sets
    data-open a frame after showModal and removes it before close, so the
    panel slides and the backdrop fades both ways. data-side picks the edge. */
+.drawer-dialog {
+  /* Clip, never scroll. showModal focuses the first control, and an
+     overflow:hidden dialog scrolls to bring it into view: a right-side
+     panel waiting off-screen was scrolled straight to its open spot, so
+     the slide moved nothing and the drawer snapped open. */
+  overflow: clip;
+}
 .drawer-dialog > .drawer-panel {
   /* Own compositor layer for the whole time the drawer is up, so the slide
      never waits on rasterising the episode list. */
