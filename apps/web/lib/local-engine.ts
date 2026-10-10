@@ -579,6 +579,10 @@ export interface PlaybackSessionStatus {
   remux?: {
     segmentsReady: number;
     starvedSeconds?: number | null;
+    /** Converted media ready from the playhead on (older Cores omit). */
+    readyAheadSeconds?: number;
+    /** The converter waits because it is far enough ahead (older Cores omit). */
+    pausedAhead?: boolean;
     restarts: number;
   };
   /** The file's audio tracks and the one playing (older Cores omit both). */

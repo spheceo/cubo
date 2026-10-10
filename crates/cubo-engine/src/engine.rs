@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
@@ -1279,6 +1279,7 @@ async fn delete_cache_item(
     }
 
     let _cache_operation = state.cache_swap.write().await;
+    tracing::info!(target: "engine", id, "viewer deleted a cached source");
     state.sessions.close_torrent(&id).await;
 
     // rqbit forgets its torrents when the app restarts, so it deleting the
@@ -1325,6 +1326,7 @@ async fn clear_cache(State(state): State<BridgeState>, headers: HeaderMap) -> Re
         return unauthorized();
     }
     let _cache_operation = state.cache_swap.write().await;
+    tracing::info!(target: "engine", "viewer cleared the cache");
     let download_dir = state.current_download_dir().await;
     match empty_cache(&state, &download_dir).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1578,6 +1580,15 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         // Delete through rqbit when it still knows the torrent, and always
         // remove the recorded files — after a restart only the files exist.
         if rqbit_delete(state, &id).await.is_ok() {
+            tracing::info!(
+                target: "engine",
+                id,
+                info_hash = %entry.info_hash,
+                used_bytes,
+                max_bytes = snapshot.cache.max_bytes,
+                disk_tight = tight,
+                "cache eviction removed a source"
+            );
             state.sessions.forget_pieces(&entry.info_hash);
             if let Err(error) = remove_entry_files(&download_dir, &entry.files).await {
                 tracing::warn!(target: "engine", error = %error, id, "cache eviction could not remove files");
@@ -2440,7 +2451,7 @@ async fn close_session(
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
-    state.sessions.close(&id).await;
+    state.sessions.close(&id, "player closed it").await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2454,7 +2465,7 @@ async fn close_session_beacon(
     if !is_valid_token(&state, &query.token) {
         return unauthorized();
     }
-    state.sessions.close(&id).await;
+    state.sessions.close(&id, "page closed").await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2527,6 +2538,9 @@ async fn session_stream(
     }
 }
 
+/// Segment requests waiting at least this long on conversion are logged.
+const SLOW_SEGMENT: Duration = Duration::from_secs(2);
+
 /// Remuxed play: the complete VOD playlist, the shared init segment, and
 /// numbered media segments cut at fixed keyframe boundaries.
 async fn session_hls(
@@ -2581,9 +2595,23 @@ async fn session_hls(
         .strip_suffix(".m4s")
         .and_then(|number| number.parse::<usize>().ok())
     {
+        let asked = Instant::now();
         let result = remuxer.segment(index, Duration::from_secs(55)).await;
         if result.is_ok() {
             session.note_media_served();
+        }
+        // A player waiting on Core shows up here; a stall with no slow
+        // segment around it happened in the browser.
+        let waited = asked.elapsed();
+        if waited >= SLOW_SEGMENT || result.is_err() {
+            tracing::info!(
+                target: "session",
+                session = %id,
+                index,
+                waited_ms = waited.as_millis() as u64,
+                error = result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or("-"),
+                "segment request slow or failed"
+            );
         }
         result
     } else {

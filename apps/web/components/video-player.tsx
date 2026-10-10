@@ -41,7 +41,7 @@ import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
-import { fitBufferToBitrate, sessionHlsConfig } from '@/lib/session-hls-config';
+import { fitBufferToBitrate, sessionHlsConfig, type BufferSizing } from '@/lib/session-hls-config';
 import type { SkipSection } from '@/lib/local-engine';
 
 const HIDE_DELAY_MS = 2600;
@@ -72,6 +72,43 @@ function timeRangesCover(ranges: TimeRanges, time: number, slack = 0.35): boolea
   }
   return false;
 }
+
+/** Seconds buffered past `time` without a gap. */
+function bufferedAhead(ranges: TimeRanges, time: number): number {
+  for (let index = 0; index < ranges.length; index += 1) {
+    if (time >= ranges.start(index) - 0.35 && time <= ranges.end(index)) {
+      return ranges.end(index) - time;
+    }
+  }
+  return 0;
+}
+
+/** The player's side of a stall or buffer error, for the Core log. */
+export type BufferDiagnostics = {
+  aheadSeconds: number;
+  videoHeight?: number;
+  goalSeconds?: number;
+  backSeconds?: number;
+  peakMbps?: number;
+  forwardBudgetMb?: number;
+  refusedAppends?: number;
+};
+
+function bufferDiagnostics(video: HTMLVideoElement, sizing: BufferSizing | null): BufferDiagnostics {
+  const round = (value: number) => Math.round(value * 10) / 10;
+  return {
+    aheadSeconds: round(bufferedAhead(video.buffered, video.currentTime)),
+    videoHeight: video.videoHeight || undefined,
+    goalSeconds: sizing ? round(sizing.goalSeconds) : undefined,
+    backSeconds: sizing ? round(sizing.backSeconds) : undefined,
+    peakMbps: sizing?.peakBytesPerSecond ? round((sizing.peakBytesPerSecond * 8) / 1_000_000) : undefined,
+    forwardBudgetMb: sizing ? round(sizing.forwardBudgetBytes / (1024 * 1024)) : undefined,
+    refusedAppends: sizing?.refusedAppends,
+  };
+}
+
+/** A buffer error is reported at most this often (they come in bursts). */
+const BUFFER_ERROR_REPORT_MS = 5_000;
 
 export type PlayerSubtitle = {
   id: string;
@@ -104,6 +141,7 @@ export function VideoPlayer({
   onPlaying,
   onError,
   onStall,
+  onBufferError,
   onBuffering,
   downloadedRanges = null,
   flushRef,
@@ -191,8 +229,12 @@ export function VideoPlayer({
    *  media itself (as opposed to loading it). */
   onError: (failure?: PlayerFailure) => void;
   onPlaying?: () => void;
-  /** A mid-playback buffering pause ended (not startup, seeks or pauses). */
-  onStall?: (stall: { positionSeconds: number; durationMs: number }) => void;
+  /** A mid-playback buffering pause ended (not startup, seeks or pauses).
+   *  `buffer` is the player's state as it began. */
+  onStall?: (stall: { positionSeconds: number; durationMs: number; buffer: BufferDiagnostics }) => void;
+  /** hls.js could not add media to the browser's buffer (non-fatal: it
+   *  retries). Repeats are throttled. */
+  onBufferError?: (error: { detail: string; positionSeconds: number; buffer: BufferDiagnostics }) => void;
   /** The loading overlay appeared (true) or cleared (false): startup,
    *  seeks and mid-play stalls alike, never while paused. */
   onBuffering?: (buffering: boolean) => void;
@@ -225,7 +267,9 @@ export function VideoPlayer({
   /** Set by the first `playing` of the current source; stalls before it are
    *  startup, not interruptions. */
   const playedSinceSource = useRef(false);
-  const stallRef = useRef<{ startedAt: number; position: number } | null>(null);
+  const stallRef = useRef<{ startedAt: number; position: number; buffer: BufferDiagnostics } | null>(null);
+  /** The session hls.js buffer sizing; null for direct play. */
+  const bufferSizingRef = useRef<(() => BufferSizing) | null>(null);
   /** False only when the viewer hit pause — browsers pausing a hidden tab
    *  must not stick. A new source starts unpaused. */
   const userPaused = useRef(false);
@@ -310,6 +354,8 @@ export function VideoPlayer({
   onErrorRef.current = onError;
   const onStallRef = useRef(onStall);
   onStallRef.current = onStall;
+  const onBufferErrorRef = useRef(onBufferError);
+  onBufferErrorRef.current = onBufferError;
   const onBufferingRef = useRef(onBuffering);
   onBufferingRef.current = onBuffering;
   /** Read once per source by the session hls.js setup (its start position). */
@@ -638,6 +684,7 @@ export function VideoPlayer({
         stallRef.current = {
           startedAt: performance.now(),
           position: video.currentTime,
+          buffer: bufferDiagnostics(video, bufferSizingRef.current?.() ?? null),
         };
       }
       return;
@@ -647,7 +694,7 @@ export function VideoPlayer({
     if (!stall) return;
     const durationMs = performance.now() - stall.startedAt;
     if (durationMs >= 250) {
-      onStallRef.current?.({ positionSeconds: stall.position, durationMs });
+      onStallRef.current?.({ positionSeconds: stall.position, durationMs, buffer: stall.buffer });
     }
   }, [waiting, pendingSeek, heldPaused]);
 
@@ -684,7 +731,8 @@ export function VideoPlayer({
         return;
       }
       instance = new Hls(sessionHlsConfig(initialTimeRef.current));
-      fitBufferToBitrate(instance, Hls);
+      const sizing = fitBufferToBitrate(instance, Hls);
+      bufferSizingRef.current = sizing;
       instance.loadSource(src);
       instance.attachMedia(video);
       instance.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -695,7 +743,23 @@ export function VideoPlayer({
       // recovery before telling the owner, who asks Core what happened.
       let networkRecoveries = 0;
       let mediaRecoveries = 0;
+      let bufferErrorReportedAt = -Infinity;
       instance.on(Hls.Events.ERROR, (_event, data) => {
+        if (
+          !data.fatal
+          && (data.details === Hls.ErrorDetails.BUFFER_FULL_ERROR
+            || data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR)
+        ) {
+          const now = performance.now();
+          if (now - bufferErrorReportedAt < BUFFER_ERROR_REPORT_MS) return;
+          bufferErrorReportedAt = now;
+          onBufferErrorRef.current?.({
+            detail: data.details,
+            positionSeconds: video.currentTime,
+            buffer: bufferDiagnostics(video, sizing()),
+          });
+          return;
+        }
         if (!data.fatal || !instance) return;
         const gone = data.response?.code === 404 || data.response?.code === 410;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !gone && networkRecoveries < 2) {
@@ -718,6 +782,7 @@ export function VideoPlayer({
     return () => {
       cancelled = true;
       sourceReadyRef.current = false;
+      bufferSizingRef.current = null;
       stopPlayLoop();
       instance?.destroy();
     };

@@ -507,7 +507,7 @@ impl SessionManager {
         let sessions: Vec<Arc<PlaybackSession>> =
             self.sessions.lock().unwrap().drain().map(|(_, session)| session).collect();
         for session in sessions {
-            self.shut_down(&session).await;
+            self.shut_down(&session, "cache emptied").await;
         }
     }
 
@@ -526,7 +526,7 @@ impl SessionManager {
             .map(|session| session.id.clone())
             .collect();
         for id in matching {
-            self.close(&id).await;
+            self.close(&id, "source deleted").await;
         }
     }
 
@@ -583,15 +583,17 @@ impl SessionManager {
         session
     }
 
-    pub async fn close(self: &Arc<Self>, id: &str) -> bool {
+    /// `reason` is for the log: why playback ended matters when a player
+    /// later finds its session gone.
+    pub async fn close(self: &Arc<Self>, id: &str, reason: &str) -> bool {
         let Some(session) = self.sessions.lock().unwrap().remove(id) else {
             return false;
         };
-        self.shut_down(&session).await;
+        self.shut_down(&session, reason).await;
         true
     }
 
-    async fn shut_down(self: &Arc<Self>, session: &PlaybackSession) {
+    async fn shut_down(self: &Arc<Self>, session: &PlaybackSession, reason: &str) {
         if let Some(task) = session.startup.lock().unwrap().take() {
             task.abort();
         }
@@ -627,7 +629,7 @@ impl SessionManager {
                 let _ = manager.rqbit.pause(&source.handle).await;
             });
         }
-        tracing::info!(target: "session", session = %session.id, "playback session closed");
+        tracing::info!(target: "session", session = %session.id, reason, "playback session closed");
     }
 
     async fn sweep(self: &Arc<Self>) {
@@ -637,8 +639,12 @@ impl SessionManager {
             let (idle, phase, remuxer) = session.update(|inner| {
                 (inner.last_seen.elapsed(), inner.phase, inner.remuxer.clone())
             });
-            if idle > IDLE_TIMEOUT || matches!(phase, Phase::Failed) && idle > Duration::from_secs(60) {
-                self.close(&session.id).await;
+            if idle > IDLE_TIMEOUT {
+                self.close(&session.id, "no heartbeat").await;
+                continue;
+            }
+            if matches!(phase, Phase::Failed) && idle > Duration::from_secs(60) {
+                self.close(&session.id, "failed").await;
                 continue;
             }
             if let Some(remuxer) = remuxer {

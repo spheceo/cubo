@@ -159,6 +159,8 @@ struct State {
     next_job_id: u64,
     /// Segment the viewer is at or asked for most recently.
     focus: usize,
+    /// The viewer's position from the last heartbeat, in seconds.
+    playhead: f64,
     failures: BTreeMap<usize, u32>,
     closed: bool,
     /// Bytes of converted media written in this session (for status).
@@ -186,6 +188,10 @@ pub struct RemuxStatus {
     /// had room to convert — i.e. how long it has been starved of source
     /// data. `None` when idle, finished or deliberately paused ahead.
     pub starved_seconds: Option<f64>,
+    /// The running job is waiting because it is far enough ahead.
+    pub paused_ahead: bool,
+    /// Converted media ready without a gap from the playhead on.
+    pub ready_ahead_seconds: f64,
     pub restarts: u64,
 }
 
@@ -221,6 +227,7 @@ impl Remuxer {
         let index = self.plan.index_at(seconds.max(0.0));
         let changed = {
             let mut state = self.state.lock().unwrap();
+            state.playhead = seconds.max(0.0);
             let changed = state.focus != index;
             state.focus = index;
             changed
@@ -237,6 +244,7 @@ impl Remuxer {
         let index = self.plan.index_at(seconds.max(0.0));
         let mut state = self.state.lock().unwrap();
         state.focus = index;
+        state.playhead = seconds.max(0.0);
         if state.job.is_none() && !state.closed {
             self.start_job(&mut state, index);
         }
@@ -267,8 +275,18 @@ impl Remuxer {
             starved_seconds: job
                 .filter(|job| !job.finished && job.error.is_none() && job.cursor <= limit)
                 .map(|job| job.last_output.elapsed().as_secs_f64()),
+            paused_ahead: job.is_some_and(|job| !job.finished && job.error.is_none() && job.cursor > limit),
+            ready_ahead_seconds: self.ready_ahead(&state),
             restarts: state.restarts,
         }
+    }
+
+    fn ready_ahead(&self, state: &State) -> f64 {
+        let first = self.plan.index_at(state.playhead);
+        let last = (first..self.plan.len())
+            .take_while(|index| state.segments.contains_key(index))
+            .last();
+        last.map_or(0.0, |last| (self.plan.end(last) - state.playhead).max(0.0))
     }
 
     pub async fn init_segment(self: &Arc<Self>, timeout: Duration) -> Result<Bytes, RemuxError> {
@@ -760,6 +778,9 @@ mod tests {
             for index in 0..4 {
                 check(&remuxer, &init, index).await;
             }
+            remuxer.set_playhead(0.5);
+            let lead = remuxer.status().ready_ahead_seconds;
+            assert!(lead >= remuxer.plan().end(3) - 0.5, "ready ahead {lead}");
             // Far seek starts a new job; its output must file identically.
             check(&remuxer, &init, count - 3).await;
             check(&remuxer, &init, count - 2).await;

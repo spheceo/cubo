@@ -31,7 +31,13 @@ import { useCore } from './core-provider';
 import { LogoLoader } from './logo-loader';
 import { resetWindowScroll } from './scroll-to-top';
 import { watchOrigin } from './watch-origin';
-import { VideoPlayer, type BufferedRange, type PlayerFailure, type PlayerSubtitle } from './video-player';
+import {
+  VideoPlayer,
+  type BufferDiagnostics,
+  type BufferedRange,
+  type PlayerFailure,
+  type PlayerSubtitle,
+} from './video-player';
 import {
   closeSession,
   createSession,
@@ -139,6 +145,19 @@ function hasAudio(status: PlaybackSessionStatus, language: string | null): boole
 
 /** How long the "no English audio" notice stays up. */
 const AUDIO_NOTICE_MS = 7_000;
+
+/** The player's buffer state as client-log fields. */
+function playerBufferLog(buffer: BufferDiagnostics): Record<string, number | undefined> {
+  return {
+    player_ahead_seconds: buffer.aheadSeconds,
+    video_height: buffer.videoHeight,
+    buffer_goal_seconds: buffer.goalSeconds,
+    back_buffer_seconds: buffer.backSeconds,
+    peak_mbps: buffer.peakMbps,
+    forward_budget_mb: buffer.forwardBudgetMb,
+    refused_appends: buffer.refusedAppends,
+  };
+}
 
 function sessionStage(status: PlaybackSessionStatus): number {
   if (status.phase === 'resolving') return STAGE.opening;
@@ -348,6 +367,9 @@ export function WatchScreen({
   const activeSourceRef = useRef<Stream | null>(null);
   const activeAutoRef = useRef(false);
   const bufferingSinceRef = useRef<number | null>(null);
+  /** Core's view of the session as the latest buffering began; a stall
+   *  report describes the stall, not the moment after it cleared. */
+  const bufferingStatusRef = useRef<Promise<PlaybackSessionStatus | null> | null>(null);
   const activeInfoHashRef = useRef<string | null>(null);
   const lastDurationRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
@@ -412,6 +434,7 @@ export function WatchScreen({
     setNeedsCore(false);
     setVideoUrl(null);
     bufferingSinceRef.current = null;
+    bufferingStatusRef.current = null;
     setDownloadedRanges(null);
     setVideoDurationHint(null);
     setProgress(0);
@@ -996,36 +1019,53 @@ export function WatchScreen({
       ready_ms: since(startup.readyAt),
       mode: startup.session?.mode,
       resume: lastPositionRef.current || undefined,
+      browser: navigator.userAgent,
       core: startup.session?.timeline,
     });
   }, []);
 
   const reportStall = useCallback(
-    (stall: { positionSeconds: number; durationMs: number }) => {
+    (stall: { positionSeconds: number; durationMs: number; buffer: BufferDiagnostics }) => {
       const connection = playbackConnection.current;
       if (!connection) return;
       const base = {
         position: Math.round(stall.positionSeconds),
         duration_ms: Math.round(stall.durationMs),
+        ...playerBufferLog(stall.buffer),
       };
       const session = sessionRef.current;
       if (!session) {
         shipClientLog(connection, 'warn', 'playback_stall', base);
         return;
       }
-      void getSession(session.connection, session.id)
-        .then((sessionStatus) => {
-          shipClientLog(connection, 'warn', 'playback_stall', {
-            ...base,
-            mode: sessionStatus.mode,
-            peers: sessionStatus.torrent?.peers,
-            download_mbps: sessionStatus.torrent?.downloadMbps,
-            finished: sessionStatus.torrent?.finished,
-            starved_seconds: sessionStatus.remux?.starvedSeconds ?? undefined,
-            remux_restarts: sessionStatus.remux?.restarts,
-          });
-        })
-        .catch(() => shipClientLog(connection, 'warn', 'playback_stall', base));
+      const atStart = bufferingStatusRef.current
+        ?? getSession(session.connection, session.id).catch(() => null);
+      void atStart.then((sessionStatus) => {
+        shipClientLog(connection, 'warn', 'playback_stall', sessionStatus ? {
+          ...base,
+          mode: sessionStatus.mode,
+          peers: sessionStatus.torrent?.peers,
+          download_mbps: sessionStatus.torrent?.downloadMbps,
+          finished: sessionStatus.torrent?.finished,
+          starved_seconds: sessionStatus.remux?.starvedSeconds ?? undefined,
+          core_ready_ahead_seconds: sessionStatus.remux?.readyAheadSeconds,
+          core_paused_ahead: sessionStatus.remux?.pausedAhead,
+          remux_restarts: sessionStatus.remux?.restarts,
+        } : base);
+      });
+    },
+    [],
+  );
+
+  const reportBufferError = useCallback(
+    (error: { detail: string; positionSeconds: number; buffer: BufferDiagnostics }) => {
+      const connection = playbackConnection.current;
+      if (!connection) return;
+      shipClientLog(connection, 'warn', 'hls_buffer_error', {
+        detail: error.detail,
+        position: Math.round(error.positionSeconds),
+        ...playerBufferLog(error.buffer),
+      });
     },
     [],
   );
@@ -1601,7 +1641,14 @@ export function WatchScreen({
             failOver();
           }}
           onStall={reportStall}
+          onBufferError={reportBufferError}
           onBuffering={(buffering) => {
+            if (buffering && bufferingSinceRef.current == null) {
+              const session = sessionRef.current;
+              bufferingStatusRef.current = session
+                ? getSession(session.connection, session.id).catch(() => null)
+                : null;
+            }
             bufferingSinceRef.current = buffering ? bufferingSinceRef.current ?? performance.now() : null;
           }}
           />

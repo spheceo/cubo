@@ -52,7 +52,25 @@ lists recipes. `just dev` starts Cubo Core (`cargo run -p cubo-cli -- serve
 The installed Core logs to `~/.local/share/cubo/logs/` (`cubo.log.<date>`
 with timestamps; `boot-service.log` for `cubo persist`). The web app ships
 its own events there (`stream_selected`, `session_error`, `source_failed`,
-`source_starved`, `playback_stall`, …). To reproduce without touching the
+`source_starved`, `playback_stall`, `hls_buffer_error`, …).
+
+Reading a stall:
+
+- `playback_stall` carries Core's state as the stall began. A low
+  `core_ready_ahead_seconds` means Core was behind (look for `segment
+  request slow or failed` lines around it). A high
+  `core_ready_ahead_seconds`, or `core_paused_ahead`, means Core was ahead
+  and the problem was in the browser.
+- It also carries the player's side: `player_ahead_seconds` buffered
+  when the stall began, `buffer_goal_seconds`, `peak_mbps` and
+  `refused_appends`. `hls_buffer_error` records each time the browser
+  refused media (throttled).
+- `playback_startup` records the browser. `playback session closed`
+  says why it closed (`no heartbeat`, `page closed`, `source deleted`, …).
+  Core also logs whether a source was deleted by the viewer or by cache
+  eviction.
+
+To reproduce without touching the
 real cache, run a dev Core with `HOME` pointed at a scratch directory (it
 uses the dev slot, 8764) and copy the relevant
 `torrent-meta/<hash>.torrent` files into it.

@@ -61,9 +61,10 @@ export function sessionBufferSeconds(
  *  buffers ~4 s and pauses at every segment of a fully downloaded file. So
  *  the goals follow the measured byte rate, a refused append shrinks the
  *  byte budget instead, and the goal never drops below a segment ahead. */
-export function fitBufferToBitrate(hls: Hls, { Events, ErrorDetails }: typeof Hls): void {
+export function fitBufferToBitrate(hls: Hls, { Events, ErrorDetails }: typeof Hls): () => BufferSizing {
   const rates: number[] = [];
   let forwardBytes = FORWARD_BUFFER_BYTES;
+  let refusedAppends = 0;
   const apply = () => {
     if (!rates.length) return;
     const { forward, back } = sessionBufferSeconds(Math.max(...rates), forwardBytes);
@@ -79,7 +80,26 @@ export function fitBufferToBitrate(hls: Hls, { Events, ErrorDetails }: typeof Hl
   });
   hls.on(Events.ERROR, (_event, data) => {
     if (data.details !== ErrorDetails.BUFFER_FULL_ERROR) return;
+    refusedAppends += 1;
     forwardBytes *= 0.7;
     apply();
   });
+  return () => ({
+    goalSeconds: hls.config.maxMaxBufferLength,
+    backSeconds: hls.config.backBufferLength,
+    peakBytesPerSecond: rates.length ? Math.max(...rates) : null,
+    forwardBudgetBytes: forwardBytes,
+    refusedAppends,
+  });
+}
+
+/** How a session's buffer is sized right now, for diagnostics. */
+export interface BufferSizing {
+  goalSeconds: number;
+  backSeconds: number;
+  /** Peak byte rate of recent fragments; null before the first loads. */
+  peakBytesPerSecond: number | null;
+  forwardBudgetBytes: number;
+  /** Appends the browser refused for lack of room this source. */
+  refusedAppends: number;
 }
