@@ -33,6 +33,14 @@ pub fn ffmpeg() -> Option<PathBuf> {
     find_tool("ffmpeg")
 }
 
+/// A scratch name beside `path` that no other test shares. Tests run in
+/// parallel, and on a fresh machine (CI) several build the same fixture at
+/// once: a shared temp file let one ffmpeg clobber another's output. Each
+/// writes its own and renames it into place; the last rename wins.
+fn unique_temp(path: &std::path::Path, extension: &str) -> PathBuf {
+    path.with_extension(format!("{}.tmp.{extension}", uuid::Uuid::new_v4().simple()))
+}
+
 /// Generates (once) an MKV with test video and 5.1 E-AC3 audio — the shape
 /// of a typical WEB-DL episode, at a tiny resolution.
 pub fn fixture_mkv(spec: FixtureSpec) -> Option<PathBuf> {
@@ -51,7 +59,7 @@ pub fn fixture_mkv(spec: FixtureSpec) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path);
     }
-    let temp = path.with_extension("tmp.mkv");
+    let temp = unique_temp(&path, "mkv");
     let height = spec.width * 9 / 16 / 2 * 2;
     let codec: &[&str] = if spec.hevc {
         &["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error"]
@@ -112,10 +120,10 @@ pub fn fixture_long_mkv(spec: FixtureSpec, total_seconds: u32) -> Option<PathBuf
         return Some(path);
     }
     let repeats = total_seconds.div_ceil(spec.seconds);
-    let list = path.with_extension("txt");
+    let list = unique_temp(&path, "txt");
     let line = format!("file '{}'\n", base.display());
     std::fs::write(&list, line.repeat(repeats as usize)).ok()?;
-    let temp = path.with_extension("tmp.mkv");
+    let temp = unique_temp(&path, "mkv");
     let status = Command::new(ffmpeg()?)
         .args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list)
@@ -139,7 +147,7 @@ pub fn fixture_mp4(seconds: u32) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path);
     }
-    let temp = path.with_extension("tmp.mp4");
+    let temp = unique_temp(&path, "mp4");
     let status = Command::new(ffmpeg()?)
         .args(["-v", "error", "-y"])
         .args(["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24"])
