@@ -1562,10 +1562,11 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
         return Ok(());
     }
 
-    // The file a live session plays is never evicted: the budget applies to
-    // everything else, least recently used first. A closed session's file
-    // is ordinary cache.
-    let live = state.sessions.live_info_hashes();
+    // The file an open session plays is never evicted, even after the
+    // session failed: the player recovers on the same source. The budget
+    // applies to everything else, least recently used first. A closed
+    // session's file is ordinary cache.
+    let live = state.sessions.open_info_hashes();
     let mut deleted_files: Vec<String> = Vec::new();
     let mut entries = snapshot.cache_entries;
     entries.sort_by_key(|entry| entry.last_accessed_at);
@@ -1654,7 +1655,7 @@ async fn apply_download_window(state: &BridgeState) -> Result<(), String> {
     let download_dir = state.current_download_dir().await;
     let critical = cache::disk_is_critical(system::volume_free_bytes(&download_dir));
     if critical {
-        state.sessions.fail_live(
+        state.sessions.fail_downloading(
             "disk_full",
             "Cubo's cache disk is almost full. Free disk space before trying playback again.",
         );

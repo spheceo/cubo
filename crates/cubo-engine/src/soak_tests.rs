@@ -30,7 +30,7 @@ use tokio::sync::watch;
 
 use crate::engine::{spawn_test_core, TestCore};
 use crate::remuxer::OUTPUT_TS_OFFSET;
-use crate::test_support::{ffmpeg, fixture_long_mkv, fixture_mp4, fragment_times, FixtureSpec};
+use crate::test_support::{ffmpeg, fixture_long_mkv, fixture_mkv, fixture_mp4, fragment_times, FixtureSpec};
 
 const PIECE_BYTES: u32 = 256 * 1024;
 /// Media the virtual player keeps buffered ahead (hls.js-like).
@@ -920,6 +920,66 @@ async fn prefetched_source_starts_without_probing() {
     let timeline = &ready["timeline"];
     let probe_ms = timeline["probedMs"].as_u64().unwrap() - timeline["initializedMs"].as_u64().unwrap();
     assert!(probe_ms < 50, "session re-probed a prefetched source: {timeline}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Prefetching the next episode of a season pack that is playing must not
+/// leave the running torrent downloading that whole file: on a nearly full
+/// disk a 6 GB 4K episode filled it while the current one played.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefetch_into_a_playing_pack_does_not_download_the_next_episode() {
+    if ffmpeg().is_none() {
+        eprintln!("skipping: needs ffmpeg on PATH");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("cubo-pack-prefetch-{}", uuid::Uuid::new_v4()));
+    let pack = root.join("seed").join("Show.S01.1080p");
+    std::fs::create_dir_all(&pack).unwrap();
+    let ep1 = pack.join("Show.S01E01.mkv");
+    std::fs::copy(fixture_mkv(FixtureSpec::default()).expect("fixture"), &ep1).unwrap();
+    let ep2 = pack.join("Show.S01E02.mkv");
+    std::fs::copy(
+        fixture_mkv(FixtureSpec { keyframe_every: 5.3, ..FixtureSpec::default() }).expect("fixture"),
+        &ep2,
+    )
+    .unwrap();
+    let seeder = loopback_seeder(&root.join("seed")).await;
+    let torrent = seed(&seeder, &pack, "Show.S01.1080p", 100_000).await;
+    let peer = seeder.listen_addr().unwrap();
+
+    let core = spawn_test_core(&root.join("core"), 4 * 1024 * 1024 * 1024).await;
+    let client = Client::new(&core);
+    let (ready, _) = open_session(
+        &client,
+        json!({ "magnet": torrent.magnet, "peers": [peer], "hevc": false, "mediaKey": "tv:1:1:1" }),
+    )
+    .await;
+    let id = ready["id"].as_str().unwrap().to_string();
+    let (status, _) = client
+        .json(
+            reqwest::Method::POST,
+            "/v1/prefetch",
+            Some(json!({ "magnet": torrent.magnet, "peers": [peer], "hevc": false, "mediaKey": "tv:1:1:2" })),
+        )
+        .await;
+    assert_eq!(status, 202);
+
+    // The prefetch selects E02 to probe it, then must hand the selection
+    // back to E01 (rqbit counts whole pieces, so a little of E02 remains).
+    let ep1_bytes = std::fs::metadata(&ep1).unwrap().len();
+    let ep2_bytes = std::fs::metadata(&ep2).unwrap().len();
+    let mut selected = 0;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (_, session) = client
+            .json(reqwest::Method::GET, &format!("/v1/sessions/{id}"), None)
+            .await;
+        selected = session["torrent"]["totalBytes"].as_u64().unwrap_or(0);
+    }
+    assert!(
+        selected < ep1_bytes + ep2_bytes / 2,
+        "the next episode stayed selected in the playing pack: {selected} bytes selected, E01 is {ep1_bytes}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

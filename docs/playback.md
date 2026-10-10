@@ -49,7 +49,9 @@ without a strong reason and maintainer approval.
   current one) and the title page's play target: metadata, header, probe.
   It then parks the torrent (kept paused by maintenance until a session
   plays it); sources that close without ever serving media are parked too,
-  so guesses and race losers never download whole files.
+  so guesses and race losers never download whole files. A torrent that
+  is playing (the next episode of the same season pack) cannot be parked,
+  so the prefetched file is dropped from its selection instead.
 - A closed session pauses its torrent only after a grace period with no
   live session on it: recovery and audio switches open a replacement on
   the same torrent, and an immediate pause drops every peer.

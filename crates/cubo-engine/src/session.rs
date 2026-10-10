@@ -123,6 +123,16 @@ struct Source {
     file_len: u64,
 }
 
+impl Source {
+    fn file_complete(&self) -> bool {
+        self.handle
+            .stats()
+            .file_progress
+            .get(self.file_index)
+            .is_some_and(|have| *have >= self.file_len)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Timeline {
@@ -258,6 +268,12 @@ impl PlaybackSession {
 
     pub fn is_live(&self) -> bool {
         self.update(|inner| !matches!(inner.phase, Phase::Failed | Phase::Closed))
+    }
+
+    /// Every byte of the playing file is on disk, so playing it writes
+    /// nothing more.
+    fn file_complete(&self) -> bool {
+        self.update(|inner| inner.source.as_ref().is_some_and(Source::file_complete))
     }
 
     pub fn info_hash(&self) -> Option<String> {
@@ -436,8 +452,21 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
+    /// Info hashes of every session not yet closed, failed ones included:
+    /// the player recovers a failed session on the same source, so cache
+    /// eviction must leave its file alone until the session is gone.
+    pub fn open_info_hashes(&self) -> HashSet<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|session| session.update(|inner| !matches!(inner.phase, Phase::Closed)))
+            .filter_map(|session| session.info_hash())
+            .collect()
+    }
+
     /// Info hashes of every session still playing or starting. Cache
-    /// maintenance never evicts or pauses these.
+    /// maintenance never pauses these.
     pub fn live_info_hashes(&self) -> HashSet<String> {
         self.sessions
             .lock()
@@ -494,11 +523,16 @@ impl SessionManager {
         let _ = std::fs::remove_file(self.piece_state_dir.join(format!("{info_hash}.bitv")));
     }
 
-    /// Fails every live session, e.g. when the disk fills up.
-    pub fn fail_live(&self, code: &'static str, message: &str) {
+    /// Fails every live session that still needs to download, e.g. when
+    /// the disk fills up. A session whose file is already complete writes
+    /// nothing and plays on (from a paused torrent if need be).
+    pub fn fail_downloading(&self, code: &'static str, message: &str) {
         let sessions: Vec<Arc<PlaybackSession>> =
             self.sessions.lock().unwrap().values().cloned().collect();
-        for session in sessions.into_iter().filter(|session| session.is_live()) {
+        for session in sessions
+            .into_iter()
+            .filter(|session| session.is_live() && !session.file_complete())
+        {
             session.fail(Failure::new(code, message));
         }
     }
@@ -1209,7 +1243,9 @@ impl SessionManager {
             match result {
                 Ok(source) => {
                     let playing = manager.live_info_hashes().contains(&source.info_hash);
-                    if !playing {
+                    if playing {
+                        manager.deselect_prefetched(&source).await;
+                    } else {
                         manager.parked.lock().unwrap().insert(source.torrent_id);
                         let _ = manager.rqbit.pause(&source.handle).await;
                     }
@@ -1240,6 +1276,40 @@ impl SessionManager {
                 }
             }
         });
+    }
+
+    /// A prefetch into a torrent that is playing (the next episode of a
+    /// season pack) cannot park it, and the running torrent would download
+    /// the guessed file whole: 6 GB of 4K filled a nearly full disk while
+    /// the current episode played. Drop the file from the selection
+    /// instead. Its header pieces stay on disk, and a session for it
+    /// selects it again.
+    async fn deselect_prefetched(&self, source: &Source) {
+        let played = self.sessions.lock().unwrap().values().any(|session| {
+            session.is_live()
+                && session.update(|inner| {
+                    inner.source.as_ref().is_some_and(|playing| {
+                        playing.info_hash == source.info_hash && playing.file_index == source.file_index
+                    })
+                })
+        });
+        if played {
+            return;
+        }
+        let selected: HashSet<usize> = match source.handle.only_files() {
+            Some(files) => files.into_iter().collect(),
+            None => match source.handle.with_metadata(|metadata| (0..metadata.file_infos.len()).collect()) {
+                Ok(all) => all,
+                Err(_) => return,
+            },
+        };
+        let wanted: HashSet<usize> = selected.into_iter().filter(|index| *index != source.file_index).collect();
+        if wanted.is_empty() {
+            return;
+        }
+        if let Err(error) = self.rqbit.update_only_files(&source.handle, &wanted).await {
+            tracing::warn!(target: "session", file = %source.file_name, error = %format!("{error:#}"), "could not deselect a prefetched file");
+        }
     }
 
     async fn run_prefetch(self: &Arc<Self>, key: &str, request: &CreateSessionRequest) -> Result<Source, Failure> {
