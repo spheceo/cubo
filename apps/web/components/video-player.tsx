@@ -41,7 +41,7 @@ import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
-import { sessionHlsConfig } from '@/lib/session-hls-config';
+import { fitBufferToBitrate, sessionHlsConfig } from '@/lib/session-hls-config';
 import type { SkipSection } from '@/lib/local-engine';
 
 const HIDE_DELAY_MS = 2600;
@@ -684,6 +684,7 @@ export function VideoPlayer({
         return;
       }
       instance = new Hls(sessionHlsConfig(initialTimeRef.current));
+      fitBufferToBitrate(instance, Hls);
       instance.loadSource(src);
       instance.attachMedia(video);
       instance.on(Hls.Events.MANIFEST_PARSED, () => {

@@ -66,6 +66,18 @@ without a strong reason and maintainer approval.
   measured throughput decides, never seeders, and only while an untried
   source remains; a manually picked source is never switched.
 
+## Player buffer
+
+hls.js budgets its buffer in seconds, but browsers cap a SourceBuffer in
+bytes (Chrome: 150 MB of video). At 4K bitrates a fixed 60 s ahead plus
+90 s behind overflows the cap. Each refused append makes hls.js halve its
+buffer goal, and it never raises it again. After a few, it buffers ~4 s
+and the loader flashes at every segment of a fully downloaded file. So
+`fitBufferToBitrate` (`lib/session-hls-config.ts`) sizes the goals from
+the measured byte rate of recent fragments (90 MB ahead, 30 MB behind). A
+refused append shrinks that byte budget instead, and the goal never drops
+below 12 s ahead. Don't go back to fixed second-based goals.
+
 ## Decode failures and re-encoding
 
 Some files carry video the browser cannot decode although the codec is
