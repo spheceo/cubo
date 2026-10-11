@@ -89,6 +89,7 @@ import { ProgressWriter } from '@/lib/progress-writer';
 import { needsReencode, rememberReencode } from '@/lib/decode-fallback';
 import { detectRecapPreview, endWindow, recapWindow, withRecapPreview, type RecapPreview } from '@/lib/recap-preview';
 import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
+import { recentStalls, stalledTooLong, stalledWithin, type Stall } from '@/lib/starvation';
 import { loadSubtitleCues } from '@/lib/subtitles';
 import { useDrawerDialog } from '@/lib/use-drawer-dialog';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
@@ -125,9 +126,6 @@ type Status = 'loading' | 'starting' | 'ready' | 'error';
 
 /** Heartbeat cadence; Core closes sessions it has not heard from in minutes. */
 const HEARTBEAT_MS = 5_000;
-/** A loading overlay this long on a source downloading slower than the
- *  video plays moves on to the next ranked source at the same position. */
-const STARVED_SWITCH_MS = 20_000;
 /** Same-source recoveries (Core restarted, player gave up on a healthy
  *  session) allowed per window before the source counts as failed. */
 const RECOVERY_LIMIT = 3;
@@ -367,6 +365,8 @@ export function WatchScreen({
   const activeSourceRef = useRef<Stream | null>(null);
   const activeAutoRef = useRef(false);
   const bufferingSinceRef = useRef<number | null>(null);
+  /** Recent loading-overlay spells on this source, for `checkStarved`. */
+  const stallsRef = useRef<Stall[]>([]);
   /** Core's view of the session as the latest buffering began; a stall
    *  report describes the stall, not the moment after it cleared. */
   const bufferingStatusRef = useRef<Promise<PlaybackSessionStatus | null> | null>(null);
@@ -435,6 +435,7 @@ export function WatchScreen({
     setVideoUrl(null);
     bufferingSinceRef.current = null;
     bufferingStatusRef.current = null;
+    stallsRef.current = [];
     setDownloadedRanges(null);
     setVideoDurationHint(null);
     setProgress(0);
@@ -1410,11 +1411,15 @@ export function WatchScreen({
 
   // A remembered or top-ranked source can be alive but useless: one peer
   // trickling far below the video's bitrate leaves the viewer on a spinner
-  // indefinitely, at startup or mid-play. Measured throughput (never seeder
-  // counts) decides, and only while an untried source remains.
+  // indefinitely, at startup or mid-play, or stopping every few seconds.
+  // Too much overlay (`stalledTooLong`) on a source downloading slower than
+  // the video plays moves on to the next ranked source at the same
+  // position. Measured throughput (never seeder counts) decides, and only
+  // while an untried source remains.
   async function checkStarved(session: { connection: LocalEngineConnection; id: string }) {
     const since = bufferingSinceRef.current;
-    if (since == null || performance.now() - since < STARVED_SWITCH_MS) return;
+    const stalls = stallsRef.current;
+    if (!stalledTooLong(stalls, performance.now())) return;
     if (!activeAutoRef.current) return;
     const alternative = sources.some(
       (stream) => streamKey(stream) !== activeKey && !failedSourcesRef.current.has(stream.infoHash),
@@ -1429,13 +1434,16 @@ export function WatchScreen({
     // downloadMbps is rqbit's MiB/s.
     const neededMbps = fileBytes / duration / (1024 * 1024);
     if (torrent.downloadMbps >= neededMbps) return;
-    if (bufferingSinceRef.current !== since) return;
+    if (bufferingSinceRef.current !== since || stallsRef.current !== stalls) return;
     bufferingSinceRef.current = null;
+    stallsRef.current = [];
+    const now = performance.now();
     shipClientLog(session.connection, 'warn', 'source_starved', {
       download_mbps: torrent.downloadMbps,
       needed_mbps: neededMbps,
       peers: torrent.peers,
-      waited_ms: Math.round(performance.now() - since),
+      waited_ms: since == null ? undefined : Math.round(now - since),
+      stalled_ms: Math.round(stalledWithin(stalls, now)),
       position: Math.round(lastPositionRef.current) || undefined,
     });
     failOver();
@@ -1649,7 +1657,13 @@ export function WatchScreen({
                 ? getSession(session.connection, session.id).catch(() => null)
                 : null;
             }
-            bufferingSinceRef.current = buffering ? bufferingSinceRef.current ?? performance.now() : null;
+            const now = performance.now();
+            if (buffering && bufferingSinceRef.current == null) {
+              stallsRef.current = [...recentStalls(stallsRef.current, now), { start: now, end: null }];
+            } else if (!buffering && bufferingSinceRef.current != null) {
+              stallsRef.current = stallsRef.current.map((stall) => (stall.end == null ? { ...stall, end: now } : stall));
+            }
+            bufferingSinceRef.current = buffering ? bufferingSinceRef.current ?? now : null;
           }}
           />
           {audioNotice ? (
