@@ -37,5 +37,6 @@ English dub. The prompt only appears when an English-audio source exists
   and it is never remembered as that episode's source.
 - MP4s whose chosen track is not the first audio track are remuxed.
 - The player's settings menu switches audio: the same file restarts when it
-  has both tracks, otherwise sources are re-ranked and raced from the
-  current position.
+  has both tracks (still Cubo's pick, so a starving source can be switched
+  away from), otherwise sources are re-ranked and raced from the current
+  position.

@@ -419,6 +419,9 @@ export function WatchScreen({
     /** Candidates that arrive later (Torrentio results behind a remembered
      *  source); they join the race when they land. */
     more?: Promise<Stream[]>,
+    /** Whether a starving source may be switched away from; defaults to
+     *  `auto`. */
+    switchable = auto,
   ): Promise<boolean> {
     const attempt = (attemptRef.current += 1);
     const stale = () => attemptRef.current !== attempt || abort.signal.aborted;
@@ -496,6 +499,7 @@ export function WatchScreen({
       list,
       startIndex,
       auto,
+      switchable,
       startAtFor: (stream) =>
         resumeFrom != null ? resume : resumeForSource(resume, savedInfoHash, stream.infoHash),
       more,
@@ -514,6 +518,7 @@ export function WatchScreen({
     list,
     startIndex,
     auto,
+    switchable,
     startAtFor,
     more,
     abort,
@@ -523,6 +528,7 @@ export function WatchScreen({
     list: Stream[];
     startIndex: number;
     auto: boolean;
+    switchable: boolean;
     startAtFor: (stream: Stream) => number;
     more?: Promise<Stream[]>;
     abort: AbortController;
@@ -593,7 +599,7 @@ export function WatchScreen({
         // point past the real end means the title was finished.
         const end = ready.durationSeconds ?? 0;
         const resumeAt = end > 0 && startAt >= end - RESUME_END_EPSILON ? 0 : startAt;
-        attachSession(connection, racer.stream, racer.index, list.length, auto, resumeAt, ready, abort, stale);
+        attachSession(connection, racer.stream, racer.index, list.length, auto, switchable, resumeAt, ready, abort, stale);
       };
       const onAbort = () => finish(false);
       abort.signal.addEventListener('abort', onAbort);
@@ -742,6 +748,7 @@ export function WatchScreen({
     index: number,
     total: number,
     auto: boolean,
+    switchable: boolean,
     startAt: number,
     ready: PlaybackSessionStatus,
     abort: AbortController,
@@ -758,7 +765,7 @@ export function WatchScreen({
     const fileIndex = ready.fileIndex ?? stream.fileIdx ?? 0;
     const id = ready.torrentId ?? ready.infoHash ?? '';
     activeSourceRef.current = { ...stream, fileIdx: fileIndex };
-    activeAutoRef.current = auto;
+    activeAutoRef.current = switchable;
     const audioTracks = ready.audioTracks ?? [];
     const playing = audioTracks.find((track) => track.index === ready.audioIndex);
     setPlayingAudio(audioTracks.length > 0 ? { tracks: audioTracks, language: playing?.language ?? null } : null);
@@ -1534,7 +1541,9 @@ export function WatchScreen({
       commit();
       const list = [active, ...sources.filter((stream) => streamKey(stream) !== streamKey(active))];
       setSources(list);
-      void start(list, 0, false, position);
+      // Restart this very file (no race), but Cubo's pick stays Cubo's
+      // pick: a starving source can still be switched away from.
+      void start(list, 0, false, position, undefined, activeAutoRef.current);
       return;
     }
     const attempt = attemptRef.current;
