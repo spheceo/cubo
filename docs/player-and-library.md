@@ -38,6 +38,11 @@
   credits takeover (Next episode countdown, "Watch preview") and marks the
   episode done. With no next episode the preview just plays; only real
   credits take over.
+- The Next episode countdown only runs while someone is around: after
+  two hours with no input on the page (pointer, keys, wheel, touch, or a
+  media-key play), playback pauses at the credits instead of rolling on
+  into the next episode (`viewer-activity.ts`). The episode still counts as
+  watched there; pressing play resumes the countdown.
 - Reaching the end window means the playhead (or a seek's target) is in
   it. A drag across the bar that has not been let go does not count: it
   would mark the episode done and could run out the countdown.

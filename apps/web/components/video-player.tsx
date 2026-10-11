@@ -42,6 +42,7 @@ import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
 import { skipsRecapOnEntry } from '@/lib/recap-preview';
+import { markViewerActive, viewerStillWatching, watchViewerActivity } from '@/lib/viewer-activity';
 import { fitBufferToBitrate, sessionHlsConfig, type BufferSizing } from '@/lib/session-hls-config';
 import type { SkipSection } from '@/lib/local-engine';
 
@@ -348,6 +349,7 @@ export function VideoPlayer({
   const [activeCue, setActiveCue] = useState<SubtitleCue | null>(null);
 
   useEffect(() => setPipSupported(document.pictureInPictureEnabled), []);
+  useEffect(() => watchViewerActivity(), []);
 
   // Callbacks live in refs so the media-source effect and stable seek helpers
   // never go stale or rerun on unrelated renders.
@@ -943,6 +945,15 @@ export function VideoPlayer({
   }, [creditsTakeover]);
   useEffect(() => {
     if (!creditsTakeover || !onNextEpisode || !playing) return;
+    // Nobody has touched the page for hours: stop at the credits rather
+    // than play the next episode to an empty room. Play resumes the
+    // countdown (pressing it is activity).
+    if (!viewerStillWatching()) {
+      markUserPaused(true);
+      stopPlayLoop();
+      videoRef.current?.pause();
+      return;
+    }
     let raf = 0;
     let last = performance.now();
     const tick = (now: number) => {
@@ -960,7 +971,7 @@ export function VideoPlayer({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [creditsTakeover, onNextEpisode, playing]);
+  }, [creditsTakeover, onNextEpisode, playing, markUserPaused, stopPlayLoop]);
 
   const revealControls = useCallback(() => {
     setCursorVisible(true);
@@ -1081,6 +1092,9 @@ export function VideoPlayer({
     });
     navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
     navigator.mediaSession.setActionHandler('play', () => {
+      // Media keys and headphone buttons are the viewer too, without any
+      // page input.
+      markViewerActive();
       markUserPaused(false);
       const video = videoRef.current;
       if (video) requestPlay(video);
