@@ -41,6 +41,7 @@ import { LogoLoader } from './logo-loader';
 import { PlayerSettings } from './player-settings';
 import { isAdvancingPlayback } from '@/lib/player-readiness';
 import { formatTime } from '@/lib/format';
+import { skipsRecapOnEntry } from '@/lib/recap-preview';
 import { fitBufferToBitrate, sessionHlsConfig, type BufferSizing } from '@/lib/session-hls-config';
 import type { SkipSection } from '@/lib/local-engine';
 
@@ -853,15 +854,23 @@ export function VideoPlayer({
     shownTime < recapWindow.end;
   const recapKey = recapWindow ? `${recapWindow.start}-${recapWindow.end}` : null;
   const [recapEntryHandled, setRecapEntryHandled] = useState<string | null>(null);
-  const skipRecapNow = inRecapWindow && skipRecapOnEntry && recapEntryHandled !== recapKey;
+  const skipRecapNow =
+    inRecapWindow
+    && skipRecapOnEntry
+    && skipsRecapOnEntry(recapWindow, initialTime)
+    && recapEntryHandled !== recapKey;
   const inRecap = inRecapWindow && !skipRecapNow;
   // The intro and recap share one skipper: same placement and reveal rules.
   const leadWindow = inIntro ? introWindow : inRecap ? recapWindow : null;
   const inLead = leadWindow != null;
+  // Where playback is or is going, never a drag still in progress:
+  // dragging across the credits would mark the episode done and could run
+  // out the Next episode countdown.
+  const creditsTime = pendingSeek ?? currentTime;
   const inCredits =
     creditsWindow != null &&
-    shownTime >= creditsWindow.start &&
-    shownTime < (creditsWindow.end ?? Number.POSITIVE_INFINITY);
+    creditsTime >= creditsWindow.start &&
+    creditsTime < (creditsWindow.end ?? Number.POSITIVE_INFINITY);
   // A dismissed credits prompt re-arms once the playhead leaves the window,
   // so rewinding back into it offers the actions again.
   useEffect(() => {

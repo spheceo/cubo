@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { detectRecapPreview, endWindow, recapWindow, withRecapPreview } from './recap-preview';
+import { detectRecapPreview, endWindow, recapWindow, skipsRecapOnEntry, withRecapPreview } from './recap-preview';
 import type { SubtitleCue } from './subtitles';
 
 const cue = (start: number, end: number, text: string): SubtitleCue => ({ start, end, text });
@@ -73,4 +73,14 @@ test('Core sections win over subtitle guesses', () => {
     detectRecapPreview(traitors, 3493),
   );
   assert.deepEqual(recapWindow(merged), { start: 0, end: 60, source: 'theintrodb' });
+});
+
+test('arriving from Next episode skips the recap only when playback starts inside it', () => {
+  const recap = { start: 0, end: 74 };
+  assert.equal(skipsRecapOnEntry(recap, 0), true);
+  assert.equal(skipsRecapOnEntry(recap, 40), true);
+  // A reconnect at 14:00 reads 0:00 for a moment; it must not jump to 1:14.
+  assert.equal(skipsRecapOnEntry(recap, 839.9), false);
+  assert.equal(skipsRecapOnEntry({ end: null }, 0), false);
+  assert.equal(skipsRecapOnEntry(null, 0), false);
 });

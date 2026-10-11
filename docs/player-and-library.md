@@ -31,12 +31,16 @@
   soon on…", `recap-preview.ts`). Skip recap shares the intro skipper.
   Arriving from the previous episode's Next episode (router state
   `continuedEpisode`, cleared from the history entry once read) jumps past
-  the recap silently, once; opening or resuming the episode any other way
-  offers Skip recap instead.
+  the recap silently, once, and only when playback starts inside the
+  recap (a player reconnecting mid-episode briefly reads 0:00); opening or
+  resuming the episode any other way offers Skip recap instead.
 - A preview that comes before the credits ends the episode: it gets the
   credits takeover (Next episode countdown, "Watch preview") and marks the
   episode done. With no next episode the preview just plays; only real
   credits take over.
+- Reaching the end window means the playhead (or a seek's target) is in
+  it. A drag across the bar that has not been let go does not count: it
+  would mark the episode done and could run out the countdown.
 
 ## Controls
 

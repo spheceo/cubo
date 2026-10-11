@@ -107,6 +107,14 @@ export function endWindow(segments: SkipSegments | null, hasNextEpisode: boolean
   return credits ? { window: credits, kind: 'credits' } : null;
 }
 
+/** Whether arriving from Next episode may skip the recap silently: only
+ *  when playback starts inside it. A player reconnecting mid-episode reads
+ *  0:00 for a moment before it seeks back to the viewer's spot; skipping
+ *  there threw the viewer back to the recap's end and saved that. */
+export function skipsRecapOnEntry(recap: { end: number | null } | null, startSeconds: number): boolean {
+  return recap?.end != null && startSeconds < recap.end;
+}
+
 /** The recap to offer a skip for: Core's (chapters, crowd data) first. */
 export function recapWindow(segments: SkipSegments | null): SkipSegmentWindow | null {
   const recap = segments?.sections.find((section) => section.kind === 'recap' && section.end != null);
