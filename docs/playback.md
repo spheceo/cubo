@@ -40,6 +40,13 @@ without a strong reason and maintainer approval.
   top pick runs alone for a few seconds, backups join while nothing is
   visibly downloading, the first ready plays and the rest are closed. Never
   go back to one-at-a-time attempts behind Core's resolve timeout.
+- A ready source in a worse quality tier (`qualityRank`) than a racer
+  still running is held, not played: up to 8 s, or 20 s while the
+  better one is visibly downloading. No backups launch meanwhile. It
+  plays when the better racers fail or the wait runs out; a better one
+  that becomes ready plays instead. Without this, a small 480p file wins
+  against a 1080p that is only slower to probe (`quality_hold` /
+  `quality_hold_released` in the logs).
 - Core never re-resolves a known source from the swarm: a torrent rqbit
   already manages is reused, otherwise saved metadata
   (`<data>/torrent-meta/<hash>.torrent`) is added from disk. rqbit resolves

@@ -72,7 +72,7 @@ import { armWatchSession, releaseWatchKeepalive } from '@/lib/background-playbac
 import { historyForEpisode, playbackKey } from '@/lib/library';
 import { resolveNextEpisode } from '@/lib/next-episode';
 import { loadPlayhead, playheadDeviceId, pickPlayhead, playableResume, RESUME_END_EPSILON, resumeForSource, resumeSeconds, savePlayhead } from '@/lib/playhead';
-import { isAutomaticSource, streamKey, type AudioTarget } from '@/lib/stream-select';
+import { isAutomaticSource, qualityRank, streamKey, type AudioTarget } from '@/lib/stream-select';
 import {
   audioTargetFor,
   DUB_LANGUAGE,
@@ -104,6 +104,11 @@ const RACE_MAX_ATTEMPTS = 5;
 const RACE_STAGGER_MS = 5_000;
 /** A racer pulling the header at least this fast (MiB/s) is left alone. */
 const RACE_HEALTHY_MBPS = 2;
+/** A lower-quality source that is ready first waits this long for a
+ *  better one still in the race, and up to the max while that one is
+ *  visibly downloading. */
+const QUALITY_HOLD_MS = 8_000;
+const QUALITY_HOLD_MAX_MS = 20_000;
 /** A saved position moving back further than this is logged. */
 const BACKWARD_JUMP_LOG_SECONDS = 60;
 /** How close to the end the next episode gets warmed. */
@@ -512,7 +517,9 @@ export function WatchScreen({
    *  gets a head start, a backup joins every RACE_STAGGER_MS while nothing is
    *  clearly downloading (and at once when a racer fails), and the first to
    *  become ready plays. The rest are closed. A dead source costs seconds,
-   *  not Core's resolve timeout. */
+   *  not Core's resolve timeout. A lower-quality winner is held briefly while
+   *  a better-quality racer is still going, so a small 480p file cannot beat
+   *  a 1080p that is just slower to probe. */
   async function raceSessions({
     connection,
     list,
@@ -550,6 +557,13 @@ export function WatchScreen({
      *  track waits here while the others keep racing, and plays (original
      *  audio, English captions) only if none of them has the dub. */
     let heldBack: { racer: Racer; ready: PlaybackSessionStatus; startAt: number } | null = null;
+    /** A ready source waiting on a better-quality racer (see QUALITY_HOLD_MS). */
+    let qualityHeld: {
+      racer: Racer;
+      ready: PlaybackSessionStatus;
+      startAt: number;
+      since: number;
+    } | null = null;
     const queue: { stream: Stream; index: number }[] = [];
     const queued = new Set<string>();
     const enqueue = (stream: Stream, index: number) => {
@@ -589,10 +603,12 @@ export function WatchScreen({
         abort.signal.removeEventListener('abort', onAbort);
         for (const racer of [...racers]) retire(racer);
         if (heldBack) closeSession(connection, heldBack.ready.id);
+        if (qualityHeld) closeSession(connection, qualityHeld.ready.id);
         resolve(result);
       };
       const play = (racer: Racer, ready: PlaybackSessionStatus, startAt: number) => {
         if (heldBack?.ready.id === ready.id) heldBack = null;
+        if (qualityHeld?.ready.id === ready.id) qualityHeld = null;
         finish(true);
         // Core may know the title is shorter than the saved progress
         // assumed (the picture ends before the container says). A resume
@@ -601,6 +617,29 @@ export function WatchScreen({
         const resumeAt = end > 0 && startAt >= end - RESUME_END_EPSILON ? 0 : startAt;
         attachSession(connection, racer.stream, racer.index, list.length, auto, switchable, resumeAt, ready, abort, stale);
       };
+      const betterRacers = (stream: Stream) =>
+        [...racers].filter((racer) => !racer.done && qualityRank(racer.stream) < qualityRank(stream));
+
+      /** Plays the quality-held source once nothing better is left in the
+       *  race or its wait is over. */
+      const releaseQualityHold = () => {
+        if (settled || !qualityHeld || stale()) return;
+        const better = betterRacers(qualityHeld.racer.stream);
+        const waited = performance.now() - qualityHeld.since;
+        const downloading = better.some(
+          (racer) => (racer.status?.torrent?.downloadMbps ?? 0) >= RACE_HEALTHY_MBPS,
+        );
+        const limit = downloading ? QUALITY_HOLD_MAX_MS : QUALITY_HOLD_MS;
+        if (better.length > 0 && waited < limit) return;
+        shipClientLog(connection, 'info', 'quality_hold_released', {
+          name: qualityHeld.racer.stream.name,
+          source_title: qualityHeld.racer.stream.title,
+          waited_ms: Math.round(waited),
+          better_left: better.length,
+        });
+        play(qualityHeld.racer, qualityHeld.ready, qualityHeld.startAt);
+      };
+
       const onAbort = () => finish(false);
       abort.signal.addEventListener('abort', onAbort);
 
@@ -622,6 +661,7 @@ export function WatchScreen({
       };
 
       const giveUpOrContinue = () => {
+        releaseQualityHold();
         if (settled || racers.size > 0) return;
         if (queue.length > 0 && launched < maxAttempts) {
           launch();
@@ -683,6 +723,26 @@ export function WatchScreen({
             giveUpOrContinue();
             return;
           }
+          if (auto && betterRacers(stream).length > 0) {
+            if (!qualityHeld || qualityRank(stream) < qualityRank(qualityHeld.racer.stream)) {
+              shipClientLog(connection, 'info', 'quality_hold', {
+                name: stream.name,
+                source_title: stream.title,
+                waiting_for: betterRacers(stream).map((better) => better.stream.name),
+              });
+              if (qualityHeld) closeSession(connection, qualityHeld.ready.id);
+              qualityHeld = {
+                racer,
+                ready,
+                startAt,
+                since: qualityHeld?.since ?? performance.now(),
+              };
+            } else {
+              closeSession(connection, ready.id);
+            }
+            giveUpOrContinue();
+            return;
+          }
           play(racer, ready, startAt);
         } catch (reason) {
           if (racer.done || settled) return;
@@ -714,7 +774,9 @@ export function WatchScreen({
       // pulling the file header at a healthy rate is left alone: splitting
       // its bandwidth would slow the likely winner.
       const timer = window.setInterval(() => {
-        if (settled || racers.size >= RACE_CONCURRENCY) return;
+        releaseQualityHold();
+        // A playable source is already in hand; no new backups.
+        if (settled || qualityHeld || racers.size >= RACE_CONCURRENCY) return;
         if (performance.now() - lastLaunch < RACE_STAGGER_MS) return;
         const healthy = [...racers].some(
           (racer) =>

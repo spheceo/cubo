@@ -120,7 +120,8 @@ function flaggedLanguages(hint: string): Set<string> {
   return found;
 }
 
-function rank(stream: Stream): number {
+/** Quality tier in playback preference order; lower is better. */
+export function qualityRank(stream: Stream): number {
   return QUALITY_RANK[stream.quality?.toLowerCase() ?? ''] ?? 4;
 }
 
@@ -349,7 +350,7 @@ export function rankStreams(
       if (byLanguage !== 0) return byLanguage;
       const byCapture = capturedReleaseRank(a) - capturedReleaseRank(b);
       if (byCapture !== 0) return byCapture;
-      const byQuality = rank(a) - rank(b);
+      const byQuality = qualityRank(a) - qualityRank(b);
       if (byQuality !== 0) return byQuality;
       const byPack = packRank(a, episode) - packRank(b, episode);
       if (byPack !== 0) return byPack;
@@ -394,7 +395,7 @@ export function rankPreviewStreams(
     if (bySizeClass !== 0) return bySizeClass;
     const byBucket = seederBucket(b.seeders) - seederBucket(a.seeders);
     if (byBucket !== 0) return byBucket;
-    const byQuality = rank(a) - rank(b);
+    const byQuality = qualityRank(a) - qualityRank(b);
     if (byQuality !== 0) return byQuality;
     const bySeeders = (b.seeders ?? 0) - (a.seeders ?? 0);
     if (bySeeders !== 0) return bySeeders;
@@ -402,7 +403,7 @@ export function rankPreviewStreams(
       (streamSizeBytes(a) || Number.MAX_SAFE_INTEGER) -
       (streamSizeBytes(b) || Number.MAX_SAFE_INTEGER);
     if (bySize !== 0) return bySize;
-    return rank(a) - rank(b);
+    return qualityRank(a) - qualityRank(b);
   });
 }
 
