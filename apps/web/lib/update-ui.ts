@@ -12,6 +12,18 @@ export function updateInProgress(
   return state === 'downloading' || state === 'applying' || busy;
 }
 
+function versionMatches(running: string, expected: string): boolean {
+  return running === expected || `v${running}` === expected || running === expected.replace(/^v/, '');
+}
+
+/** The install finished once Core runs the expected version, or any version
+ *  other than the one it ran before: GitHub can list a release before its
+ *  build for this platform is uploaded, and Core then installs the newest
+ *  release it can actually download. */
+export function updateLanded(running: string, expected: string, from: string | null): boolean {
+  return versionMatches(running, expected) || (from != null && !versionMatches(running, from));
+}
+
 export function displayTag(tag: string): string {
   return tag.startsWith('v') ? tag : `v${tag}`;
 }

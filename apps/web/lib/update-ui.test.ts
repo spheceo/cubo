@@ -4,6 +4,7 @@ import {
   mergeUpdateStatus,
   updateButtonLabel,
   updateInProgress,
+  updateLanded,
   updateProgressPercent,
 } from './update-ui';
 import type { CoreUpdateStatus } from './local-engine';
@@ -76,4 +77,12 @@ test('banner stays up through download and apply', () => {
   assert.equal(updateInProgress('downloading', false), true);
   assert.equal(updateInProgress('ready', true), true);
   assert.equal(updateInProgress('applying', false), true);
+});
+
+test('an install lands on the expected version or on any version Core moved to', () => {
+  assert.equal(updateLanded('0.0.32', 'v0.0.32', '0.0.30'), true);
+  // GitHub listed v0.0.32 before its macOS build was up; Core installed v0.0.31.
+  assert.equal(updateLanded('0.0.31', 'v0.0.32', '0.0.30'), true);
+  assert.equal(updateLanded('0.0.30', 'v0.0.32', '0.0.30'), false);
+  assert.equal(updateLanded('0.0.31', 'v0.0.32', null), false);
 });

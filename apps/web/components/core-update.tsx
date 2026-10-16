@@ -20,11 +20,14 @@ import {
   mergeUpdateStatus,
   updateButtonLabel,
   updateInProgress,
+  updateLanded,
   updateProgressPercent,
 } from '@/lib/update-ui';
 import { useCore } from './core-provider';
 
 const APPLYING_KEY = 'cubo.updatingTo';
+/** Core version running when the install started. */
+const APPLYING_FROM_KEY = 'cubo.updatingFrom';
 
 function previewStatus(kind: string | null): CoreUpdateStatus | null {
   if (kind === 'download' || kind === 'updating') {
@@ -37,10 +40,6 @@ function previewStatus(kind: string | null): CoreUpdateStatus | null {
     return { current: '0.0.9', latest: 'v0.1.0', state: 'applying', progress: 1 };
   }
   return null;
-}
-
-function versionMatches(running: string, expected: string): boolean {
-  return running === expected || `v${running}` === expected || running === expected.replace(/^v/, '');
 }
 
 interface UpdateContextValue {
@@ -129,6 +128,7 @@ function useCoreUpdateState() {
 
   useEffect(() => {
     const expected = sessionStorage.getItem(APPLYING_KEY);
+    const from = sessionStorage.getItem(APPLYING_FROM_KEY);
     if (!expected || !connection) return;
 
     let cancelled = false;
@@ -138,8 +138,9 @@ function useCoreUpdateState() {
         try {
           const response = await fetch(`${connection.baseUrl}/v1/health`);
           const health = (await response.json()) as { version?: string };
-          if (health.version && versionMatches(health.version, expected)) {
+          if (health.version && updateLanded(health.version, expected, from)) {
             sessionStorage.removeItem(APPLYING_KEY);
+            sessionStorage.removeItem(APPLYING_FROM_KEY);
             window.location.reload();
             return;
           }
@@ -147,6 +148,14 @@ function useCoreUpdateState() {
           // Core is down while it relaunches.
         }
         await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+      }
+      // Never strand the page on "Installing": let the status poll take over.
+      if (!cancelled) {
+        sessionStorage.removeItem(APPLYING_KEY);
+        sessionStorage.removeItem(APPLYING_FROM_KEY);
+        setStatus((current) =>
+          current ? { ...current, state: 'idle', progress: 0, error: 'The update did not finish installing.' } : current,
+        );
       }
     };
     void wait();
@@ -181,12 +190,14 @@ function useCoreUpdateState() {
         }
       }
       sessionStorage.setItem(APPLYING_KEY, latest);
+      sessionStorage.setItem(APPLYING_FROM_KEY, connection.version);
       setStatus((current) =>
         current ? { ...current, state: 'applying', progress: 1, error: null } : current,
       );
       setStatus(await applyUpdate(connection));
     } catch (reason) {
       sessionStorage.removeItem(APPLYING_KEY);
+      sessionStorage.removeItem(APPLYING_FROM_KEY);
       setStatus((current) => ({
         current: current?.current ?? connection.version,
         latest: current?.latest ?? latest,

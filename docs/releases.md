@@ -16,6 +16,13 @@ CI builds the web app, embeds it in the CLI for macOS (Apple Silicon +
 Intel), Windows x64, Linux x64, and Linux arm64, and uploads
 `cubo-cli-<target>.tar.gz` archives with ffmpeg sidecars.
 
+The release is published before every archive is uploaded, so for a few
+minutes the newest tag may have no build for a platform. Core then installs
+the newest release it can download, which can be older than the tag the
+web app offered. The web app treats any Core version change as a finished
+install, and gives up after a minute instead of showing "Installing"
+forever.
+
 ## ffmpeg sidecars
 
 `node scripts/fetch-ffmpeg.mjs` downloads static ffmpeg/ffprobe into
