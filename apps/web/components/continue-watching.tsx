@@ -1,10 +1,16 @@
 import { backdropUrl, logoUrl, type LibraryItem } from '@cubo/core';
+import { useQueries } from '@tanstack/react-query';
 import gsap from 'gsap';
 import { useEffect, useRef, useState } from 'react';
 import { IoClose } from 'react-icons/io5';
 import { ConfirmDialog } from '@/components/confirm-dialog';
 import { Link } from '@/components/link';
-import { continueWatchingItems, episodeLabel } from '@/lib/library';
+import {
+  continueWatchingCandidates,
+  continueWatchingEntries,
+  finishedShowIds,
+  type ContinueWatchingEntry,
+} from '@/lib/library';
 import { queryClient, tmdbQueries } from '@/lib/queries';
 import { prefetchTitle } from '@/lib/source-prefetch';
 import { useCore } from './core-provider';
@@ -79,17 +85,27 @@ export function ContinueWatching({
   className?: string;
 }) {
   const { library, removeFromHistory, connection } = useCore();
-  const items = continueWatchingItems(library?.history, mediaType);
+  const candidates = continueWatchingCandidates(library?.history, mediaType);
+  // A finished episode's card depends on what has aired since.
+  const showIds = finishedShowIds(candidates);
+  const shows = useQueries({ queries: showIds.map((id) => tmdbQueries.details('tv', id)) });
+  const detailsById = new Map(
+    shows.flatMap((query) => (query.data ? [[query.data.id, query.data] as const] : [])),
+  );
+  const items = continueWatchingEntries(candidates, (id) => detailsById.get(id));
 
-  // Warm the first few resume targets so "continue" starts at once: Core
+  // Warm the first few play targets so "continue" starts at once: Core
   // fetches metadata, header and probe, then parks each torrent.
-  const warmKeys = items.slice(0, WARM_ITEMS).map((item) => item.key).join('|');
+  const playable = items.filter((entry) => entry.kind !== 'waiting').slice(0, WARM_ITEMS);
+  const warmKeys = playable
+    .map((entry) => `${entry.item.mediaType}:${entry.item.mediaId}:${entry.season}:${entry.episode}`)
+    .join('|');
   useEffect(() => {
     if (!connection?.sessions || !warmKeys) return;
     let cancelled = false;
-    const targets = items.slice(0, WARM_ITEMS);
+    const targets = playable;
     void (async () => {
-      for (const item of targets) {
+      for (const { item, season, episode } of targets) {
         if (cancelled) return;
         const details = await queryClient
           .fetchQuery(tmdbQueries.details(item.mediaType, item.mediaId))
@@ -101,15 +117,15 @@ export function ContinueWatching({
           imdbId: details.imdbId ?? item.imdbId,
           title: item.title,
           originalLanguage: details.originalLanguage,
-          season: item.season,
-          episode: item.episode,
+          season,
+          episode,
         });
       }
     })();
     return () => {
       cancelled = true;
     };
-    // `items` is rebuilt every render; the joined keys say when it changed.
+    // `playable` is rebuilt every render; the joined keys say when it changed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connection, warmKeys]);
   const sectionRef = useRef<HTMLElement>(null);
@@ -160,16 +176,16 @@ export function ContinueWatching({
     <section ref={sectionRef} className={className}>
       <h2 className="text-2xl font-semibold">Continue Watching</h2>
       <div ref={gridRef} className="relative isolate mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {items.map((item) => (
+        {items.map((entry) => (
           <ContinueWatchingCard
-            key={item.key}
-            item={item}
-            removing={removingKey === item.key}
+            key={entry.item.key}
+            entry={entry}
+            removing={removingKey === entry.item.key}
             cardRef={(element) => {
-              if (element) cardRefs.current.set(item.key, element);
-              else cardRefs.current.delete(item.key);
+              if (element) cardRefs.current.set(entry.item.key, element);
+              else cardRefs.current.delete(entry.item.key);
             }}
-            onRemove={() => void removeItem(item.key)}
+            onRemove={() => void removeItem(entry.item.key)}
           />
         ))}
       </div>
@@ -178,29 +194,31 @@ export function ContinueWatching({
 }
 
 function ContinueWatchingCard({
-  item,
+  entry,
   onRemove,
   cardRef,
   removing,
 }: {
-  item: LibraryItem;
+  entry: ContinueWatchingEntry;
   onRemove: () => void;
   cardRef: (element: HTMLDivElement | null) => void;
   removing: boolean;
 }) {
   const [confirming, setConfirming] = useState(false);
 
+  const { item } = entry;
   const backdrop = backdropUrl(item.backdropPath, 'w780');
   const logo = logoUrl(item.logoPath, 'w300');
-  const percent = Math.min(100, Math.round(item.progress * 100));
-  const episode = episodeLabel(item.season, item.episode);
+  const percent = Math.min(100, Math.round(entry.progress * 100));
+  const episode = entry.label;
   const title = episode ? `${item.title} · ${episode}` : item.title;
+  const action = entry.kind === 'resume' ? 'Continue' : entry.kind === 'next' ? 'Play' : 'Open';
 
   return (
     <div ref={cardRef} className="group" aria-busy={removing}>
       <Link
-        href={item.watchHref}
-        aria-label={`Continue ${title}`}
+        href={entry.href}
+        aria-label={`${action} ${title}${entry.newEpisode ? ', new episode' : ''}`}
         className="relative block aspect-video cursor-pointer overflow-hidden rounded-xl bg-white/[0.06] shadow-[0_12px_30px_rgba(0,0,0,0.28)]"
       >
         {backdrop ? (
@@ -215,6 +233,12 @@ function ContinueWatchingCard({
           />
         ) : null}
         <div className="absolute inset-0 bg-linear-to-t from-black/80 via-black/20 to-transparent" />
+        {entry.newEpisode ? (
+          <span className="absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-xs font-semibold text-white backdrop-blur-md">
+            <span aria-hidden className="size-1.5 rounded-full bg-white" />
+            New episode
+          </span>
+        ) : null}
         <button
           type="button"
           aria-label="Remove from Continue Watching"
@@ -251,7 +275,7 @@ function ContinueWatchingCard({
       {confirming ? (
         <ConfirmDialog
           title="Remove from Continue Watching?"
-          description={`Are you sure you want to remove ${title} from your continue watching list?`}
+          description={`Are you sure you want to remove ${item.title} from your continue watching list?`}
           onCancel={() => setConfirming(false)}
           onConfirm={() => {
             setConfirming(false);

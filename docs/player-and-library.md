@@ -71,6 +71,19 @@
 
 ## Library and browsing
 
+- Continue Watching (`continueWatchingEntries` in `lib/library.ts`) has
+  one card per title, from the last episode touched. An unfinished
+  episode resumes. A finished one moves the card on to the next aired
+  episode, so a show stays until there is nothing left to watch.
+  Finishing the final aired episode of an ended or canceled show
+  finishes it, in whatever order it was watched. A caught-up show that
+  is still airing (TMDB "Returning Series", "In Production", "Planned",
+  or a scheduled next episode) stays with its next air date ("S1 E8 ·
+  Airs Thu, Oct 22", or "Caught up"). That card opens the title page.
+- The "New episode" pill (frosted dark, white dot) means the season the
+  viewer is on got an episode after they finished theirs. Catching up
+  on an older season while a later one airs gets no pill. Cards with
+  the pill lead the row.
 - Air-date labels past tomorrow always carry the date ("Airs Fri, Oct 9"):
   a bare weekday reads as the past when that day already went by this week.
 - The Library schedule (`release-schedule.tsx`) covers every TV show in the

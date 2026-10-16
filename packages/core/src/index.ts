@@ -53,6 +53,11 @@ export interface MediaDetails extends MediaSummary {
   seasons: SeasonSummary[];
   /** Next episode TMDB/Cinemeta says has not aired yet. */
   nextEpisode: UpcomingEpisode | null;
+  /** Most recent episode that has aired, when known. */
+  lastEpisode: UpcomingEpisode | null;
+  /** TMDB production status ("Returning Series", "Ended", "Canceled", …);
+   *  null when the provider does not say. */
+  status: string | null;
 }
 
 export interface Stream {
@@ -290,6 +295,8 @@ export type TmdbDetailsRaw = TmdbListItemRaw & {
   seasons?: TmdbSeasonRaw[];
   images?: { logos?: TmdbImageRaw[] };
   next_episode_to_air?: TmdbEpisodeRaw | null;
+  last_episode_to_air?: TmdbEpisodeRaw | null;
+  status?: string | null;
 };
 
 export type TmdbImageRaw = {
@@ -544,6 +551,8 @@ function cinemetaDetails(
           }))
         : [],
     nextEpisode: upcomingFromVideos(videos),
+    lastEpisode: mediaType === 'tv' ? airedFromVideos(videos) : null,
+    status: null,
   };
 }
 
@@ -589,6 +598,8 @@ export function normalizeDetails(item: TmdbDetailsRaw, mediaType: MediaType): Me
         posterPath: season.poster_path ?? null,
       })),
     nextEpisode: upcomingFromTmdb(item.next_episode_to_air),
+    lastEpisode: airedFromTmdb(item.last_episode_to_air),
+    status: item.status ?? null,
   };
 }
 
@@ -601,6 +612,33 @@ function upcomingFromTmdb(episode: TmdbEpisodeRaw | null | undefined): UpcomingE
     name: episode.name ?? '',
     airDate: episode.air_date,
   };
+}
+
+function airedFromTmdb(episode: TmdbEpisodeRaw | null | undefined): UpcomingEpisode | null {
+  if (!episode?.air_date || (episode.season_number ?? 0) < 1) return null;
+  return {
+    seasonNumber: episode.season_number ?? 0,
+    episodeNumber: episode.episode_number ?? 0,
+    name: episode.name ?? '',
+    airDate: episode.air_date,
+  };
+}
+
+function airedFromVideos(videos: CinemetaVideo[]): UpcomingEpisode | null {
+  const aired = videos
+    .filter((video) => (video.season ?? 0) > 0 && (video.episode ?? 0) > 0 && video.released)
+    .map((video) => ({
+      seasonNumber: video.season ?? 0,
+      episodeNumber: video.episode ?? 0,
+      name: video.name ?? '',
+      airDate: video.released!.slice(0, 10),
+    }))
+    .filter((episode) => parseCalendarDate(episode.airDate) && !isUpcomingDate(episode.airDate))
+    .sort(
+      (left, right) =>
+        left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber,
+    );
+  return aired[aired.length - 1] ?? null;
 }
 
 function upcomingFromVideos(videos: CinemetaVideo[]): UpcomingEpisode | null {

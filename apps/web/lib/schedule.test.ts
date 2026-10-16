@@ -31,6 +31,8 @@ function show(id: number, nextAirDate: string | null): MediaDetails {
     nextEpisode: nextAirDate
       ? { seasonNumber: 1, episodeNumber: 3, name: 'Three', airDate: nextAirDate }
       : null,
+    lastEpisode: null,
+    status: 'Returning Series',
   };
 }
 

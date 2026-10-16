@@ -1,8 +1,9 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import type { LibraryItem } from '@cubo/core';
+import type { LibraryItem, MediaDetails } from '@cubo/core';
 import {
-  continueWatchingItems,
+  continueWatchingCandidates,
+  continueWatchingEntries,
   historyForEpisode,
   latestHistoryForTitle,
   watchHistoryItems,
@@ -27,6 +28,12 @@ function item(partial: Partial<LibraryItem> & Pick<LibraryItem, 'key' | 'mediaId
     detailHref: '/tv/1',
     ...partial,
   };
+}
+
+/** Continue Watching keys with no TMDB details loaded. */
+function continueWatchingItems(history: LibraryItem[]): LibraryItem[] {
+  return continueWatchingEntries(continueWatchingCandidates(history), () => undefined)
+    .map((entry) => entry.item);
 }
 
 test('watch history shows one card per title — the last episode touched, not the highest', () => {
@@ -107,4 +114,151 @@ test('continue watching ignores rows without a known duration', () => {
     key: 'tv:6:1:1', mediaId: 6, lastWatchedAt: 30, durationSeconds: 0,
   });
   assert.deepEqual(continueWatchingItems([unknownDuration]), []);
+});
+
+function dayOffset(days: number): string {
+  const date = new Date();
+  date.setHours(12, 0, 0, 0);
+  date.setDate(date.getDate() + days);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function daysAgoMs(days: number): number {
+  return Date.now() - days * 86_400_000;
+}
+
+function details(partial: Partial<MediaDetails> & Pick<MediaDetails, 'id'>): MediaDetails {
+  return {
+    mediaType: 'tv',
+    title: 'War',
+    overview: '',
+    posterPath: null,
+    backdropPath: null,
+    releaseDate: '2026-09-01',
+    voteAverage: 7,
+    imdbId: null,
+    originalLanguage: 'en',
+    logoPath: null,
+    genres: [],
+    runtime: 50,
+    numberOfSeasons: 2,
+    seasons: [
+      { seasonNumber: 1, name: 'Season 1', episodeCount: 8, airDate: '', posterPath: null },
+      { seasonNumber: 2, name: 'Season 2', episodeCount: 6, airDate: '', posterPath: null },
+    ],
+    nextEpisode: null,
+    lastEpisode: null,
+    status: 'Ended',
+    ...partial,
+  };
+}
+
+function finishedEpisode(mediaId: number, season: number, episode: number, lastWatchedAt: number): LibraryItem {
+  return item({
+    key: `tv:${mediaId}:${season}:${episode}`, mediaId, season, episode, lastWatchedAt,
+    positionSeconds: 3590, durationSeconds: 3600, progress: 0.997, completed: true,
+  });
+}
+
+function entriesFor(history: LibraryItem[], shows: MediaDetails[]) {
+  const byId = new Map(shows.map((show) => [show.id, show]));
+  return continueWatchingEntries(continueWatchingCandidates(history), (id) => byId.get(id));
+}
+
+test('a finished episode moves the card on to the next aired episode', () => {
+  const [entry] = entriesFor(
+    [finishedEpisode(1, 1, 3, daysAgoMs(1))],
+    [details({ id: 1, lastEpisode: { seasonNumber: 1, episodeNumber: 5, name: '', airDate: dayOffset(-20) } })],
+  );
+  assert.equal(entry.kind, 'next');
+  assert.equal(entry.label, 'S1 E4');
+  assert.equal(entry.href, '/watch/tv/1?season=1&episode=4');
+  assert.equal(entry.progress, 0);
+  assert.equal(entry.newEpisode, false);
+});
+
+test('a season finale moves on to the next season', () => {
+  const [entry] = entriesFor(
+    [finishedEpisode(1, 1, 8, daysAgoMs(30))],
+    [details({ id: 1, lastEpisode: { seasonNumber: 2, episodeNumber: 6, name: '', airDate: dayOffset(-60) } })],
+  );
+  assert.equal(entry.label, 'S2 E1');
+});
+
+test('an episode that aired after the viewer finished theirs is marked new and leads the row', () => {
+  const entries = entriesFor(
+    [
+      item({ key: 'tv:2:1:1', mediaId: 2, lastWatchedAt: daysAgoMs(0) }),
+      finishedEpisode(1, 1, 3, daysAgoMs(7)),
+    ],
+    [details({
+      id: 1,
+      status: 'Returning Series',
+      lastEpisode: { seasonNumber: 1, episodeNumber: 4, name: '', airDate: dayOffset(-1) },
+      nextEpisode: { seasonNumber: 1, episodeNumber: 5, name: '', airDate: dayOffset(6) },
+    })],
+  );
+  assert.deepEqual(entries.map((entry) => [entry.item.mediaId, entry.newEpisode]), [[1, true], [2, false]]);
+  assert.equal(entries[0].label, 'S1 E4');
+});
+
+test('catching up on an older season gets no new-episode pill', () => {
+  const [entry] = entriesFor(
+    [finishedEpisode(1, 1, 2, daysAgoMs(4))],
+    [details({
+      id: 1,
+      status: 'Returning Series',
+      lastEpisode: { seasonNumber: 2, episodeNumber: 4, name: '', airDate: dayOffset(-2) },
+    })],
+  );
+  assert.equal(entry.label, 'S1 E3');
+  assert.equal(entry.newEpisode, false);
+});
+
+test('caught up on a show that is still airing waits on the next air date', () => {
+  const [entry] = entriesFor(
+    [finishedEpisode(1, 1, 3, daysAgoMs(1))],
+    [details({
+      id: 1,
+      status: 'Returning Series',
+      lastEpisode: { seasonNumber: 1, episodeNumber: 3, name: '', airDate: dayOffset(-2) },
+      nextEpisode: { seasonNumber: 1, episodeNumber: 4, name: '', airDate: dayOffset(0) },
+    })],
+  );
+  assert.equal(entry.kind, 'waiting');
+  assert.equal(entry.label, 'S1 E4 · Airs Today');
+  assert.equal(entry.href, '/tv/1');
+});
+
+test('a returning show with nothing scheduled stays as caught up', () => {
+  const [entry] = entriesFor(
+    [finishedEpisode(1, 2, 6, daysAgoMs(1))],
+    [details({
+      id: 1,
+      status: 'Returning Series',
+      lastEpisode: { seasonNumber: 2, episodeNumber: 6, name: '', airDate: dayOffset(-30) },
+    })],
+  );
+  assert.equal(entry.kind, 'waiting');
+  assert.equal(entry.label, 'Caught up');
+});
+
+test('finishing the final episode of an ended show finishes it, even watched out of order', () => {
+  const history = [
+    finishedEpisode(1, 1, 1, daysAgoMs(3)),
+    finishedEpisode(1, 2, 6, daysAgoMs(1)),
+  ];
+  assert.deepEqual(
+    entriesFor(history, [details({
+      id: 1,
+      lastEpisode: { seasonNumber: 2, episodeNumber: 6, name: '', airDate: dayOffset(-300) },
+    })]),
+    [],
+  );
+});
+
+test('a finished show waits for its details before it gets a card', () => {
+  assert.deepEqual(entriesFor([finishedEpisode(1, 1, 3, daysAgoMs(1))], []), []);
 });
