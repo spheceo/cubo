@@ -37,6 +37,16 @@ test('successful torrent and file survive a revisit despite seeder changes', () 
   }
 });
 
+test('a remembered lower-quality source gives way to a better tier, not to seeders', () => {
+  const sd = { ...english, infoHash: 'sd', quality: '480p', seeders: 1 };
+  const hd = { ...english, infoHash: 'hd', quality: '1080p', seeders: 19 };
+  const ranked = rankStreams([sd, hd], { transcode: true, hevc: false }, 'en');
+  assert.equal(preferSource(ranked, sd)[0]?.infoHash, 'hd');
+  const otherSd = { ...sd, infoHash: 'other-sd', seeders: 500 };
+  const sameTier = rankStreams([otherSd, sd], { transcode: true, hevc: false }, 'en');
+  assert.equal(preferSource(sameTier, sd)[0]?.infoHash, 'sd');
+});
+
 test('automatic playback excludes explicit foreign audio and cinema captures', () => {
   assert.equal(isAutomaticSource(english, 'en'), true);
   assert.equal(isAutomaticSource({ ...english, title: 'Movie Spanish 🇪🇸' }, 'en'), false);

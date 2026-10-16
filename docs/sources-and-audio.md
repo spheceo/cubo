@@ -4,7 +4,10 @@
 
 Successful playback remembers the exact torrent and file per movie/episode
 (`source-affinity.ts`). Reopening tries that source while alternatives load
-in parallel. Seeder-count changes alone must not switch releases. Failed
+in parallel. Seeder-count changes alone must not switch releases; a better
+quality tier does. Only a remembered top-tier (1080p) source starts before
+Torrentio answers. A lower one waits for the list and leads only if nothing
+ranks in a better tier, so a 480p that won one race is not replayed forever. Failed
 sources are forgotten and excluded from further automatic attempts in the
 same session; an explicit retry resets that exclusion.
 

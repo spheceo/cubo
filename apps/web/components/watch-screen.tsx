@@ -964,7 +964,11 @@ export function WatchScreen({
         rankForPlayback(found, saved, connection, { originalLanguage, audio, season, episode });
       sourceRefreshRef.current = foundPromise.then((found) => rank(found, savedSource));
       try {
-        const preferred = rank([], savedSource);
+        // Only a remembered source in the top tier starts before Torrentio
+        // answers; a lower one waits to see whether a better tier exists.
+        const preferred = savedSource && qualityRank(savedSource) === 0
+          ? rank([], savedSource)
+          : [];
         if (preferred.length > 0 && connection) {
           setSources(preferred);
           // Alternatives join the race as soon as Torrentio answers, so a
@@ -985,9 +989,9 @@ export function WatchScreen({
         const found = await foundPromise;
         if (cancelled) return;
         // A failed remembered torrent must not consume the first retry too.
-        const ranked = rank(preferred.length > 0
-          ? found.filter((stream) => stream.infoHash !== savedSource?.infoHash)
-          : found, null);
+        const ranked = preferred.length > 0
+          ? rank(found.filter((stream) => stream.infoHash !== savedSource?.infoHash), null)
+          : rank(found, savedSource);
         setSources(ranked);
         if (connection) {
           shipClientLog(

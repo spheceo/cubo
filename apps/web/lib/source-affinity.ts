@@ -1,5 +1,5 @@
 import type { Stream } from '@cubo/core';
-import { streamKey } from './stream-select';
+import { qualityRank, streamKey } from './stream-select';
 
 const STORAGE_KEY = 'cubo.sources.v1';
 const MAX_SOURCES = 100;
@@ -35,12 +35,15 @@ export function loadSource(key: string): Stream | null {
 }
 
 /** Provider order and seeder counts fluctuate; neither should switch rips.
- * The caller still applies current codec, size and language eligibility. */
+ * A better quality tier does: a remembered 480p that won a race gives way
+ * once the ranking leads with a 1080p. The caller still applies current
+ * codec, size and language eligibility. */
 export function preferSource(streams: Stream[], saved: Stream | null): Stream[] {
   if (!saved) return streams;
   const key = streamKey(saved);
   const matching = streams.find((stream) => streamKey(stream) === key);
   if (!matching) return streams;
+  if (streams[0] && qualityRank(streams[0]) < qualityRank(matching)) return streams;
   return [matching, ...streams.filter((stream) => streamKey(stream) !== key)];
 }
 
