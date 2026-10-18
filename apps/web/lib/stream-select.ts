@@ -140,6 +140,18 @@ function stereo3dRank(stream: Stream): number {
   return STEREO_3D_RE.test(hint) ? 1 : 0;
 }
 
+/** Below this many seeders a swarm is near-dead: Wayward Pines' 4-seeder
+ *  WEB-DL delivered 0.19 Mbps against the 0.87 it needed while a 54-seeder
+ *  pack of the same episode sat lower in the list. */
+const WEAK_SWARM_SEEDERS = 5;
+
+/** 0 = a usable swarm (or an unknown count), 1 = near-dead. Seeder counts
+ *  are stale tracker scrapes, so this only separates the nearly empty from
+ *  the rest; among usable swarms seeders still never outrank the release. */
+export function weakSwarmRank(stream: Stream): number {
+  return stream.seeders != null && stream.seeders < WEAK_SWARM_SEEDERS ? 1 : 0;
+}
+
 /** Buckets seeders so "plenty" sources compete on bitrate instead of raw swarm size. */
 function seederBucket(seeders: number | null): number {
   const value = seeders ?? 0;
@@ -328,7 +340,8 @@ export function isOversizedStream(stream: Stream): boolean {
 
 /** Playable streams, best first: original-language audio (a dubbed release
  *  should never win the auto-pick), then real releases over cinema captures,
- *  then preferred quality, then a single title over a collection/season
+ *  then preferred quality, then a usable swarm over a near-dead one, then a
+ *  single title over a collection/season
  *  pack (a pack MP4 still has a weak swarm for that one file), then a
  *  normal-sized rip over a 12 GB+ remux, then direct-play files (fully
  *  seekable, no converter), then a healthy swarm, then the larger file
@@ -352,6 +365,8 @@ export function rankStreams(
       if (byCapture !== 0) return byCapture;
       const byQuality = qualityRank(a) - qualityRank(b);
       if (byQuality !== 0) return byQuality;
+      const bySwarm = weakSwarmRank(a) - weakSwarmRank(b);
+      if (bySwarm !== 0) return bySwarm;
       const byPack = packRank(a, episode) - packRank(b, episode);
       if (byPack !== 0) return byPack;
       const bySizeClass = oversizedRank(a) - oversizedRank(b);

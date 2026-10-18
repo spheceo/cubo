@@ -207,6 +207,49 @@ pub fn chapter_skip_segments(
     (intro, credits)
 }
 
+/// How far past a crowd credits start the file's own credits chapter may
+/// begin and still be the same credits.
+const CREDITS_ALIGN_MAX_SHIFT_SECONDS: f64 = 180.0;
+/// A final chapter longer than this is story, not an end-credits roll.
+const CREDITS_CHAPTER_MAX_SECONDS: f64 = 300.0;
+const CREDITS_CHAPTER_MIN_SECONDS: f64 = 10.0;
+
+/// Crowd databases time credits on someone else's copy of the episode, and
+/// some submissions mark the closing scene as the outro (IntroDB starts
+/// Wayward Pines' credits 60–100 s before they roll in the Blu-ray rips).
+/// Releases put a chapter mark where the credits roll even when they leave
+/// it unnamed, so a crowd start that falls mid-chapter shortly before a
+/// short final chapter moves to that chapter. Only ever later: ending the
+/// episode early skips story, a late prompt costs seconds of credits.
+pub fn align_credits_to_chapters(
+    credits: SkipSegment,
+    chapters: &[Chapter],
+    duration_seconds: f64,
+) -> Option<SkipSegment> {
+    if duration_seconds <= 0.0 || chapters.len() < 2 {
+        return None;
+    }
+    let last = chapters
+        .iter()
+        .filter(|chapter| {
+            chapter.start_seconds.is_finite()
+                && chapter.end_seconds.is_finite()
+                && chapter.end_seconds > chapter.start_seconds
+        })
+        .max_by(|a, b| a.start_seconds.total_cmp(&b.start_seconds))?;
+    let length = duration_seconds - last.start_seconds;
+    let shift = last.start_seconds - credits.start;
+    let runs_to_end = last.end_seconds >= duration_seconds - 2.0;
+    (runs_to_end
+        && (CREDITS_CHAPTER_MIN_SECONDS..=CREDITS_CHAPTER_MAX_SECONDS).contains(&length)
+        && shift > 5.0
+        && shift <= CREDITS_ALIGN_MAX_SHIFT_SECONDS)
+        .then_some(SkipSegment {
+            start: last.start_seconds,
+            end: f64::MAX,
+        })
+}
+
 /// ffprobe's `field_order`: `progressive`, `unknown`, or a field order
 /// (`tt`, `bb`, `tb`, `bt`) for interlaced video.
 fn is_interlaced(field_order: &str) -> bool {
@@ -663,6 +706,87 @@ mod tests {
         #[test]
         fn no_choice_keeps_the_probe_pick() {
             assert_eq!(dual().with_audio_language(None).audio_stream_index, Some(2));
+        }
+    }
+
+    mod credits_alignment {
+        use super::super::{align_credits_to_chapters, Chapter, SkipSegment};
+
+        fn chapter(start: f64, end: f64) -> Chapter {
+            Chapter {
+                start_seconds: start,
+                end_seconds: end,
+                title: "Chapter".to_owned(),
+            }
+        }
+
+        fn crowd(start: f64, end: f64) -> SkipSegment {
+            SkipSegment { start, end }
+        }
+
+        /// Wayward Pines S01E04 (Panda Blu-ray rip): IntroDB says the
+        /// outro runs 2509–2602; the credits roll at chapter 10, 2605.35.
+        fn wayward_pines_e04() -> Vec<Chapter> {
+            vec![
+                chapter(0.0, 64.856),
+                chapter(64.856, 308.934),
+                chapter(308.934, 353.979),
+                chapter(1726.141, 2110.9),
+                chapter(2110.9, 2605.353),
+                chapter(2605.353, 2642.452),
+            ]
+        }
+
+        #[test]
+        fn crowd_credits_move_to_the_final_chapter() {
+            let aligned = align_credits_to_chapters(crowd(2509.0, 2602.31), &wayward_pines_e04(), 2642.452)
+                .expect("aligned");
+            assert_eq!(aligned.start, 2605.353);
+            assert_eq!(aligned.end, f64::MAX);
+        }
+
+        #[test]
+        fn a_crowd_end_matching_the_file_does_not_block_the_move() {
+            // S01E06 Panda: IntroDB's 2463–2600.6 matches the file's length
+            // yet starts 100 s before the credits chapter.
+            let chapters = [
+                chapter(1884.508, 2207.455),
+                chapter(2207.455, 2563.394),
+                chapter(2563.394, 2600.489),
+            ];
+            let aligned = align_credits_to_chapters(crowd(2463.22, 2600.62), &chapters, 2600.489)
+                .expect("aligned");
+            assert_eq!(aligned.start, 2563.394);
+        }
+
+        #[test]
+        fn crowd_credits_inside_the_final_chapter_stay() {
+            assert!(align_credits_to_chapters(crowd(2610.0, f64::MAX), &wayward_pines_e04(), 2642.452).is_none());
+            // Within a few seconds of the mark is the same start.
+            assert!(align_credits_to_chapters(crowd(2602.0, f64::MAX), &wayward_pines_e04(), 2642.452).is_none());
+        }
+
+        #[test]
+        fn a_long_final_chapter_is_story_not_credits() {
+            let chapters = [chapter(0.0, 2000.0), chapter(2000.0, 2600.0)];
+            assert!(align_credits_to_chapters(crowd(1900.0, f64::MAX), &chapters, 2600.0).is_none());
+        }
+
+        #[test]
+        fn a_far_later_chapter_is_not_the_same_credits() {
+            assert!(align_credits_to_chapters(crowd(2300.0, f64::MAX), &wayward_pines_e04(), 2642.452).is_none());
+        }
+
+        #[test]
+        fn files_without_chapters_keep_crowd_timing() {
+            assert!(align_credits_to_chapters(crowd(2509.0, f64::MAX), &[], 2642.452).is_none());
+            assert!(align_credits_to_chapters(crowd(2509.0, f64::MAX), &[chapter(0.0, 2642.452)], 2642.452).is_none());
+        }
+
+        #[test]
+        fn a_final_chapter_short_of_the_end_is_not_trusted() {
+            let chapters = [chapter(0.0, 2605.0), chapter(2605.0, 2620.0)];
+            assert!(align_credits_to_chapters(crowd(2509.0, f64::MAX), &chapters, 2642.0).is_none());
         }
     }
 

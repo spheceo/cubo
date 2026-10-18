@@ -11,6 +11,20 @@ ranks in a better tier, so a 480p that won one race is not replayed forever. Fai
 sources are forgotten and excluded from further automatic attempts in the
 same session; an explicit retry resets that exclusion.
 
+A show's next episode plays from the release its last episode played from
+(`preferContinuity`): the same season pack when it carries the episode (its
+torrent is already known, often with peers), else the same scene group's
+episode ("…-KONTRAST"). Only within the leading quality tier and never onto
+a near-dead swarm. An episode's own remembered source still wins.
+
+## Swarm health
+
+Seeder counts are stale tracker scrapes, so among usable swarms they only
+break ties. A near-dead one (under 5 seeders) ranks below every usable
+source of its quality tier, ahead of pack, size and direct-play preferences
+(`weakSwarmRank`): a 4-seeder single episode delivered 0.19 Mbps of the
+0.87 it needed while a 54-seeder pack sat lower in the list.
+
 ## Eligibility
 
 - Automatic playback and previews exclude positively identified foreign

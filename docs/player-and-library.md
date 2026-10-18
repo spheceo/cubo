@@ -24,8 +24,22 @@
 
 - From a show's second episode on, detected intros skip themselves after a
   short countdown on the Skip intro button (Watch intro cancels), once per
-  intro window. The player settings toggle "Auto-skip intro" turns it off;
-  episode 1 always plays its intro.
+  intro window. Episode 1 always plays its intro.
+- The player settings' Auto-skip pane holds both automatic skips: "Skip
+  intros" and "Play next episode". With the latter off, the credits still
+  take over with Next episode, but there is no countdown and nothing
+  advances on its own. Both default on and persist locally.
+- Credits must never start while the story is still going: ending early
+  skips story, a late prompt only costs seconds of credits. Crowd databases
+  time credits on someone else's copy, and IntroDB starts Wayward Pines'
+  credits 60–100 s before the Blu-ray rips roll them. Core moves crowd
+  credits that land mid-chapter to a short final chapter (10 s–5 min,
+  running to the end) starting up to 3 min later
+  (`align_credits_to_chapters`), since releases mark the credits with a
+  chapter even when they leave it unnamed. The player then moves them past
+  English dialogue that runs on from their start (a line within 30 s,
+  ignoring lyrics, sound tags and the subtitler's credit;
+  `creditsAfterDialogue`). Both only ever move credits later.
 - Recaps and previews come from Core's sections when it has them, otherwise
   from the English subtitles' narrator lead-ins ("Previously on…", "Coming
   soon on…", `recap-preview.ts`). Skip recap shares the intro skipper.

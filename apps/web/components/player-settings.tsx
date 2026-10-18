@@ -25,7 +25,8 @@ type Panel =
   | 'color'
   | 'framing'
   | 'sections'
-  | 'section-color';
+  | 'section-color'
+  | 'auto-skip';
 
 const FRAMING_MODES: FramingMode[] = ['fit', 'fill-width', 'fill-height', 'auto'];
 
@@ -50,6 +51,8 @@ export function PlayerSettings({
   onPickFraming,
   autoSkipIntro = true,
   onToggleAutoSkipIntro,
+  autoPlayNext = true,
+  onToggleAutoPlayNext,
   sectionsVisible = true,
   onToggleSections,
   sectionColors,
@@ -70,6 +73,9 @@ export function PlayerSettings({
   /** Whether detected intros skip themselves from a show's second episode. */
   autoSkipIntro?: boolean;
   onToggleAutoSkipIntro?: (enabled: boolean) => void;
+  /** Whether the credits prompt counts down into the next episode. */
+  autoPlayNext?: boolean;
+  onToggleAutoPlayNext?: (enabled: boolean) => void;
   /** Whether intro/credits/etc. bands are drawn on the timeline. Detection
    *  and skip actions keep working either way — this is purely display. */
   sectionsVisible?: boolean;
@@ -89,6 +95,14 @@ export function PlayerSettings({
   const colorEntry =
     CAPTION_COLORS.find((entry) => entry.value === captionColor) ?? CAPTION_COLORS[0];
   const framingLabel = FRAMING_LABELS[framing];
+  const autoSkipLabel =
+    autoSkipIntro && autoPlayNext
+      ? 'On'
+      : autoSkipIntro
+        ? 'Intro'
+        : autoPlayNext
+          ? 'Credits'
+          : 'Off';
   const colorFor = (kind: SectionKind) =>
     sectionColors?.[kind] ??
     SECTION_KINDS.find((entry) => entry.kind === kind)?.default ??
@@ -126,7 +140,27 @@ export function PlayerSettings({
       aria-label="Playback settings"
       className="relative w-56 overflow-hidden rounded-xl border border-white/10 bg-black/92 shadow-2xl backdrop-blur-md"
     >
-      {panel === 'sections' ? (
+      {panel === 'auto-skip' ? (
+        <>
+          <PaneHeader label="Auto-skip" onBack={() => setPanel('root')} />
+          <div className="border-t border-white/8">
+            {onToggleAutoSkipIntro ? (
+              <SwitchRow
+                label="Skip intros"
+                checked={autoSkipIntro}
+                onChange={onToggleAutoSkipIntro}
+              />
+            ) : null}
+            {onToggleAutoPlayNext ? (
+              <SwitchRow
+                label="Play next episode"
+                checked={autoPlayNext}
+                onChange={onToggleAutoPlayNext}
+              />
+            ) : null}
+          </div>
+        </>
+      ) : panel === 'sections' ? (
         <>
           <PaneHeader label="Timeline sections" onBack={() => setPanel('root')} />
           <div className="border-t border-white/8">
@@ -140,29 +174,6 @@ export function PlayerSettings({
                 {sectionsVisible ? 'On' : 'Off'}
               </span>
             </button>
-            {onToggleAutoSkipIntro ? (
-              <button
-                type="button"
-                role="switch"
-                aria-checked={autoSkipIntro}
-                onClick={() => onToggleAutoSkipIntro(!autoSkipIntro)}
-                className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
-              >
-                <span>Auto-skip intro</span>
-                <span
-                  aria-hidden
-                  className={`relative inline-flex h-4.5 w-8 shrink-0 items-center rounded-full transition-colors ${
-                    autoSkipIntro ? 'bg-white' : 'bg-white/20'
-                  }`}
-                >
-                  <span
-                    className={`absolute size-3.5 rounded-full transition-[left,background-color] ${
-                      autoSkipIntro ? 'left-4 bg-black' : 'left-0.5 bg-white/80'
-                    }`}
-                  />
-                </span>
-              </button>
-            ) : null}
           </div>
           <div className="border-t border-white/8">
             {SECTION_KINDS.map((entry) => (
@@ -286,6 +297,22 @@ export function PlayerSettings({
               <IoChevronForward size={14} className="shrink-0" />
             </span>
           </button>
+          {onToggleAutoSkipIntro || onToggleAutoPlayNext ? (
+            <>
+              <div className="border-t border-white/8" />
+              <button
+                type="button"
+                onClick={() => setPanel('auto-skip')}
+                className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+              >
+                <span>Auto-skip</span>
+                <span className="flex min-w-0 items-center gap-1 text-white/45">
+                  <span className="truncate">{autoSkipLabel}</span>
+                  <IoChevronForward size={14} className="shrink-0" />
+                </span>
+              </button>
+            </>
+          ) : null}
           <div className="border-t border-white/8" />
           <button
             type="button"
@@ -366,6 +393,40 @@ function SubRow({
         ) : null}
         <span className="truncate">{value}</span>
         <IoChevronForward size={14} className="shrink-0" />
+      </span>
+    </button>
+  );
+}
+
+function SwitchRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className="flex w-full cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/8"
+    >
+      <span>{label}</span>
+      <span
+        aria-hidden
+        className={`relative inline-flex h-4.5 w-8 shrink-0 items-center rounded-full transition-colors ${
+          checked ? 'bg-white' : 'bg-white/20'
+        }`}
+      >
+        <span
+          className={`absolute size-3.5 rounded-full transition-[left,background-color] ${
+            checked ? 'left-4 bg-black' : 'left-0.5 bg-white/80'
+          }`}
+        />
       </span>
     </button>
   );

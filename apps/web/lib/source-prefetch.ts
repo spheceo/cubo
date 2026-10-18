@@ -10,7 +10,7 @@ import type { MediaType, Stream } from '@cubo/core';
 import { buildMagnet, prefetchSource, type LocalEngineConnection } from './local-engine';
 import { playbackKey } from './library';
 import { supportsHevcRemux } from './media-compatibility';
-import { loadSource, preferSource } from './source-affinity';
+import { loadShowSource, loadSource, preferContinuity, preferSource } from './source-affinity';
 import { fetchStreams } from './stream-cache';
 import { isAutomaticSource, rankStreams, type AudioTarget } from './stream-select';
 import { savedAudioTarget } from './audio-choice';
@@ -30,16 +30,19 @@ export interface PrefetchTarget {
   audio?: AudioTarget;
   season?: number | null;
   episode?: number | null;
+  /** The release the show's last episode played from (episodes only). */
+  continuity?: Stream | null;
 }
 
 /** Automatic playback order for a title: eligible sources best first, the
- *  remembered one (if still eligible) at the front. The watch screen and
- *  the prefetcher share it so they agree on what plays. */
+ *  remembered one (if still eligible) at the front, else the release the
+ *  show's last episode played from. The watch screen and the prefetcher
+ *  share it so they agree on what plays. */
 export function rankForPlayback(
   found: Stream[],
   saved: Stream | null,
   connection: Pick<LocalEngineConnection, 'transcode'> | null,
-  target: Pick<PrefetchTarget, 'originalLanguage' | 'audio' | 'season' | 'episode'>,
+  target: Pick<PrefetchTarget, 'originalLanguage' | 'audio' | 'season' | 'episode' | 'continuity'>,
 ): Stream[] {
   const audio = target.audio === undefined ? target.originalLanguage : target.audio;
   const candidates = saved
@@ -60,7 +63,9 @@ export function rankForPlayback(
       ? { season: target.season, episode: target.episode }
       : null,
   ).filter((stream) => isAutomaticSource(stream, audio));
-  return preferSource(ranked, saved);
+  const preferred = preferSource(ranked, saved);
+  if (saved && preferred[0]?.infoHash === saved.infoHash) return preferred;
+  return preferContinuity(preferred, target.continuity ?? null);
 }
 
 export async function prefetchTitle(
@@ -82,7 +87,8 @@ export async function prefetchTitle(
   const audio = target.audio === undefined
     ? savedAudioTarget(target.mediaType, target.mediaId, target.originalLanguage)
     : target.audio;
-  const choice = rankForPlayback(found, loadSource(key), connection, { ...target, audio })[0];
+  const continuity = target.mediaType === 'tv' ? loadShowSource(target.mediaId) : null;
+  const choice = rankForPlayback(found, loadSource(key), connection, { ...target, audio, continuity })[0];
   if (!choice) return;
   prefetchSource(connection, {
     magnet: buildMagnet(choice),

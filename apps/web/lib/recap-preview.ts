@@ -89,6 +89,60 @@ export function withRecapPreview(segments: SkipSegments | null, found: RecapPrev
   return { ...base, sections };
 }
 
+/** Credits roll without dialogue. A line this soon after the claimed start
+ *  means the story is still going; a post-credits scene comes later. */
+const CREDITS_DIALOGUE_GAP_SECONDS = 30;
+/** Song lyrics, sound tags and the subtitler's own credit aren't dialogue. */
+const MUSIC_RE = /[♪♫]/;
+const SOUND_TAG_RE = /^[\s.…-]*[[(][^\])]*[\])][\s.…-]*$/;
+const SUBTITLE_CREDIT_RE =
+  /\b(?:subtitles?|subtitled|captions?|captioning|synced|sync|corrected|transcript|opensubtitles)\b|www\.|\.(?:com|org|net)\b/i;
+
+function isDialogue(text: string): boolean {
+  const plain = plainText(text);
+  return /[a-z]/i.test(plain)
+    && !MUSIC_RE.test(plain)
+    && !SOUND_TAG_RE.test(plain)
+    && !SUBTITLE_CREDIT_RE.test(plain);
+}
+
+/** Crowd credits are timed on someone else's copy and can start while this
+ *  one is still mid-scene, ending the episode early. Moves the credits past
+ *  dialogue that runs on from their start. Only ever later: a late prompt
+ *  costs seconds of credits, an early one skips story. */
+export function creditsAfterDialogue(
+  credits: SkipSegmentWindow,
+  cues: SubtitleCue[],
+  durationSeconds: number,
+): SkipSegmentWindow {
+  const limit = durationSeconds > 0 ? durationSeconds : Number.POSITIVE_INFINITY;
+  const dialogue = cues
+    .filter((cue) => cue.end > credits.start && cue.start < limit && isDialogue(cue.text))
+    .sort((a, b) => a.start - b.start);
+  let start = credits.start;
+  for (const cue of dialogue) {
+    if (cue.start - start > CREDITS_DIALOGUE_GAP_SECONDS) break;
+    start = Math.max(start, cue.end);
+  }
+  if (start <= credits.start) return credits;
+  return {
+    start,
+    end: credits.end != null && credits.end > start ? credits.end : null,
+    source: 'subtitles',
+  };
+}
+
+/** Skip windows with the credits moved past running dialogue. */
+export function withDialogueCredits(
+  segments: SkipSegments | null,
+  cues: SubtitleCue[],
+  durationSeconds: number,
+): SkipSegments | null {
+  if (!segments?.credits) return segments;
+  const credits = creditsAfterDialogue(segments.credits, cues, durationSeconds);
+  return credits === segments.credits ? segments : { ...segments, credits };
+}
+
 export interface EndWindow {
   window: SkipSegmentWindow;
   kind: 'credits' | 'preview';

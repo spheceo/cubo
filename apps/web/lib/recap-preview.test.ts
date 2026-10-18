@@ -1,6 +1,14 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { detectRecapPreview, endWindow, recapWindow, skipsRecapOnEntry, withRecapPreview } from './recap-preview';
+import {
+  creditsAfterDialogue,
+  detectRecapPreview,
+  endWindow,
+  recapWindow,
+  skipsRecapOnEntry,
+  withDialogueCredits,
+  withRecapPreview,
+} from './recap-preview';
 import type { SubtitleCue } from './subtitles';
 
 const cue = (start: number, end: number, text: string): SubtitleCue => ({ start, end, text });
@@ -83,4 +91,39 @@ test('arriving from Next episode skips the recap only when playback starts insid
   assert.equal(skipsRecapOnEntry(recap, 839.9), false);
   assert.equal(skipsRecapOnEntry({ end: null }, 0), false);
   assert.equal(skipsRecapOnEntry(null, 0), false);
+});
+
+// Wayward Pines S01E04 (Blu-ray): IntroDB puts the credits at 2509 but
+// the closing scene talks until 2548 and the credits roll at 2605.
+const closingScene: SubtitleCue[] = [
+  cue(2504.63, 2506.9, 'You said you would never leave.'),
+  cue(2507.17, 2510.2, 'I know.'),
+  cue(2534.03, 2537.5, 'Then why are you packing?'),
+  cue(2539.12, 2540.9, "Because they're coming."),
+  cue(2541.16, 2546.0, 'Who is?'),
+  cue(2548.3, 2550.4, 'Everyone.'),
+  cue(2610.0, 2614.0, '♪ Somewhere beyond the sea ♪'),
+  cue(2620.0, 2623.0, 'Subtitles by explosiveskull'),
+];
+
+test('credits move past dialogue that runs on from their crowd start', () => {
+  const moved = creditsAfterDialogue({ start: 2509, end: 2602.31, source: 'introdb' }, closingScene, 2642.45);
+  assert.deepEqual(moved, { start: 2550.4, end: 2602.31, source: 'subtitles' });
+});
+
+test('credits already past the dialogue stay put', () => {
+  const credits = { start: 2605.35, end: null, source: 'chapters' };
+  assert.equal(creditsAfterDialogue(credits, closingScene, 2642.45), credits);
+});
+
+test('a post-credits scene after a quiet roll does not move the credits', () => {
+  const credits = { start: 2560, end: null, source: 'introdb' };
+  const stinger = [...closingScene, cue(2630, 2633, 'Wait, there is one more thing.')];
+  assert.equal(creditsAfterDialogue(credits, stinger, 2642.45), credits);
+});
+
+test('the guard leaves windows without credits alone', () => {
+  const segments = { intro: null, credits: null, sections: [] };
+  assert.equal(withDialogueCredits(segments, closingScene, 2642.45), segments);
+  assert.equal(withDialogueCredits(null, closingScene, 2642.45), null);
 });

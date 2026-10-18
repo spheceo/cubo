@@ -26,6 +26,7 @@ import {
   type FramingMode,
 } from '@/lib/framing-prefs';
 import { cancelAutoplayUnmute, playInBackground } from '@/lib/background-playback';
+import { loadAutoPlayNextPref, saveAutoPlayNextPref } from '@/lib/auto-next-prefs';
 import { loadAutoSkipIntroPref, saveAutoSkipIntroPref } from '@/lib/intro-skip-prefs';
 import {
   loadSectionPrefs,
@@ -313,6 +314,11 @@ export function VideoPlayer({
   const toggleAutoSkipIntro = useCallback((enabled: boolean) => {
     setAutoSkipIntro(enabled);
     saveAutoSkipIntroPref(enabled);
+  }, []);
+  const [autoPlayNext, setAutoPlayNext] = useState(() => loadAutoPlayNextPref());
+  const toggleAutoPlayNext = useCallback((enabled: boolean) => {
+    setAutoPlayNext(enabled);
+    saveAutoPlayNextPref(enabled);
   }, []);
 
   const goBack = useCallback(() => {
@@ -934,6 +940,8 @@ export function VideoPlayer({
   // Next episode countdown — the fill sweep doubles as the timer. Driven by
   // rAF writing a scaleX transform straight onto the node: compositor-smooth
   // and zero re-renders. Pausing freezes it; completing it auto-advances.
+  // With auto-play next off there is no countdown, only the button.
+  const nextCountdown = onNextEpisode != null && autoPlayNext;
   const nextFillRef = useRef<HTMLSpanElement | null>(null);
   const nextFillPos = useRef(0);
   const nextFired = useRef(false);
@@ -944,7 +952,7 @@ export function VideoPlayer({
     if (nextFillRef.current) nextFillRef.current.style.transform = 'scaleX(0)';
   }, [creditsTakeover]);
   useEffect(() => {
-    if (!creditsTakeover || !onNextEpisode || !playing) return;
+    if (!creditsTakeover || !onNextEpisode || !autoPlayNext || !playing) return;
     // Nobody has touched the page for hours: stop at the credits rather
     // than play the next episode to an empty room. Play resumes the
     // countdown (pressing it is activity).
@@ -971,7 +979,7 @@ export function VideoPlayer({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [creditsTakeover, onNextEpisode, playing, markUserPaused, stopPlayLoop]);
+  }, [creditsTakeover, onNextEpisode, autoPlayNext, playing, markUserPaused, stopPlayLoop]);
 
   const revealControls = useCallback(() => {
     setCursorVisible(true);
@@ -1563,10 +1571,10 @@ export function VideoPlayer({
               else goBack();
             }}
             className={`relative isolate flex cursor-pointer items-center gap-2 overflow-hidden rounded-full px-4 py-2 text-[0.8rem] font-medium text-black transition-colors ${
-              onNextEpisode ? 'bg-white/70' : 'bg-white hover:bg-white/85'
+              nextCountdown ? 'bg-white/70' : 'bg-white hover:bg-white/85'
             }`}
           >
-            {onNextEpisode ? (
+            {nextCountdown ? (
               <span
                 aria-hidden
                 ref={nextFillRef}
@@ -1855,6 +1863,8 @@ export function VideoPlayer({
                     onPickFraming={pickFraming}
                     autoSkipIntro={autoSkipIntro}
                     onToggleAutoSkipIntro={toggleAutoSkipIntro}
+                    autoPlayNext={autoPlayNext}
+                    onToggleAutoPlayNext={toggleAutoPlayNext}
                     sectionsVisible={showSections}
                     onToggleSections={toggleSections}
                     sectionColors={sectionColors}

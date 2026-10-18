@@ -87,10 +87,10 @@ import {
 } from '@/lib/audio-choice';
 import { ProgressWriter } from '@/lib/progress-writer';
 import { needsReencode, rememberReencode } from '@/lib/decode-fallback';
-import { detectRecapPreview, endWindow, recapWindow, withRecapPreview, type RecapPreview } from '@/lib/recap-preview';
-import { forgetSource, loadSource, rememberSource } from '@/lib/source-affinity';
+import { detectRecapPreview, endWindow, recapWindow, withDialogueCredits, withRecapPreview } from '@/lib/recap-preview';
+import { forgetSource, loadShowSource, loadSource, rememberShowSource, rememberSource } from '@/lib/source-affinity';
 import { recentStalls, stalledTooLong, stalledWithin, type Stall } from '@/lib/starvation';
-import { loadSubtitleCues } from '@/lib/subtitles';
+import { loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { useDrawerDialog } from '@/lib/use-drawer-dialog';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
 import { fetchStreams } from '@/lib/stream-cache';
@@ -241,7 +241,8 @@ export function WatchScreen({
    *  fallback switch clears the previous file's timings. */
   const [skipSegments, setSkipSegments] = useState<SkipSegments | null>(null);
   /** "Previously on…" / "Coming soon on…" found in the English subtitles. */
-  const [subtitleRecap, setSubtitleRecap] = useState<RecapPreview | null>(null);
+  /** The English subtitles' cues, for recap/preview detection and credits. */
+  const [englishCues, setEnglishCues] = useState<SubtitleCue[] | null>(null);
   const [resumeAt, setResumeAt] = useState(0);
   /** What Core has on disk for the current session, for the download bar. */
   const [downloadedRanges, setDownloadedRanges] = useState<BufferedRange[] | null>(null);
@@ -960,8 +961,9 @@ export function WatchScreen({
       audioTargetRef.current = audio;
       setAudioChoice(choice);
       const savedSource = loadSource(itemKey);
+      const continuity = mediaType === 'tv' ? loadShowSource(mediaId) : null;
       const rank = (found: Stream[], saved: Stream | null) =>
-        rankForPlayback(found, saved, connection, { originalLanguage, audio, season, episode });
+        rankForPlayback(found, saved, connection, { originalLanguage, audio, season, episode, continuity });
       sourceRefreshRef.current = foundPromise.then((found) => rank(found, savedSource));
       try {
         // Only a remembered source in the top tier starts before Torrentio
@@ -1192,26 +1194,32 @@ export function WatchScreen({
 
   // Episodes narrate their recap and teaser ("Previously on…", "Coming
   // soon on…"); the English subtitles say where both start even when no
-  // crowd database has timings for the show.
+  // crowd database has timings for the show. They also say when the story
+  // is still going where a crowd database puts the credits.
   const introSegment = skipSegments?.intro ?? null;
   useEffect(() => {
-    setSubtitleRecap(null);
-    if (mediaType !== 'tv' || !videoDurationHint) return;
+    setEnglishCues(null);
     const track = subtitleTracks.find((entry) => /^en(g|-|$)/i.test(entry.language));
     if (!track) return;
     let cancelled = false;
-    const duration = videoDurationHint;
     void loadSubtitleCues(track.src).then((cues) => {
-      if (!cancelled) setSubtitleRecap(detectRecapPreview(cues, duration, introSegment));
+      if (!cancelled) setEnglishCues(cues);
     });
     return () => {
       cancelled = true;
     };
-  }, [mediaType, subtitleTracks, videoDurationHint, introSegment]);
-  const playerSkips = useMemo(
-    () => (subtitleRecap ? withRecapPreview(skipSegments, subtitleRecap) : skipSegments),
-    [skipSegments, subtitleRecap],
+  }, [subtitleTracks]);
+  const subtitleRecap = useMemo(
+    () =>
+      englishCues && mediaType === 'tv' && videoDurationHint
+        ? detectRecapPreview(englishCues, videoDurationHint, introSegment)
+        : null,
+    [englishCues, mediaType, videoDurationHint, introSegment],
   );
+  const playerSkips = useMemo(() => {
+    const merged = subtitleRecap ? withRecapPreview(skipSegments, subtitleRecap) : skipSegments;
+    return englishCues ? withDialogueCredits(merged, englishCues, videoDurationHint ?? 0) : merged;
+  }, [skipSegments, subtitleRecap, englishCues, videoDurationHint]);
   const playerRecap = useMemo(() => recapWindow(playerSkips), [playerSkips]);
   const hasNextEpisode = nextEpisode != null;
   const playerEnd = useMemo(() => endWindow(playerSkips, hasNextEpisode), [playerSkips, hasNextEpisode]);
@@ -1697,6 +1705,7 @@ export function WatchScreen({
           onPlaying={() => {
             if (activeSourceRef.current && rememberableRef.current) {
               rememberSource(itemKey, activeSourceRef.current);
+              if (mediaType === 'tv') rememberShowSource(mediaId, activeSourceRef.current);
             }
             reportFirstFrame();
           }}

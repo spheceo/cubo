@@ -8,7 +8,9 @@ without a strong reason and maintainer approval.
 ## Invariants
 
 1. **Direct-play first.** MP4/WebM rank above remux-needing sources within a
-   quality tier (`apps/web/lib/stream-select.ts`). Core decides the mode after
+   quality tier (`apps/web/lib/stream-select.ts`), except that a near-dead
+   swarm ranks below every usable one (see
+   [sources-and-audio.md](sources-and-audio.md)). Core decides the mode after
    probing the chosen file.
 2. **Remux through hls.js.** Core serves a complete VOD HLS playlist in
    absolute movie time. `video-player.tsx` uses hls.js, including on Safari;

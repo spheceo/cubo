@@ -39,7 +39,9 @@ use crate::session::{
 };
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
 use crate::system;
-use crate::transcode::{chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager};
+use crate::transcode::{
+    align_credits_to_chapters, chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager,
+};
 use crate::update::UpdateManager;
 
 /// The installed Core (release builds, `cubo persist`) always owns 8765.
@@ -2022,7 +2024,24 @@ async fn skip_segments(
         }
     }
 
-    let remote = fill_remote_skip_segments(&state.client, &query).await;
+    let mut remote = fill_remote_skip_segments(&state.client, &query).await;
+    if let (Some(probe), Some(total)) = (&probe, duration) {
+        for section in remote.iter_mut().filter(|section| section.kind == "credits") {
+            if let Some(aligned) =
+                align_credits_to_chapters(section.segment, &probe.chapters, total)
+            {
+                tracing::info!(
+                    target: "skip-segments",
+                    source = section.source,
+                    crowd_start = section.segment.start,
+                    aligned_start = aligned.start,
+                    "crowd credits moved to the file's credits chapter"
+                );
+                section.segment = aligned;
+                section.source = "chapters";
+            }
+        }
+    }
     if intro.is_none() {
         if let Some(found) = remote.iter().find(|s| s.kind == "intro") {
             intro = Some((found.segment, found.source));
