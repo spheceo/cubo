@@ -2024,7 +2024,7 @@ async fn skip_segments(
         }
     }
 
-    let mut remote = fill_remote_skip_segments(&state.client, &query).await;
+    let mut remote = fill_remote_skip_segments(&state.client, &query, duration).await;
     if let (Some(probe), Some(total)) = (&probe, duration) {
         for section in remote.iter_mut().filter(|section| section.kind == "credits") {
             if let Some(aligned) =
@@ -2164,16 +2164,12 @@ struct RemoteSection {
 async fn fill_remote_skip_segments(
     client: &reqwest::Client,
     query: &SkipSegmentsQuery,
+    duration_seconds: Option<f64>,
 ) -> Vec<RemoteSection> {
     let mut sections: Vec<RemoteSection> = Vec::new();
 
     if let Some(tmdb_id) = query.tmdb {
-        let mut url = format!("https://api.theintrodb.org/v3/media?tmdb_id={tmdb_id}");
-        if query.media_type == "tv" {
-            if let (Some(season), Some(episode)) = (query.season, query.episode) {
-                url.push_str(&format!("&season={season}&episode={episode}"));
-            }
-        }
+        let url = theintrodb_media_url(tmdb_id, query, duration_seconds);
         if let Ok(response) = client
             .get(&url)
             .timeout(Duration::from_secs(8))
@@ -2190,16 +2186,7 @@ async fn fill_remote_skip_segments(
                     let Some(list) = body.get(key).and_then(|value| value.as_array()) else {
                         continue;
                     };
-                    let found = list.iter().find_map(|entry| {
-                        let start = entry.get("start_ms")?.as_f64()? / 1000.0;
-                        // A null end means "runs to the end of the media".
-                        let end = entry
-                            .get("end_ms")
-                            .and_then(|value| value.as_f64())
-                            .map(|ms| ms / 1000.0)
-                            .unwrap_or(f64::MAX);
-                        (start >= 0.0 && end > start).then_some(SkipSegment { start, end })
-                    });
+                    let found = list.iter().find_map(theintrodb_segment);
                     if let Some(segment) = found {
                         sections.push(RemoteSection {
                             segment,
@@ -2262,6 +2249,44 @@ async fn fill_remote_skip_segments(
     }
 
     sections
+}
+
+/// TheIntroDB v4 `GET /media`. TVDB is its identity, but it resolves a TMDB
+/// id server-side, TMDB's own season/episode numbering included, so no
+/// `mapping` is needed. The file's duration picks the release version
+/// (theatrical, extended…) closest to this copy; with none within five
+/// minutes the API falls back to the most-submitted one.
+fn theintrodb_media_url(
+    tmdb_id: u64,
+    query: &SkipSegmentsQuery,
+    duration_seconds: Option<f64>,
+) -> String {
+    let mut url = format!("https://api.theintrodb.org/v4/media?tmdb_id={tmdb_id}");
+    if query.media_type == "tv" {
+        if let (Some(season), Some(episode)) = (query.season, query.episode) {
+            url.push_str(&format!("&season={season}&episode={episode}"));
+        }
+    }
+    let duration = duration_seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+    if let Some(seconds) = duration {
+        url.push_str(&format!("&duration_ms={}", (seconds * 1000.0).round() as u64));
+    }
+    url
+}
+
+/// One TheIntroDB timestamp. A null start means "from the very beginning"
+/// (a cold-open-free intro), a null end "runs to the end of the media".
+fn theintrodb_segment(entry: &serde_json::Value) -> Option<SkipSegment> {
+    let start = match entry.get("start_ms")? {
+        serde_json::Value::Null => 0.0,
+        value => value.as_f64()? / 1000.0,
+    };
+    let end = entry
+        .get("end_ms")
+        .and_then(|value| value.as_f64())
+        .map(|ms| ms / 1000.0)
+        .unwrap_or(f64::MAX);
+    (start >= 0.0 && end > start).then_some(SkipSegment { start, end })
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2838,6 +2863,52 @@ fn is_hop_by_hop(header: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::header::ORIGIN;
+
+    fn skip_query(
+        media_type: &str,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> SkipSegmentsQuery {
+        SkipSegmentsQuery {
+            torrent: "abc".into(),
+            file: 0,
+            media_type: media_type.into(),
+            tmdb: Some(1399),
+            imdb: None,
+            season,
+            episode,
+        }
+    }
+
+    #[test]
+    fn theintrodb_lookup_uses_v4_with_this_files_duration() {
+        let episode = skip_query("tv", Some(1), Some(6));
+        assert_eq!(
+            theintrodb_media_url(1399, &episode, Some(2642.451)),
+            "https://api.theintrodb.org/v4/media?tmdb_id=1399&season=1&episode=6&duration_ms=2642451"
+        );
+        assert_eq!(
+            theintrodb_media_url(1399, &episode, None),
+            "https://api.theintrodb.org/v4/media?tmdb_id=1399&season=1&episode=6"
+        );
+        // A movie sends no season/episode, which v4 would read as TV.
+        let movie = skip_query("movie", Some(1), Some(6));
+        assert_eq!(
+            theintrodb_media_url(27205, &movie, Some(0.0)),
+            "https://api.theintrodb.org/v4/media?tmdb_id=27205"
+        );
+    }
+
+    #[test]
+    fn theintrodb_null_start_is_the_beginning() {
+        let intro = serde_json::json!({ "start_ms": null, "end_ms": 38000 });
+        let segment = theintrodb_segment(&intro).unwrap();
+        assert_eq!((segment.start, segment.end), (0.0, 38.0));
+        let credits = serde_json::json!({ "start_ms": 3630687, "end_ms": null });
+        let segment = theintrodb_segment(&credits).unwrap();
+        assert_eq!((segment.start, segment.end), (3630.687, f64::MAX));
+        assert!(theintrodb_segment(&serde_json::json!({ "end_ms": 1000 })).is_none());
+    }
 
     #[test]
     fn only_use_claimed_cache_directories() {

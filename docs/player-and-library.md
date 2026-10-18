@@ -40,6 +40,11 @@
   English dialogue that runs on from their start (a line within 30 s,
   ignoring lyrics, sound tags and the subtitler's credit;
   `creditsAfterDialogue`). Both only ever move credits later.
+- TheIntroDB is read through its v4 API (v2/v3 are frozen and being
+  removed), addressed by TMDB id with TMDB's own season/episode numbers,
+  which v4 resolves server-side, so no `mapping`. Core sends the file's
+  probed duration (`duration_ms`) so the release version nearest this cut
+  answers. A null `start_ms` means the segment starts at 0.
 - Recaps and previews come from Core's sections when it has them, otherwise
   from the English subtitles' narrator lead-ins ("Previously on…", "Coming
   soon on…", `recap-preview.ts`). Skip recap shares the intro skipper.
