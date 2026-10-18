@@ -2158,6 +2158,16 @@ struct RemoteSection {
     source: &'static str,
 }
 
+fn theintrodb_media_url(tmdb_id: u64, query: &SkipSegmentsQuery) -> String {
+    let mut url = format!("https://api.theintrodb.org/v4/media?tmdb_id={tmdb_id}");
+    if query.media_type == "tv" {
+        if let (Some(season), Some(episode)) = (query.season, query.episode) {
+            url.push_str(&format!("&season={season}&episode={episode}"));
+        }
+    }
+    url
+}
+
 /// Crowd-sourced sections: TheIntroDB (TMDB-keyed, movies + episodes) first,
 /// IntroDB (IMDb-keyed, confidence-voted) second. Each kind keeps the first
 /// answer — TheIntroDB is the better-keyed, broader dataset.
@@ -2168,12 +2178,7 @@ async fn fill_remote_skip_segments(
     let mut sections: Vec<RemoteSection> = Vec::new();
 
     if let Some(tmdb_id) = query.tmdb {
-        let mut url = format!("https://api.theintrodb.org/v3/media?tmdb_id={tmdb_id}");
-        if query.media_type == "tv" {
-            if let (Some(season), Some(episode)) = (query.season, query.episode) {
-                url.push_str(&format!("&season={season}&episode={episode}"));
-            }
-        }
+        let url = theintrodb_media_url(tmdb_id, query);
         if let Ok(response) = client
             .get(&url)
             .timeout(Duration::from_secs(8))
@@ -2838,6 +2843,39 @@ fn is_hop_by_hop(header: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::header::ORIGIN;
+
+    #[test]
+    fn theintrodb_v4_media_url_preserves_tmdb_lookup() {
+        let mut query = SkipSegmentsQuery {
+            torrent: String::new(),
+            file: 0,
+            media_type: "movie".to_owned(),
+            tmdb: Some(12345),
+            imdb: None,
+            season: Some(1),
+            episode: Some(2),
+        };
+        assert_eq!(
+            theintrodb_media_url(12345, &query),
+            "https://api.theintrodb.org/v4/media?tmdb_id=12345"
+        );
+        query.media_type = "tv".to_owned();
+        assert_eq!(
+            theintrodb_media_url(12345, &query),
+            "https://api.theintrodb.org/v4/media?tmdb_id=12345&season=1&episode=2"
+        );
+        query.season = Some(0);
+        query.episode = Some(0);
+        assert_eq!(
+            theintrodb_media_url(12345, &query),
+            "https://api.theintrodb.org/v4/media?tmdb_id=12345&season=0&episode=0"
+        );
+        query.episode = None;
+        assert_eq!(
+            theintrodb_media_url(12345, &query),
+            "https://api.theintrodb.org/v4/media?tmdb_id=12345"
+        );
+    }
 
     #[test]
     fn only_use_claimed_cache_directories() {
