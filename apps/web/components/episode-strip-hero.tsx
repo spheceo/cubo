@@ -38,6 +38,9 @@ const PICKED_HEADROOM = 16;
  *  thumbnails use w780, which stays sharp on a 2x screen once the picked
  *  one is scaled up. */
 const HERO_STILL = 'w1280';
+/** Room a raised card must leave beside the hero's buttons for the text
+ *  to stay down. */
+const BUTTON_CLEARANCE = 64;
 /** The hero text column, and its gap above the thumbnails. */
 const TEXT_WIDTH = 600;
 const TEXT_GAP = 28;
@@ -461,7 +464,9 @@ function Strip({
   const band = height * (PICKED_SCALE - 1) + PICKED_LIFT + PICKED_HEADROOM;
   const cardLeft = gutter - scroll + activeIndex * stride;
   const cardRight = cardLeft + width + grow;
-  const covered = measured && cardLeft < clearRight + 4 && cardRight > gutter;
+  // Lifted when the card would be under the buttons or crowd them; a card
+  // well clear of them leaves the text where it is.
+  const covered = measured && cardLeft < clearRight + BUTTON_CLEARANCE && cardRight > gutter;
   const lift = covered ? Math.round(height * (PICKED_SCALE - 1) + PICKED_LIFT + 12) : 0;
   useLayoutEffect(() => {
     onLift(lift);
