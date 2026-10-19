@@ -91,6 +91,14 @@
   `apps/web/components` instead of `window.confirm` / `<select>`.
 - No new color tokens without approval; reuse the theme in
   `packages/ui/src/theme.css`.
+- New screens speak the existing type and component language rather
+  than inventing their own: heroes use `HeroTitle` (bold, colon split),
+  the "Kind • detail • detail" line (`text-xl font-semibold` kind),
+  white synopsis, `WatchPlayLink` and the `bg-control` circle buttons
+  (or reuse `FeaturedHero` outright, with its `kind`); rows use
+  `SectionRow`/`MediaRow` headings (`text-3xl font-bold`). No mono
+  eyebrows, light-weight display type, tight negative tracking or
+  bespoke pill buttons.
 - Side drawers (`.drawer-dialog`, `useDrawerDialog`) clip with
   `overflow: clip`, never `overflow-hidden`: `showModal` focuses the first
   control and a hidden-overflow dialog scrolls the off-screen panel into
@@ -137,7 +145,9 @@
   (`CrossfadeImage` keeps the old picture until the new one covers it),
   slowly (about 0.9 s): keep new motion off layout properties. Keep the
   hero sparse: episode number and name under each thumbnail, nothing
-  more, and no counters or extra meta beside the play button.
+  more, and no counters. Its text is FeaturedHero's: the show's title,
+  then "Episode name • S1 E10 • 21m left", the synopsis, and
+  "Continue S1 E10" / "Watch S1 E8".
 - Pages fade in when the path changes (`.route-enter`, opacity only:
   a transform would trap fixed overlays inside the page).
 - "Your services" are the services the viewer picked, in their order,

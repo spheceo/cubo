@@ -8,13 +8,21 @@ import {
 } from '@cubo/core';
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { IoChevronBack, IoChevronForward, IoPlay } from 'react-icons/io5';
+import { IoChevronBack, IoChevronForward } from 'react-icons/io5';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
 import { Link } from '@/components/link';
 import { isUpcomingAirDate } from '@/lib/air-date';
-import { completedNearEnd, historyForEpisode, type ContinueWatchingEntry } from '@/lib/library';
+import { formatRuntime } from '@/lib/format';
+import {
+  completedNearEnd,
+  episodeLabel,
+  historyForEpisode,
+  type ContinueWatchingEntry,
+} from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
 import { CrossfadeImage } from './crossfade-image';
+import { HeroTitle } from './featured-hero';
+import { WatchPlayLink } from './watch-play-link';
 import { useCore } from './core-provider';
 
 /** Thumbnail width at rest; the picked one grows by `PICKED_SCALE`. */
@@ -69,25 +77,31 @@ export function EpisodeStripHero({
   return (
     <section
       aria-label={`Continue watching ${show.title}`}
-      className="relative flex h-[max(720px,92dvh)] flex-col overflow-hidden"
+      className="relative flex min-h-[max(720px,92dvh)] flex-col overflow-hidden"
     >
       <CrossfadeImage src={image} />
       <div className="pointer-events-none absolute inset-0 bg-linear-to-r from-background via-background/70 via-35% to-transparent to-70%" />
       <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-background/85 via-30% to-transparent to-60%" />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-40 bg-linear-to-b from-background/80 to-transparent" />
 
-      <div className="relative z-10 flex flex-1 flex-col justify-end px-6 sm:px-10">
-        <p className="font-mono text-xs uppercase tracking-[0.14em] text-white/70">
-          {entry.newEpisode ? 'New episode' : 'Continue watching'}
-        </p>
-        <h1 className="mt-3 max-w-[14ch] text-5xl font-medium leading-none tracking-[-0.04em] sm:text-6xl lg:text-7xl">
-          {show.title}
-        </h1>
-        {active ? (
-          <EpisodeDetails key={active.episodeNumber} show={show} episode={active} />
-        ) : (
-          <div className="h-36" />
-        )}
+      {/* Top padding clears the site header: a long title grows the hero
+          rather than sliding under the nav. */}
+      <div className="relative z-10 flex flex-1 flex-col justify-end px-6 pt-24 sm:px-10">
+        <div className="max-w-4xl">
+          <HeroTitle title={show.title} />
+        </div>
+        <div className="mt-5 w-[600px] max-w-full space-y-5">
+          {active ? (
+            <EpisodeDetails
+              key={active.episodeNumber}
+              show={show}
+              episode={active}
+              newEpisode={entry.newEpisode && active.episodeNumber === entry.episode}
+            />
+          ) : (
+            <div className="h-40" />
+          )}
+        </div>
       </div>
 
       {list.length > 0 ? (
@@ -105,7 +119,17 @@ export function EpisodeStripHero({
   );
 }
 
-function EpisodeDetails({ show, episode }: { show: MediaDetails; episode: Episode }) {
+/** The picked episode, in FeaturedHero's language: name as the kind, then
+ *  episode and time, the synopsis, and the same play and info buttons. */
+function EpisodeDetails({
+  show,
+  episode,
+  newEpisode,
+}: {
+  show: MediaDetails;
+  episode: Episode;
+  newEpisode: boolean;
+}) {
   const { library } = useCore();
   const row = historyForEpisode(
     library?.history,
@@ -115,40 +139,38 @@ function EpisodeDetails({ show, episode }: { show: MediaDetails; episode: Episod
   );
   const finished = row ? completedNearEnd(row) : false;
   const started = row != null && !finished && row.positionSeconds >= 5;
-  // The episode line above already names it; the button only says what
-  // pressing it does, and its bar shows how far in.
-  const label = started ? 'Resume' : finished ? 'Watch again' : 'Play';
+  const code = episodeLabel(episode.seasonNumber, episode.episodeNumber) ?? '';
+  const minutesLeft = started
+    ? Math.max(1, Math.round((row.durationSeconds - row.positionSeconds) / 60))
+    : null;
+  const details = [
+    code,
+    newEpisode ? 'New episode' : null,
+    minutesLeft != null ? `${minutesLeft}m left` : formatRuntime(episode.runtime),
+  ].filter(Boolean) as string[];
 
   return (
-    <div className="hero-swap">
-      <p className="mt-4 text-lg tracking-[-0.01em]">
-        <span className="text-faint">
-          S{episode.seasonNumber} · E{episode.episodeNumber}
-        </span>
-        <span className="ml-3">{episode.name}</span>
-      </p>
-      <p className="mt-1.5 line-clamp-2 h-12 max-w-lg text-[15px] leading-6 text-white/55">
-        {episode.overview}
-      </p>
-      <div className="mt-5 flex items-center gap-3">
-        <Link
+    <div className="hero-swap space-y-5">
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-xl font-semibold">{episode.name}</h2>
+        {details.map((detail) => (
+          <div key={detail} className="flex items-center gap-2">
+            <p>•</p>
+            <p>{detail}</p>
+          </div>
+        ))}
+      </div>
+      <p className="line-clamp-3 min-h-[4.5rem]">{episode.overview}</p>
+      <div className="flex flex-wrap items-center gap-4">
+        <WatchPlayLink
           href={watchHref(show, episode.seasonNumber, episode.episodeNumber)}
-          className="relative flex h-12 cursor-pointer items-center gap-2.5 overflow-hidden rounded-full bg-white px-6 font-semibold text-black transition-colors hover:bg-white/85"
-        >
-          <IoPlay size={20} />
-          {label}
-          {started ? (
-            <span
-              aria-hidden
-              className="absolute bottom-0 left-0 h-1 bg-star"
-              style={{ width: `${Math.round(row.progress * 100)}%` }}
-            />
-          ) : null}
-        </Link>
+          label={started ? `Continue ${code}` : `Watch ${code}`}
+          progress={started ? row.progress : 0}
+        />
         <Link
           href={titleHref(show)}
           aria-label={`More information about ${show.title}`}
-          className="flex h-12 w-12 cursor-pointer items-center justify-center rounded-full bg-white/10 backdrop-blur-sm transition-colors hover:bg-white/20"
+          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control"
         >
           <IoMdInformationCircleOutline size={25} />
         </Link>
@@ -221,7 +243,7 @@ function Strip({
           aria-label="Previous episode"
           disabled={activeIndex === 0}
           onClick={() => onStep(-1)}
-          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-white/10 backdrop-blur-sm transition-colors hover:bg-white/20 disabled:cursor-default disabled:opacity-40"
+          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-40"
         >
           <IoChevronBack size={20} />
         </button>
@@ -230,7 +252,7 @@ function Strip({
           aria-label="Next episode"
           disabled={activeIndex === episodes.length - 1}
           onClick={() => onStep(1)}
-          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-white/10 backdrop-blur-sm transition-colors hover:bg-white/20 disabled:cursor-default disabled:opacity-40"
+          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-40"
         >
           <IoChevronForward size={20} />
         </button>

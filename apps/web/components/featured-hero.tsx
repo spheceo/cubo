@@ -13,7 +13,7 @@ import { WatchLaterButton } from './watch-later-button';
 import { WatchPlayLink } from './watch-play-link';
 
 /** Kino splits titles on a colon so the subtitle carries the display weight. */
-function HeroTitle({ title }: { title: string }) {
+export function HeroTitle({ title }: { title: string }) {
   const [main, ...rest] = title.split(':');
 
   if (rest.length === 0) {
@@ -28,7 +28,7 @@ function HeroTitle({ title }: { title: string }) {
   );
 }
 
-export function FeaturedHero({ item }: { item: MediaDetails }) {
+export function FeaturedHero({ item, kind: kindOverride }: { item: MediaDetails; kind?: string }) {
   const artworkRef = useRef<HTMLImageElement>(null);
   const titleRef = useRef<HTMLDivElement>(null);
   const detailsRef = useRef<HTMLDivElement>(null);
@@ -39,9 +39,8 @@ export function FeaturedHero({ item }: { item: MediaDetails }) {
   const year = item.releaseDate.slice(0, 4);
   const nextAirs = item.nextEpisode ? formatNextEpisodeLabel(item.nextEpisode) : null;
   const kind =
-    item.mediaType === 'tv'
-      ? (nextAirs ?? 'Featured Show')
-      : 'Featured Movie';
+    kindOverride ??
+    (item.mediaType === 'tv' ? (nextAirs ?? 'Featured Show') : 'Featured Movie');
   const { library } = useCore();
   const resume = latestHistoryForTitle(library?.history, item.mediaType, item.id);
   const firstSeason = item.mediaType === 'tv' ? (item.seasons[0]?.seasonNumber ?? 1) : undefined;

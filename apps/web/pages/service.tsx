@@ -4,7 +4,6 @@ import {
   logoUrl,
   posterUrl,
   titleHref,
-  watchHref,
   type DiscoverQuery,
   type MediaSummary,
   type MediaType,
@@ -12,18 +11,16 @@ import {
 } from '@cubo/core';
 import { useQueries, useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { IoArrowBack, IoPlay } from 'react-icons/io5';
-import { IoMdInformationCircleOutline } from 'react-icons/io';
-import { MediaCard, ScrollRow } from '@cubo/ui';
+import { IoArrowBack } from 'react-icons/io5';
+import { ScrollRow } from '@cubo/ui';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { CatalogError } from '@/components/catalog-error';
 import { Dropdown } from '@/components/dropdown';
-import { useCore } from '@/components/core-provider';
 import { Link } from '@/components/link';
-import { HeroSkeleton } from '@/components/page-skeletons';
-import { WatchLaterButton } from '@/components/watch-later-button';
+import { FeaturedHero } from '@/components/featured-hero';
+import { MediaRow } from '@/components/media-row';
+import { HeroSkeleton, MediaRowSkeleton } from '@/components/page-skeletons';
 import { parseCalendarDate } from '@/lib/air-date';
-import { latestHistoryForTitle, playButtonLabel, watchLaterItem } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
 import {
   catalogRegions,
@@ -45,8 +42,6 @@ const GROUP_GENRES: Record<MediaType, number[]> = {
   movie: [28, 35],
 };
 
-/** Poster width, matching Home's rows. */
-const POSTER_WIDTH = 'w-[38vw] shrink-0 sm:w-[24vw] md:w-[14vw] xl:w-[11vw]';
 
 function isoDate(time: number): string {
   const date = new Date(time);
@@ -164,6 +159,10 @@ export function ServicePage() {
       .flatMap((pool) => pool.items)
       .find((item) => item.backdropPath) ?? null;
   const heroLoading = !hero && [newShows, newMovies, shows, movies].some((pool) => pool.loading);
+  const heroDetails = useQuery({
+    ...tmdbQueries.details(hero?.mediaType ?? 'tv', hero?.id ?? 0),
+    enabled: hero != null,
+  });
 
   const update = (patch: Record<string, string | null>) => {
     const next = new URLSearchParams(params);
@@ -205,14 +204,14 @@ export function ServicePage() {
 
   return (
     <main className="min-h-dvh bg-background pb-16 text-white">
-      <div className="relative h-[72dvh] min-h-[560px] overflow-hidden">
-        {heroLoading || !provider ? (
+      <div className="relative">
+        {heroDetails.data && provider ? (
+          <FeaturedHero item={heroDetails.data} kind={`New on ${provider.name}`} />
+        ) : heroLoading || heroDetails.isLoading || !provider ? (
           <HeroSkeleton />
-        ) : hero ? (
-          <ServiceHero item={hero} providerName={provider.name} />
         ) : null}
 
-        <div className="absolute inset-x-0 top-24 z-20 flex flex-wrap items-center gap-4 px-6 sm:px-10">
+        <div className="absolute inset-x-0 top-20 z-20 flex flex-wrap items-center gap-4 px-6 sm:px-10">
           <button
             type="button"
             onClick={back}
@@ -232,7 +231,7 @@ export function ServicePage() {
         </div>
       </div>
 
-      <div className="relative z-10 -mt-6 space-y-12 px-6 sm:px-10">
+      <div className="relative space-y-10 px-6 pt-4 sm:px-10">
         <div className="flex flex-wrap items-center gap-2.5">
           <div className="flex rounded-full bg-control p-1" role="tablist" aria-label="Media type">
             {(['tv', 'movie'] as const).map((type) => (
@@ -261,11 +260,11 @@ export function ServicePage() {
           />
         </div>
 
-        <section>
-          <h2 className="text-2xl font-semibold">
+        <section className="space-y-5">
+          <h2 className="text-3xl font-bold">
             Top 10 on {provider?.name}
             {rankRegion ? (
-              <span className="ml-3 text-base font-normal text-faint">{regionName(rankRegion)}</span>
+              <span className="ml-3 text-base font-semibold text-faint">{regionName(rankRegion)}</span>
             ) : null}
           </h2>
           {top.data?.results.length ? (
@@ -275,10 +274,10 @@ export function ServicePage() {
           )}
         </section>
 
-        <section>
-          <h2 className="text-2xl font-semibold">New on {provider?.name}</h2>
+        <section className="space-y-5">
+          <h2 className="text-3xl font-bold">New on {provider?.name}</h2>
           {fresh.items.length ? (
-            <div className="mt-2">
+            <div>
               <ScrollRow className="gap-4 pt-2 pb-2" label={`New on ${provider?.name}`}>
                 {fresh.items.slice(0, 12).map((item) => (
                   <NewCard key={item.id} item={item} date={shortDate(item.releaseDate)} />
@@ -365,69 +364,10 @@ function ServiceSwitcher({
   );
 }
 
-function ServiceHero({ item, providerName }: { item: MediaSummary; providerName: string }) {
-  const { library } = useCore();
-  const details = useQuery(tmdbQueries.details(item.mediaType, item.id));
-  const resume = latestHistoryForTitle(library?.history, item.mediaType, item.id);
-  const playHref =
-    item.mediaType === 'tv'
-      ? watchHref(item, resume?.season ?? 1, resume?.episode ?? 1)
-      : watchHref(item);
-  const year = item.releaseDate.slice(0, 4);
-
-  return (
-    <>
-      <img
-        src={backdropUrl(item.backdropPath, 'w1280')}
-        alt=""
-        fetchPriority="high"
-        className="absolute inset-y-0 right-0 h-full w-full object-cover lg:w-[76%]"
-      />
-      <div className="pointer-events-none absolute inset-0 bg-linear-to-r from-background via-background/70 via-35% to-transparent to-70%" />
-      <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-background/60 via-20% to-transparent to-50%" />
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-linear-to-b from-background/80 to-transparent" />
-
-      <div className="absolute inset-x-0 bottom-16 z-10 px-6 sm:px-10">
-        <div className="max-w-xl">
-          <p className="font-mono text-xs uppercase tracking-[0.14em] text-white/70">
-            New on {providerName}
-          </p>
-          <h2 className="mt-3 text-5xl font-medium leading-none tracking-[-0.04em] sm:text-6xl">
-            {item.title}
-          </h2>
-          <p className="mt-4 text-muted">
-            {[year, item.mediaType === 'tv' ? 'Series' : 'Movie', item.voteAverage ? `★ ${item.voteAverage.toFixed(1)}` : null]
-              .filter(Boolean)
-              .join(' · ')}
-          </p>
-          <p className="mt-2 line-clamp-2 max-w-lg text-[15px] leading-6 text-white/55">{item.overview}</p>
-          <div className="mt-6 flex flex-wrap items-center gap-3">
-            <Link
-              href={playHref}
-              className="flex h-12 cursor-pointer items-center gap-2.5 rounded-full bg-white px-6 font-semibold text-black transition-colors hover:bg-white/85"
-            >
-              <IoPlay size={20} />
-              {playButtonLabel(item.mediaType, resume)}
-            </Link>
-            {details.data ? <WatchLaterButton item={watchLaterItem(details.data)} /> : null}
-            <Link
-              href={titleHref(item)}
-              aria-label={`More information about ${item.title}`}
-              className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control"
-            >
-              <IoMdInformationCircleOutline size={25} />
-            </Link>
-          </div>
-        </div>
-      </div>
-    </>
-  );
-}
-
 /** Posters behind outlined rank numerals. */
 function TopTen({ items }: { items: MediaSummary[] }) {
   return (
-    <div className="mt-2">
+    <div>
       <ScrollRow className="gap-1.5 pt-2 pb-2" label="Ranked">
         {items.map((item, index) => (
           <Link
@@ -536,33 +476,16 @@ function GroupRow({
   query: Omit<DiscoverQuery, 'providerIds' | 'region'>;
   order: CatalogOrder;
 }) {
-  const ref = useRef<HTMLElement>(null);
+  const ref = useRef<HTMLDivElement>(null);
   const near = useNearViewport(ref);
   const pool = usePooled(provider, regions, query, order, near);
   const items = pool.items.filter((item) => item.posterPath);
   if (pool.failed || (near && !pool.loading && items.length === 0)) return null;
 
   return (
-    <section ref={ref}>
-      <h2 className="text-2xl font-semibold">{title}</h2>
-      {items.length ? (
-        <div className="mt-2">
-          <ScrollRow className="gap-3 pt-2 pb-2" label={title}>
-            {items.slice(0, 16).map((item) => (
-              <MediaCard
-                key={`${item.mediaType}-${item.id}`}
-                item={item}
-                href={titleHref(item)}
-                linkComponent={Link}
-                className={POSTER_WIDTH}
-              />
-            ))}
-          </ScrollRow>
-        </div>
-      ) : (
-        <RowPlaceholder loading tall />
-      )}
-    </section>
+    <div ref={ref}>
+      {items.length ? <MediaRow title={title} items={items} /> : <MediaRowSkeleton />}
+    </div>
   );
 }
 
