@@ -148,12 +148,15 @@
   more, and no counters. Its text is FeaturedHero's: the show's title,
   then "Episode name • S1 E10 • 21m left", the synopsis, and
   "Continue S1 E10" / "Watch S1 E8".
+- Once the page is idle, the strip preloads every episode's full-size
+  still (nearest the picked one first, two at a time) so stepping along
+  it never waits on the network.
 - Pages fade in when the path changes (`.route-enter`, opacity only:
   a transform would trap fixed overlays inside the page).
 - "Your services" are the services the viewer picked, in their order,
   stored locally (`lib/streaming-services.ts`) and managed in the
-  Library's "Your services" section (Home's Edit and Add tiles link
-  there; there is no modal). Any service TMDB lists in any country can
+  Library's "Your services" section (Home's row is only the tiles and an
+  Edit link there; no add tile, no modal). Any service TMDB lists in any country can
   be picked; TMDB ids that share a name are one service (Amazon Prime
   Video is 9 and 119). Until the viewer picks, the tiles are Netflix,
   Apple TV, Disney Plus and Amazon Prime Video. Tiles take the logo's own

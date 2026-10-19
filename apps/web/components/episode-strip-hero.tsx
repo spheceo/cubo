@@ -69,6 +69,8 @@ export function EpisodeStripHero({
     ? backdropUrl(show.backdropPath, 'w1280')
     : stillUrl(active.stillPath, 'original');
 
+  usePreloadedStills(list, show, activeIndex);
+
   const step = (delta: number) => {
     const next = list[Math.min(list.length - 1, Math.max(0, activeIndex + delta))];
     if (next) setPicked(next.episodeNumber);
@@ -117,6 +119,54 @@ export function EpisodeStripHero({
       )}
     </section>
   );
+}
+
+/** The full-size picture each episode swaps in, fetched ahead so stepping
+ *  along the strip never waits on the network. Starts once the page is
+ *  idle, nearest the picked episode first, a couple at a time. */
+function usePreloadedStills(episodes: Episode[], show: MediaDetails, activeIndex: number) {
+  const keys = episodes.map((episode) => episode.stillPath ?? '').join('|');
+  const startRef = useRef(activeIndex);
+  startRef.current = activeIndex;
+
+  useEffect(() => {
+    if (!episodes.length) return;
+    const start = startRef.current;
+    const ordered = [...episodes.keys()]
+      .sort((a, b) => Math.abs(a - start) - Math.abs(b - start))
+      .map((index) => episodes[index].stillPath)
+      .filter((path): path is string => Boolean(path))
+      .map((path) => stillUrl(path, 'original'));
+    ordered.push(backdropUrl(show.backdropPath, 'w1280'));
+
+    let cancelled = false;
+    let next = 0;
+    const loading = new Set<HTMLImageElement>();
+    const pump = () => {
+      while (!cancelled && loading.size < 2 && next < ordered.length) {
+        const image = new Image();
+        image.decoding = 'async';
+        loading.add(image);
+        const done = () => {
+          loading.delete(image);
+          pump();
+        };
+        image.onload = done;
+        image.onerror = done;
+        image.src = ordered[next++];
+      }
+    };
+    const idle = window.requestIdleCallback
+      ? window.requestIdleCallback(pump, { timeout: 1500 })
+      : window.setTimeout(pump, 300);
+    return () => {
+      cancelled = true;
+      if (window.cancelIdleCallback) window.cancelIdleCallback(idle);
+      else window.clearTimeout(idle);
+    };
+    // `keys` stands in for the episode list; restart only when it changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keys, show.backdropPath]);
 }
 
 /** The picked episode, in FeaturedHero's language: name as the kind, then
