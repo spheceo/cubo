@@ -15,6 +15,7 @@ const ALLOWED_PATHS = [
   /^discover\/(movie|tv)$/,
   /^tv\/\d+\/season\/\d+$/,
   /^search\/(movie|tv|multi)$/,
+  /^watch\/providers\/(movie|tv|regions)$/,
 ];
 
 export default async function handler(req: IncomingMessage, res: ServerResponse) {

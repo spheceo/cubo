@@ -77,14 +77,11 @@ function animateRemoveFromGrid(grid: HTMLElement, card: HTMLElement): Promise<vo
   });
 }
 
-export function ContinueWatching({
-  mediaType,
-  className = 'mt-8',
-}: {
-  mediaType?: LibraryItem['mediaType'];
-  className?: string;
-}) {
-  const { library, removeFromHistory, connection } = useCore();
+/** Continue Watching's cards, shared by the row and the home hero. */
+export function useContinueWatchingEntries(
+  mediaType?: LibraryItem['mediaType'],
+): ContinueWatchingEntry[] {
+  const { library } = useCore();
   const candidates = continueWatchingCandidates(library?.history, mediaType);
   // A finished episode's card depends on what has aired since.
   const showIds = finishedShowIds(candidates);
@@ -92,7 +89,22 @@ export function ContinueWatching({
   const detailsById = new Map(
     shows.flatMap((query) => (query.data ? [[query.data.id, query.data] as const] : [])),
   );
-  const items = continueWatchingEntries(candidates, (id) => detailsById.get(id));
+  return continueWatchingEntries(candidates, (id) => detailsById.get(id));
+}
+
+export function ContinueWatching({
+  mediaType,
+  className = 'mt-8',
+  excludeKey,
+}: {
+  mediaType?: LibraryItem['mediaType'];
+  className?: string;
+  /** A card shown elsewhere on the page (the home hero) stays out of the
+   *  row; it is still warmed. */
+  excludeKey?: string;
+}) {
+  const { removeFromHistory, connection } = useCore();
+  const items = useContinueWatchingEntries(mediaType);
 
   // Warm the first few play targets so "continue" starts at once: Core
   // fetches metadata, header and probe, then parks each torrent.
@@ -134,7 +146,8 @@ export function ContinueWatching({
   const busy = useRef(false);
   const [removingKey, setRemovingKey] = useState<string | null>(null);
 
-  if (items.length === 0) return null;
+  const shown = items.filter((entry) => entry.item.key !== excludeKey);
+  if (shown.length === 0) return null;
 
   async function removeItem(key: string) {
     if (busy.current) return;
@@ -146,7 +159,7 @@ export function ContinueWatching({
     try {
       if (grid && card && !prefersReducedMotion()) {
         const section = sectionRef.current;
-        if (items.length === 1 && section) {
+        if (shown.length === 1 && section) {
           await new Promise<void>((resolve) => {
             gsap.to(section, {
               autoAlpha: 0,
@@ -176,7 +189,7 @@ export function ContinueWatching({
     <section ref={sectionRef} className={className}>
       <h2 className="text-2xl font-semibold">Continue Watching</h2>
       <div ref={gridRef} className="relative isolate mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {items.map((entry) => (
+        {shown.map((entry) => (
           <ContinueWatchingCard
             key={entry.item.key}
             entry={entry}

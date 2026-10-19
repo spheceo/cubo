@@ -118,6 +118,29 @@
 - The Library schedule (`release-schedule.tsx`) covers every TV show in the
   history, not just Continue Watching, built from the cached TMDB details
   and next-episode season queries. Keep it to Week / Month / List views.
+- Home's hero is the episode strip while a show is in progress: the
+  first Continue Watching card that is a show with an episode to play
+  (so a new episode leads), with that season's aired episodes along the
+  bottom (`episode-strip-hero.tsx`). Picking an episode moves the hero
+  onto it without leaving the page; Play starts the picked one. That
+  show's card stays out of the Continue Watching row below. Without one,
+  Home falls back to the rotating featured hero. The hero waits for the
+  library so it never swaps a moment after the page appears.
+- The strip and backdrop move on transforms and crossfades only
+  (`CrossfadeImage` keeps the old picture until the new one covers it);
+  keep new motion there off layout properties.
+- "Your services" are the subscriptions the viewer picked, in their order,
+  for their country (`lib/streaming-services.ts`, stored locally). Until
+  they pick, the country comes from the time zone (a US-English browser
+  in South Africa still means ZA), then the browser languages, and the
+  services are the country's leading known subscriptions: TMDB's
+  per-country list mixes rental stores in. Tiles take the logo's own
+  background colour (sampled from its corner) so no colour tokens are
+  added per brand.
+- A service page (`/services/:id`) only shows titles included with that
+  subscription in the viewer's country (`with_watch_monetization_types=
+  flatrate`), from TMDB's availability data. The services row hides when
+  the metadata source has none (Cinemeta).
 - Featured heroes rotate across eligible catalog titles (last decade only),
   using recent history shared across Home, Movies, and TV. Each page holds
   its choice for several hours across refreshes; never revert to always

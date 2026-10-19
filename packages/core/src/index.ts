@@ -169,6 +169,11 @@ export interface CuboClient {
     details(mediaType: MediaType, id: number): Promise<MediaDetails>;
     season(id: number, seasonNumber: number): Promise<Episode[]>;
     search(query: string): Promise<MediaSummary[]>;
+    /** Subscription services with a catalogue in `region`, TMDB's most
+     *  prominent first. Empty when the metadata source cannot say. */
+    providers(region: string): Promise<WatchProvider[]>;
+    /** Countries TMDB has availability data for. */
+    providerRegions(): Promise<WatchRegion[]>;
   };
   streams: {
     get(mediaType: MediaType, imdbId: string, season?: number, episode?: number): Promise<Stream[]>;
@@ -197,6 +202,13 @@ export interface DiscoverQuery {
   maxVoteCount?: number;
   yearFrom?: number;
   yearTo?: number;
+  /** ISO dates (YYYY-MM-DD) bounding the release date; win over the years. */
+  releasedAfter?: string;
+  releasedBefore?: string;
+  /** Only titles included with any of these services' subscriptions in
+   *  `region` (TMDB provider ids; needs `region`). */
+  providerIds?: number[];
+  region?: string;
   page?: number;
 }
 
@@ -204,6 +216,19 @@ export interface DiscoverPage {
   results: MediaSummary[];
   page: number;
   totalPages: number;
+  /** Matches across every page, uncapped. */
+  totalResults: number;
+}
+
+export interface WatchProvider {
+  id: number;
+  name: string;
+  logoPath: string | null;
+}
+
+export interface WatchRegion {
+  code: string;
+  name: string;
 }
 
 export interface Genre {
@@ -810,11 +835,18 @@ export function createClient(config?: CuboClientConfig): CuboClient {
         if (query.maxVoteCount) params.set('vote_count.lte', String(query.maxVoteCount));
         if (query.yearFrom) params.set(`${dateKey}.gte`, `${query.yearFrom}-01-01`);
         if (query.yearTo) params.set(`${dateKey}.lte`, `${query.yearTo}-12-31`);
+        if (query.releasedAfter) params.set(`${dateKey}.gte`, query.releasedAfter);
+        if (query.releasedBefore) params.set(`${dateKey}.lte`, query.releasedBefore);
+        if (query.providerIds?.length && query.region) {
+          params.set('with_watch_providers', query.providerIds.join('|'));
+          params.set('watch_region', query.region);
+          params.set('with_watch_monetization_types', 'flatrate');
+        }
         // A rating sort with no vote floor is topped by 10.0/1-vote titles.
         if (sortBy === 'rating' && !query.minVoteCount) params.set('vote_count.gte', '200');
-        const data = await request<TmdbListResponse & { page?: number; total_pages?: number }>(
-          `/api/tmdb/discover/${query.mediaType}?${params}`,
-        );
+        const data = await request<
+          TmdbListResponse & { page?: number; total_pages?: number; total_results?: number }
+        >(`/api/tmdb/discover/${query.mediaType}?${params}`);
         return {
           results: (data.results ?? [])
             .filter((item) => item.poster_path || item.backdrop_path)
@@ -822,7 +854,44 @@ export function createClient(config?: CuboClientConfig): CuboClient {
           page: data.page ?? 1,
           // TMDB caps discover at 500 pages even when more matches exist.
           totalPages: Math.min(data.total_pages ?? 1, 500),
+          totalResults: data.total_results ?? 0,
         };
+      },
+      async providers(region: string) {
+        type Raw = {
+          provider_id: number;
+          provider_name: string;
+          logo_path: string | null;
+          display_priorities?: Record<string, number>;
+        };
+        const lists = await Promise.all(
+          (['movie', 'tv'] as const).map((mediaType) =>
+            request<{ results?: Raw[] }>(
+              `/api/tmdb/watch/providers/${mediaType}?watch_region=${encodeURIComponent(region)}`,
+            ),
+          ),
+        );
+        const byId = new Map<number, { provider: WatchProvider; priority: number }>();
+        for (const raw of lists.flatMap((list) => list.results ?? [])) {
+          const priority = raw.display_priorities?.[region] ?? Number.MAX_SAFE_INTEGER;
+          const known = byId.get(raw.provider_id);
+          if (known && known.priority <= priority) continue;
+          byId.set(raw.provider_id, {
+            provider: { id: raw.provider_id, name: raw.provider_name, logoPath: raw.logo_path },
+            priority,
+          });
+        }
+        return [...byId.values()]
+          .sort((a, b) => a.priority - b.priority)
+          .map((entry) => entry.provider);
+      },
+      async providerRegions() {
+        const data = await request<{
+          results?: { iso_3166_1: string; english_name: string; native_name?: string }[];
+        }>('/api/tmdb/watch/providers/regions');
+        return (data.results ?? [])
+          .map((raw) => ({ code: raw.iso_3166_1, name: raw.english_name }))
+          .sort((a, b) => a.name.localeCompare(b.name));
       },
       async related(mediaType: MediaType, id: number) {
         const [recommendations, similar] = await Promise.all([
@@ -902,6 +971,7 @@ export function createClient(config?: CuboClientConfig): CuboClient {
         results: items.slice(0, pageSize),
         page,
         totalPages: metas.length >= pageSize ? page + 1 : page,
+        totalResults: items.length,
       };
     },
     async related(mediaType: MediaType, id: number) {
@@ -966,6 +1036,13 @@ export function createClient(config?: CuboClientConfig): CuboClient {
           .map((meta) => cinemetaSummary(cinemeta, meta, 'tv'))
           .filter((item): item is MediaSummary => item !== null),
       );
+    },
+    // Cinemeta has no availability data, so there are no services to show.
+    async providers(_region: string) {
+      return [];
+    },
+    async providerRegions() {
+      return [];
     },
   };
 
@@ -1040,7 +1117,10 @@ export function logoUrl(path: string | null, size: 'w300' | 'w500' | 'original' 
   return path.startsWith('http') ? path : `https://image.tmdb.org/t/p/${size}${path}`;
 }
 
-export function stillUrl(path: string | null, size: 'w300' | 'w780' = 'w300'): string {
+export function stillUrl(
+  path: string | null,
+  size: 'w300' | 'w780' | 'original' = 'w300',
+): string {
   if (!path) return '';
   return path.startsWith('http') ? path : `https://image.tmdb.org/t/p/${size}${path}`;
 }

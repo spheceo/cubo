@@ -15,6 +15,7 @@ import { HomePage } from '@/pages/home';
 import { LibraryPage } from '@/pages/library';
 import { NotFoundPage } from '@/pages/not-found';
 import { SearchPage } from '@/pages/search';
+import { ServicePage } from '@/pages/service';
 import { TitlePage } from '@/pages/title';
 
 const WatchPage = lazy(() =>
@@ -61,6 +62,7 @@ export function App() {
                 <Route path="discover" element={<DiscoverPage />} />
                 <Route path="search" element={<SearchPage />} />
                 <Route path="library" element={<LibraryPage />} />
+                <Route path="services/:id" element={<ServicePage />} />
                 <Route path="legal" element={<LegalPage />} />
                 <Route path="movie/:id" element={<TitlePage mediaType="movie" />} />
                 <Route path="tv/:id" element={<TitlePage mediaType="tv" />} />

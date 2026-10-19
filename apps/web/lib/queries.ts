@@ -35,6 +35,27 @@ export const tmdbQueries = {
       initialPageParam: 1,
       getNextPageParam: (last) => (last.page < last.totalPages ? last.page + 1 : undefined),
     }),
+  /** One page on its own, keyed like Discover's one-off page fetches. */
+  discoverPage: (query: DiscoverQuery) =>
+    queryOptions({
+      queryKey: ['tmdb', 'discover', 'page', { ...query, page: query.page ?? 1 }],
+      queryFn: () => catalog.tmdb.discover({ ...query, page: query.page ?? 1 }),
+    }),
+  /** Which services operate where changes rarely; a day is plenty fresh. */
+  providers: (region: string) =>
+    queryOptions({
+      queryKey: ['tmdb', 'providers', region],
+      queryFn: () => catalog.tmdb.providers(region),
+      staleTime: 24 * 60 * 60 * 1000,
+      gcTime: 24 * 60 * 60 * 1000,
+    }),
+  providerRegions: () =>
+    queryOptions({
+      queryKey: ['tmdb', 'provider-regions'],
+      queryFn: () => catalog.tmdb.providerRegions(),
+      staleTime: 24 * 60 * 60 * 1000,
+      gcTime: 24 * 60 * 60 * 1000,
+    }),
   details: (mediaType: MediaType, id: number) =>
     queryOptions({
       queryKey: ['tmdb', 'details', mediaType, id],

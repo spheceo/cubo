@@ -215,6 +215,7 @@ pub fn tmdb_allowed(path: &str) -> bool {
         ["discover", "movie" | "tv"] => true,
         ["tv", id, "season", season] if is_digits(id) && is_digits(season) => true,
         ["search", "movie" | "tv" | "multi"] => true,
+        ["watch", "providers", "movie" | "tv" | "regions"] => true,
         _ => false,
     }
 }
@@ -405,6 +406,10 @@ mod tests {
         assert!(tmdb_allowed("search/multi"));
         assert!(!tmdb_allowed("movie/550/credits"));
         assert!(!tmdb_allowed("configuration"));
+        assert!(tmdb_allowed("watch/providers/tv"));
+        assert!(tmdb_allowed("watch/providers/regions"));
+        assert!(!tmdb_allowed("watch/providers"));
+        assert!(!tmdb_allowed("movie/550/watch/providers"));
     }
 
     #[test]
