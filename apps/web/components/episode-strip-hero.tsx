@@ -23,6 +23,9 @@ const CARD_GAP = { narrow: 18, wide: 28 };
 const PICKED_SCALE = 1.3;
 /** How far the picked thumbnail rises above its row. */
 const PICKED_LIFT = 12;
+/** Room above the picked thumbnail for its ring and rounded corners; the
+ *  strip clips its overflow so neighbours can bleed off the sides. */
+const PICKED_HEADROOM = 16;
 const EASE = 'cubic-bezier(.22,1,.36,1)';
 
 /**
@@ -222,7 +225,7 @@ function Strip({
   return (
     <div className="relative z-10 pb-8">
       <div className="mb-4 flex items-center justify-end gap-3 px-6 sm:px-10">
-        <span className="font-mono text-xs tracking-[0.12em] text-faint">
+        <span className="font-mono text-xs tracking-[0.12em] text-white/70 [text-shadow:0_1px_8px_rgb(0_0_0/0.6)]">
           {String(active?.episodeNumber ?? 0).padStart(2, '0')} / {String(episodes.at(-1)?.episodeNumber ?? 0).padStart(2, '0')}
         </span>
         <button
@@ -250,7 +253,7 @@ function Strip({
         role="group"
         aria-label="Episodes"
         className="relative overflow-hidden"
-        style={{ height: height * PICKED_SCALE + 64 }}
+        style={{ height: height * PICKED_SCALE + PICKED_LIFT + 52 + PICKED_HEADROOM }}
         onKeyDown={(event) => {
           if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
           event.preventDefault();
