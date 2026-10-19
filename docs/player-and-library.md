@@ -148,6 +148,14 @@
   more, and no counters. Its text is FeaturedHero's: the show's title,
   then "Episode name • S1 E10 • 21m left", the synopsis, and
   "Continue S1 E10" / "Watch S1 E8".
+- `CrossfadeImage` fades each new picture in with the Web Animations API
+  after `decode()`, never by flipping a class on load: a cached picture
+  loads before its first frame paints, so a CSS transition skips to the
+  end and pops. Pictures underneath stay until the newest covers them.
+- The strip drags (mouse or touch, with a little fling on release) and
+  takes trackpad sideways swipes, without changing the picked episode;
+  picking one hands the position back to it. Its images are not
+  draggable, and a drag's closing click is not a pick.
 - Once the page is idle, the strip preloads every episode's full-size
   still (nearest the picked one first, two at a time) so stepping along
   it never waits on the network.

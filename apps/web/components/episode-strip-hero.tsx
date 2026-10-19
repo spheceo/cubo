@@ -34,6 +34,10 @@ const PICKED_LIFT = 12;
 /** Room above the picked thumbnail for its ring and rounded corners; the
  *  strip clips its overflow so neighbours can bleed off the sides. */
 const PICKED_HEADROOM = 16;
+/** Pixels a press must travel before it is a drag rather than a click. */
+const DRAG_THRESHOLD = 6;
+/** How far a release carries the strip on, in ms of the flick's speed. */
+const FLING_MS = 280;
 /** The episode name under each thumbnail. */
 const LABEL_HEIGHT = 32;
 const EASE = 'cubic-bezier(.22,1,.36,1)';
@@ -252,6 +256,24 @@ function Strip({
   const cardRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const focusAfterStep = useRef(false);
   const [frameWidth, setFrameWidth] = useState(0);
+  // Where the viewer has dragged or swiped the strip to; null follows the
+  // picked episode. Picking an episode hands control back.
+  const [manualScroll, setManualScroll] = useState<number | null>(null);
+  const [live, setLive] = useState(false);
+  const drag = useRef<{
+    pointer: number;
+    startX: number;
+    startScroll: number;
+    moved: boolean;
+    lastX: number;
+    lastTime: number;
+    velocity: number;
+  } | null>(null);
+  const suppressClick = useRef(false);
+
+  useEffect(() => {
+    setManualScroll(null);
+  }, [activeIndex]);
   // The first layout lands in place; only later picks animate.
   const [animate, setAnimate] = useState(false);
 
@@ -286,8 +308,77 @@ function Strip({
   // empty space.
   const stripWidth = (episodes.length - 1) * stride + width + grow;
   const maxScroll = Math.max(0, stripWidth + gutter * 2 - frameWidth);
-  const scroll = Math.min(activeIndex * stride, frameWidth ? maxScroll : activeIndex * stride);
-  const transition = animate ? `transform ${MOVE_MS}ms ${EASE}` : 'none';
+  const autoScroll = Math.min(activeIndex * stride, frameWidth ? maxScroll : activeIndex * stride);
+  const scroll = manualScroll ?? autoScroll;
+  const clampScroll = (value: number) => Math.max(0, Math.min(maxScroll, value));
+  // While a finger, mouse or trackpad drives the strip it follows exactly;
+  // otherwise it glides.
+  const transition = animate && !live ? `transform ${MOVE_MS}ms ${EASE}` : 'none';
+  const scrollRef = useRef({ scroll, clampScroll });
+  scrollRef.current = { scroll, clampScroll };
+
+  // Trackpad sideways swipes scroll the strip. Not passive, so the swipe
+  // does not also become the browser's back/forward gesture.
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    let idle = 0;
+    const onWheel = (event: WheelEvent) => {
+      if (Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
+      event.preventDefault();
+      const { scroll: current, clampScroll: clamp } = scrollRef.current;
+      setLive(true);
+      setManualScroll(clamp(current + event.deltaX));
+      window.clearTimeout(idle);
+      idle = window.setTimeout(() => setLive(false), 140);
+    };
+    frame.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      frame.removeEventListener('wheel', onWheel);
+      window.clearTimeout(idle);
+    };
+  }, []);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    drag.current = {
+      pointer: event.pointerId,
+      startX: event.clientX,
+      startScroll: scroll,
+      moved: false,
+      lastX: event.clientX,
+      lastTime: event.timeStamp,
+      velocity: 0,
+    };
+  };
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const state = drag.current;
+    if (!state || event.pointerId !== state.pointer) return;
+    const dx = event.clientX - state.startX;
+    // A few pixels of wobble is still a click on a card.
+    if (!state.moved && Math.abs(dx) < DRAG_THRESHOLD) return;
+    if (!state.moved) {
+      state.moved = true;
+      event.currentTarget.setPointerCapture(state.pointer);
+      setLive(true);
+    }
+    const dt = event.timeStamp - state.lastTime;
+    if (dt > 0) state.velocity = (event.clientX - state.lastX) / dt;
+    state.lastX = event.clientX;
+    state.lastTime = event.timeStamp;
+    setManualScroll(clampScroll(state.startScroll - dx));
+  };
+  const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const state = drag.current;
+    if (!state || event.pointerId !== state.pointer) return;
+    drag.current = null;
+    if (!state.moved) return;
+    suppressClick.current = true;
+    setLive(false);
+    // Let go mid-flick and the strip carries on a little, easing to rest.
+    const released = state.startScroll - (state.lastX - state.startX);
+    setManualScroll(clampScroll(released - state.velocity * FLING_MS));
+  };
   const active = episodes[activeIndex];
 
   return (
@@ -317,8 +408,21 @@ function Strip({
         ref={frameRef}
         role="group"
         aria-label="Episodes"
-        className="relative overflow-hidden [mask-image:linear-gradient(to_right,transparent,#000_3%,#000_97%,transparent)]"
+        className={`relative touch-pan-y overflow-hidden select-none [mask-image:linear-gradient(to_right,transparent,#000_3%,#000_97%,transparent)] ${
+          live ? 'cursor-grabbing' : 'cursor-grab'
+        }`}
         style={{ height: height * PICKED_SCALE + PICKED_LIFT + LABEL_HEIGHT + PICKED_HEADROOM }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onClickCapture={(event) => {
+          // The click that ends a drag is not a pick.
+          if (!suppressClick.current) return;
+          suppressClick.current = false;
+          event.preventDefault();
+          event.stopPropagation();
+        }}
         onKeyDown={(event) => {
           if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
           event.preventDefault();
@@ -354,7 +458,9 @@ function Strip({
                 aria-label={`Episode ${episode.episodeNumber}: ${episode.name}`}
                 tabIndex={isActive ? 0 : -1}
                 onClick={() => onPick(episode.episodeNumber)}
-                className="group absolute bottom-0 left-0 cursor-pointer text-left outline-none"
+                className={`group absolute bottom-0 left-0 text-left outline-none ${
+                  live ? 'cursor-grabbing' : 'cursor-pointer'
+                }`}
                 style={{
                   width,
                   transform: `translateX(${index * stride + (index > activeIndex ? grow : 0)}px)`,
@@ -381,7 +487,8 @@ function Strip({
                       src={stillUrl(episode.stillPath, 'w300')}
                       alt=""
                       loading="lazy"
-                      className="h-full w-full object-cover"
+                      draggable={false}
+                      className="pointer-events-none h-full w-full object-cover"
                     />
                   ) : null}
                   {progress > 0 ? (
