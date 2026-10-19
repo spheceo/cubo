@@ -246,6 +246,8 @@ export function WatchScreen({
   const [resumeAt, setResumeAt] = useState(0);
   /** What Core has on disk for the current session, for the download bar. */
   const [downloadedRanges, setDownloadedRanges] = useState<BufferedRange[] | null>(null);
+  /** Core re-encodes the current session's picture. */
+  const [reencoding, setReencoding] = useState(false);
   const [episodesOpen, setEpisodesOpen] = useState(false);
   /** Original audio or English dub, for titles not made in English. Null
    *  until decided (the viewer is asked once per title when a dub exists). */
@@ -360,6 +362,10 @@ export function WatchScreen({
 
   const attemptRef = useRef(0);
   const failedSourcesRef = useRef(new Set<string>());
+  /** Sources whose picture failed to decode during this visit: they stay
+   *  re-encoded through recoveries and audio switches until the viewer
+   *  leaves, while `needsReencode` only covers repeat offenders. */
+  const reencodingRef = useRef(new Set<string>());
   const sourceRefreshRef = useRef<Promise<Stream[]> | null>(null);
   /** Cancels the in-flight start sequence (buffer polling included) the
    *  moment a newer attempt begins or the screen unmounts. */
@@ -446,6 +452,7 @@ export function WatchScreen({
     bufferingStatusRef.current = null;
     stallsRef.current = [];
     setDownloadedRanges(null);
+    setReencoding(false);
     setVideoDurationHint(null);
     setProgress(0);
     setStage(STAGE.core);
@@ -692,7 +699,7 @@ export function WatchScreen({
             resumeSeconds: startAt,
             hevc: supportsHevcRemux(),
             audioLanguage,
-            transcodeVideo: needsReencode(stream),
+            transcodeVideo: reencodingRef.current.has(streamKey(stream)) || needsReencode(stream),
           });
           racer.sessionId = created.id;
           if (racer.done || settled || stale()) {
@@ -824,6 +831,7 @@ export function WatchScreen({
     setSubtitleMatch(null);
     setSkipSegments(null);
     sessionRef.current = { connection, id: ready.id };
+    setReencoding(ready.videoTranscode === true);
 
     const fileIndex = ready.fileIndex ?? stream.fileIdx ?? 0;
     const id = ready.torrentId ?? ready.infoHash ?? '';
@@ -1562,6 +1570,7 @@ export function WatchScreen({
     // is fails the same way, so the same source comes back re-encoded.
     const active = activeSourceRef.current;
     if (failure?.decode && sessionStatus?.phase === 'ready' && !sessionStatus.videoTranscode && active) {
+      reencodingRef.current.add(streamKey(active));
       rememberReencode(active);
       const index = sources.findIndex((stream) => streamKey(stream) === streamKey(active));
       if (index >= 0) {
@@ -1702,6 +1711,7 @@ export function WatchScreen({
           initialTime={resumeAt}
           onPlaybackProgress={savePlaybackProgress}
           downloadedRanges={downloadedRanges}
+          reencoding={reencoding}
           onPlaying={() => {
             if (activeSourceRef.current && rememberableRef.current) {
               rememberSource(itemKey, activeSourceRef.current);

@@ -98,11 +98,21 @@ supported (Apple's hardware decoder rejects frames in BBC 50 fps WEB-DLs;
 interlaced HDTV captures never decode). A decode error (video element
 `MEDIA_ERR_DECODE` or a fatal hls.js media error) restarts the same source
 with `transcodeVideo`, which Core re-encodes to H.264 (`h264_videotoolbox`
-on macOS, libx264 elsewhere), and the source is remembered
-(`decode-fallback.ts`) so later visits re-encode at once. Interlaced sources
-always re-encode, deinterlaced. Re-encodes use `-force_key_frames source`,
+on macOS, libx264 elsewhere). The source stays re-encoded for the rest of
+that visit. Failures are counted per source (`decode-fallback.ts`): after
+one, the next visit tries the browser's decoder again, since a hardware
+decoder busy with another app (a video export) fails once on files that
+play fine; after failures on two visits, later visits re-encode at once.
+Interlaced sources always re-encode, deinterlaced. Re-encodes use `-force_key_frames source`,
 no B-frames, so segments keep the plan. Restarting such a file unchanged
 only loops; never treat it as healthy.
+
+Re-encoding is far faster than real time on an idle machine but falls
+behind when the encoder is shared (another app exporting video). The file
+is then on disk while segments arrive late, so the grey bar runs ahead of
+a loader. After 3 s of waiting with the file on disk past the playhead, the
+player's loader says it is converting the video
+(`reencoding` on `VideoPlayer`).
 
 ## Downloaded bar
 

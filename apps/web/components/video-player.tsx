@@ -55,6 +55,10 @@ const AUTO_NEXT_MS = 6_000;
 const AUTO_SKIP_INTRO_MS = 4_000;
 /** Matches `.player-menu[data-closing]` in globals.css. */
 const SETTINGS_CLOSE_MS = 140;
+/** A wait this long on a re-encoded file says what it is waiting for. */
+const CONVERTING_NOTE_MS = 3_000;
+/** Seconds on disk past the playhead that make a wait the conversion's. */
+const CONVERTING_ON_DISK_SECONDS = 10;
 
 export type BufferedRange = {
   start: number;
@@ -147,6 +151,7 @@ export function VideoPlayer({
   onBufferError,
   onBuffering,
   downloadedRanges = null,
+  reencoding = false,
   flushRef,
   topRightControls,
   menuOpen = false,
@@ -241,6 +246,10 @@ export function VideoPlayer({
   /** The loading overlay appeared (true) or cleared (false): startup,
    *  seeks and mid-play stalls alike, never while paused. */
   onBuffering?: (buffering: boolean) => void;
+  /** Core re-encodes this file's picture (the browser could not decode
+   *  it). A wait with the file already on disk is then the conversion
+   *  falling behind, not the download. */
+  reencoding?: boolean;
   /** Absolute stretches Core has on disk. When given, the bar draws the
    *  watchable span from the playhead instead of the browser's buffered
    *  ranges: for direct files the browser only knows bytes and places them
@@ -914,6 +923,23 @@ export function VideoPlayer({
   useEffect(() => {
     onBufferingRef.current?.(buffering);
   }, [buffering]);
+  const [bufferingLong, setBufferingLong] = useState(false);
+  useEffect(() => {
+    setBufferingLong(false);
+    if (!buffering) return;
+    const timer = window.setTimeout(() => setBufferingLong(true), CONVERTING_NOTE_MS);
+    return () => window.clearTimeout(timer);
+  }, [buffering]);
+  // The grey bar runs past the playhead, so the wait is Core converting the
+  // picture: say so instead of a bare loader the viewer reads as a stall.
+  const convertingNote =
+    reencoding
+    && buffering
+    && bufferingLong
+    && downloadedRanges != null
+    && watchableSpan(downloadedRanges, shownTime).some(
+      (range) => range.end >= Math.min(shownTime + CONVERTING_ON_DISK_SECONDS, duration - 1),
+    );
 
   const keepControls = !creditsTakeover && (settingsOpen || menuOpen || heldPaused || blocked);
   const keepControlsRef = useRef(keepControls);
@@ -1487,8 +1513,13 @@ export function VideoPlayer({
       />
 
       {buffering ? (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center bg-black/40">
           <LogoLoader title={title} progress={null} size="sm" logoPath={logoPath} />
+          {convertingNote ? (
+            <p role="status" className="mt-5 max-w-xs px-6 text-center text-sm leading-6 text-white/70">
+              Converting this video for your browser. It runs slower while your computer is busy.
+            </p>
+          ) : null}
         </div>
       ) : null}
 
