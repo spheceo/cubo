@@ -38,6 +38,9 @@ const PICKED_HEADROOM = 16;
  *  thumbnails use w780, which stays sharp on a 2x screen once the picked
  *  one is scaled up. */
 const HERO_STILL = 'w1280';
+/** The hero text column, and its gap above the thumbnails. */
+const TEXT_WIDTH = 600;
+const TEXT_GAP = 28;
 /** Pixels a press must travel before it is a drag rather than a click. */
 const DRAG_THRESHOLD = 6;
 /** How far a release carries the strip on, in ms of the flick's speed. */
@@ -84,6 +87,16 @@ export function EpisodeStripHero({
 
   usePreloadedStills(list, show, activeIndex);
 
+  // The text sits just above the thumbnails and rises only while the
+  // picked (bigger, lifted) card is underneath it. The first position is
+  // set before paint and never animates.
+  const [lift, setLift] = useState(0);
+  const [liftAnimates, setLiftAnimates] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setLiftAnimates(true), 400);
+    return () => window.clearTimeout(timer);
+  }, []);
+
 
   return (
     <section
@@ -97,11 +110,17 @@ export function EpisodeStripHero({
 
       {/* Top padding clears the site header: a long title grows the hero
           rather than sliding under the nav. */}
-      <div className="relative z-10 flex flex-1 flex-col justify-end px-6 pt-24 sm:px-10">
+      <div
+        className="relative z-10 flex flex-1 flex-col justify-end px-6 pt-24 sm:px-10"
+        style={{
+          transform: `translateY(-${lift}px)`,
+          transition: liftAnimates ? `transform ${MOVE_MS}ms ${EASE}` : 'none',
+        }}
+      >
         <div className="max-w-4xl">
           <HeroTitle title={show.title} />
         </div>
-        <div className="mt-5 w-[600px] max-w-full space-y-5">
+        <div className="mt-5 max-w-full space-y-5" style={{ width: TEXT_WIDTH }}>
           {active ? (
             <EpisodeDetails
               key={active.episodeNumber}
@@ -121,6 +140,7 @@ export function EpisodeStripHero({
           activeIndex={activeIndex}
           showId={show.id}
           onPick={setPicked}
+          onLift={setLift}
         />
       ) : (
         <div className="h-60" />
@@ -246,11 +266,14 @@ function Strip({
   activeIndex,
   showId,
   onPick,
+  onLift,
 }: {
   episodes: Episode[];
   activeIndex: number;
   showId: number;
   onPick: (episodeNumber: number) => void;
+  /** How far the hero text must rise to clear the picked card. */
+  onLift: (pixels: number) => void;
 }) {
   const { library } = useCore();
   const frameRef = useRef<HTMLDivElement>(null);
@@ -405,36 +428,31 @@ function Strip({
     const released = state.startScroll - (state.lastX - state.startX);
     setManualScroll(clampScroll(released - state.velocity * FLING_MS));
   };
-  const active = episodes[activeIndex];
+  // The band above the thumbnails is only ever used by the picked card
+  // growing and lifting. The strip pulls up into it, under the hero text,
+  // so the text can sit just above the thumbnails; the band itself lets
+  // clicks through to the text.
+  const band = height * (PICKED_SCALE - 1) + PICKED_LIFT + PICKED_HEADROOM;
+  const cardLeft = gutter - scroll + activeIndex * stride;
+  const cardRight = cardLeft + width + grow;
+  const textRight = gutter + Math.min(TEXT_WIDTH, frameWidth - gutter * 2);
+  const covered = measured && cardLeft < textRight + 24 && cardRight > gutter - 24;
+  const lift = covered ? Math.round(height * (PICKED_SCALE - 1) + PICKED_LIFT + 12) : 0;
+  useLayoutEffect(() => {
+    onLift(lift);
+  }, [lift, onLift]);
+
+  const visible = Math.max(0, frameWidth - gutter * 2);
+  const page = (direction: 1 | -1) =>
+    setManualScroll(clampScroll(scroll + direction * visible * 0.75));
 
   return (
-    <div className="relative z-10 pb-8">
-      <div className="mb-4 flex items-center justify-end gap-3 px-6 sm:px-10">
-        <button
-          type="button"
-          aria-label="Previous episode"
-          disabled={activeIndex === 0}
-          onClick={() => select(activeIndex - 1)}
-          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-40"
-        >
-          <IoChevronBack size={20} />
-        </button>
-        <button
-          type="button"
-          aria-label="Next episode"
-          disabled={activeIndex === episodes.length - 1}
-          onClick={() => select(activeIndex + 1)}
-          className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-40"
-        >
-          <IoChevronForward size={20} />
-        </button>
-      </div>
-
+    <div className="pointer-events-none relative z-10 pb-8" style={{ marginTop: TEXT_GAP - band }}>
       <div
         ref={frameRef}
         role="group"
         aria-label="Episodes"
-        className={`relative touch-pan-y overflow-hidden select-none [mask-image:linear-gradient(to_right,transparent,#000_3%,#000_97%,transparent)] ${
+        className={`group/strip relative touch-pan-y overflow-hidden select-none [mask-image:linear-gradient(to_right,transparent,#000_3%,#000_97%,transparent)] ${
           live ? 'cursor-grabbing' : 'cursor-grab'
         }`}
         style={{ height: height * PICKED_SCALE + PICKED_LIFT + LABEL_HEIGHT + PICKED_HEADROOM }}
@@ -459,7 +477,7 @@ function Strip({
         {measured ? (
         <div className="strip-reveal absolute inset-0">
         <div
-          className="absolute bottom-0 left-0"
+          className="pointer-events-auto absolute bottom-0 left-0"
           style={{
             height: height + LABEL_HEIGHT,
             transform: `translateX(${gutter - scroll}px)`,
@@ -541,9 +559,49 @@ function Strip({
             );
           })}
         </div>
+        <StripEdge side="left" enabled={scroll > 4} bottom={LABEL_HEIGHT} height={height} onPage={page} />
+        <StripEdge side="right" enabled={scroll < maxScroll - 4} bottom={LABEL_HEIGHT} height={height} onPage={page} />
         </div>
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** Home rows' fading edge arrow, paging the strip; shown on hover. */
+function StripEdge({
+  side,
+  enabled,
+  bottom,
+  height,
+  onPage,
+}: {
+  side: 'left' | 'right';
+  enabled: boolean;
+  bottom: number;
+  height: number;
+  onPage: (direction: 1 | -1) => void;
+}) {
+  const left = side === 'left';
+  return (
+    <button
+      type="button"
+      aria-label={left ? 'Scroll episodes left' : 'Scroll episodes right'}
+      tabIndex={-1}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={() => onPage(left ? -1 : 1)}
+      className={`absolute z-10 hidden w-28 cursor-pointer items-center transition-opacity duration-200 md:flex ${
+        left ? 'left-0 justify-start pl-4' : 'right-0 justify-end pr-4'
+      } ${enabled ? 'pointer-events-auto opacity-0 group-hover/strip:opacity-100' : 'pointer-events-none opacity-0'}`}
+      style={{
+        bottom,
+        height,
+        background: `linear-gradient(to ${left ? 'right' : 'left'}, var(--color-background) 30%, transparent)`,
+      }}
+    >
+      <span className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-white/[0.08] text-white backdrop-blur-sm transition-colors hover:bg-white/[0.14]">
+        {left ? <IoChevronBack size={18} /> : <IoChevronForward size={18} />}
+      </span>
+    </button>
   );
 }
