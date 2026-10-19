@@ -195,11 +195,10 @@ export function ServicePage() {
   const genres = genresFor(mediaType);
   // Hop between the viewer's services from the header; the one on screen
   // stays in the list even when it is not one of theirs.
-  const switchOptions = [
+  const switchList = [
     ...(provider && !services.includes(provider) ? [provider] : []),
     ...services,
-  ].map((entry) => ({ value: entry.id, label: entry.name }));
-  const switchable = switchOptions.length > 1;
+  ];
   const groups = genreId
     ? []
     : GROUP_GENRES[mediaType].flatMap((id) => genres.filter((genre) => genre.id === id));
@@ -222,20 +221,12 @@ export function ServicePage() {
           >
             <IoArrowBack size={18} />
           </button>
-          {provider?.logoPath ? (
-            <img src={logoUrl(provider.logoPath, 'w300')} alt="" className="h-10 w-10 rounded-[10px]" />
-          ) : null}
-          <h1 className={switchable ? 'sr-only' : 'text-lg font-semibold tracking-[-0.02em]'}>
-            {provider?.name ?? ''}
-          </h1>
-          {switchable && provider ? (
-            <Dropdown
-              ariaLabel="Service"
-              value={provider.id}
-              options={switchOptions}
-              onChange={(next) =>
-                navigate(`/services/${next}${mediaType === 'movie' ? '?type=movie' : ''}`)
-              }
+          <h1 className="sr-only">{provider?.name ?? ''}</h1>
+          {provider ? (
+            <ServiceSwitcher
+              current={provider}
+              services={switchList}
+              suffix={mediaType === 'movie' ? '?type=movie' : ''}
             />
           ) : null}
         </div>
@@ -322,6 +313,55 @@ export function ServicePage() {
         ) : null}
       </div>
     </main>
+  );
+}
+
+/** The viewer's services as one bar of logos: the one on screen is lit
+ *  and named, the rest stay dim until hovered and open their page. */
+function ServiceSwitcher({
+  current,
+  services,
+  suffix,
+}: {
+  current: WatchProvider;
+  services: WatchProvider[];
+  suffix: string;
+}) {
+  return (
+    <nav
+      aria-label="Your services"
+      className="flex items-center gap-1 rounded-full border border-white/10 bg-black/30 p-1 backdrop-blur-md"
+    >
+      {services.map((entry) => {
+        const active = entry.id === current.id;
+        return (
+          <Link
+            key={entry.id}
+            href={`/services/${entry.id}${suffix}`}
+            aria-label={entry.name}
+            aria-current={active ? 'page' : undefined}
+            className={`group flex h-9 cursor-pointer items-center gap-2.5 rounded-full p-1 transition-[background-color,opacity] duration-500 ${
+              active ? 'bg-white/[0.14] pr-4' : 'opacity-50 hover:bg-white/[0.08] hover:opacity-100'
+            }`}
+          >
+            {entry.logoPath ? (
+              <img
+                src={logoUrl(entry.logoPath, 'w300')}
+                alt=""
+                className="h-7 w-7 rounded-full object-cover"
+              />
+            ) : (
+              <span className="flex h-7 w-7 items-center justify-center rounded-full bg-control text-[11px] font-semibold">
+                {entry.name.slice(0, 2)}
+              </span>
+            )}
+            {active ? (
+              <span className="service-name text-sm font-semibold whitespace-nowrap">{entry.name}</span>
+            ) : null}
+          </Link>
+        );
+      })}
+    </nav>
   );
 }
 

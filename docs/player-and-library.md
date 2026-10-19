@@ -165,8 +165,9 @@
   the still, date pill), top rated, and two genre rows that only fetch
   as they near the viewport and drop out when empty. Keep it to that;
   the genre menu reaches the rest. Picking a genre narrows the first
-  three rows to it and drops the genre rows. The header is the logo and
-  a menu to switch between the viewer's services.
+  three rows to it and drops the genre rows. The header is one bar of
+  the viewer's services' logos: the one on screen lit and named, the
+  rest dim until hovered.
 - Featured heroes rotate across eligible catalog titles (last decade only),
   using recent history shared across Home, Movies, and TV. Each page holds
   its choice for several hours across refreshes; never revert to always
