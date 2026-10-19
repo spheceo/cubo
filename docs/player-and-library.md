@@ -40,6 +40,12 @@
   English dialogue that runs on from their start (a line within 30 s,
   ignoring lyrics, sound tags and the subtitler's credit;
   `creditsAfterDialogue`). Both only ever move credits later.
+- Crowd intros are timed on someone else's copy as well (IntroDB's single
+  Wayward Pines submissions sit 8–17 s early in the Blu-ray rips). When the
+  file has a chapter about as long as the crowd intro (within 10 s and
+  30%) starting within 30 s of it, that chapter is the intro
+  (`align_intro_to_chapters`): rips mark the title sequence even when the
+  chapter is unnamed.
 - TheIntroDB is read through its v4 API (v2/v3 are frozen and being
   removed), addressed by TMDB id with TMDB's own season/episode numbers,
   which v4 resolves server-side, so no `mapping`. Core sends the file's
@@ -70,6 +76,10 @@
 
 - The captions button and the Subtitles settings row only show when the
   title has subtitle tracks.
+- Turning captions on picks the viewer's last-picked caption language,
+  else English wherever it sits in the provider's list, else the first
+  track (`preferredSubtitleId`). The menu keeps the provider's order and
+  caps at 18 languages, but never cuts English.
 - Subtitle cues honour a leftover ASS `{\anN}` tag: 7–9 go to the top
   (below the top chrome when it shows), 4–6 to the middle, left/centre/right
   by column. Every other `{\…}` override is stripped, and `\N` becomes a

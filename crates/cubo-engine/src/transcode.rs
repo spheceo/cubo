@@ -250,6 +250,46 @@ pub fn align_credits_to_chapters(
         })
 }
 
+/// How far a crowd intro may sit from the file's own intro chapter and still
+/// be the same title sequence.
+const INTRO_ALIGN_MAX_SHIFT_SECONDS: f64 = 30.0;
+/// How much longer or shorter than the crowd intro that chapter may run.
+const INTRO_ALIGN_MAX_LENGTH_DIFF_SECONDS: f64 = 10.0;
+
+/// Crowd intros are timed on someone else's copy too: IntroDB's single
+/// Wayward Pines submissions sit 8–17 s early in the Blu-ray rips, where a
+/// chapter brackets the title sequence exactly (fades to black at both
+/// marks). The chapter nearest the crowd window, about as long and starting
+/// within 30 s of it, replaces the crowd timing. Unlike credits this moves
+/// either way: a mark that close and that long is the same sequence.
+pub fn align_intro_to_chapters(intro: SkipSegment, chapters: &[Chapter]) -> Option<SkipSegment> {
+    if !intro.end.is_finite() || intro.end <= intro.start {
+        return None;
+    }
+    let length = intro.end - intro.start;
+    let (chapter, miss) = chapters
+        .iter()
+        .filter(|chapter| {
+            chapter.start_seconds.is_finite()
+                && chapter.end_seconds.is_finite()
+                && chapter.end_seconds > chapter.start_seconds
+                && (chapter.start_seconds - intro.start).abs() <= INTRO_ALIGN_MAX_SHIFT_SECONDS
+                && ((chapter.end_seconds - chapter.start_seconds) - length).abs()
+                    <= INTRO_ALIGN_MAX_LENGTH_DIFF_SECONDS.min(length * 0.3)
+        })
+        .map(|chapter| {
+            let miss = (chapter.start_seconds - intro.start).abs()
+                + (chapter.end_seconds - intro.end).abs();
+            (chapter, miss)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+    // Within a second at both ends is the same window already.
+    (miss > 1.0).then_some(SkipSegment {
+        start: chapter.start_seconds,
+        end: chapter.end_seconds,
+    })
+}
+
 /// ffprobe's `field_order`: `progressive`, `unknown`, or a field order
 /// (`tt`, `bb`, `tb`, `bt`) for interlaced video.
 fn is_interlaced(field_order: &str) -> bool {
@@ -787,6 +827,66 @@ mod tests {
         fn a_final_chapter_short_of_the_end_is_not_trusted() {
             let chapters = [chapter(0.0, 2605.0), chapter(2605.0, 2620.0)];
             assert!(align_credits_to_chapters(crowd(2509.0, f64::MAX), &chapters, 2642.0).is_none());
+        }
+    }
+
+    mod intro_alignment {
+        use super::super::{align_intro_to_chapters, Chapter, SkipSegment};
+
+        fn chapter(start: f64, end: f64) -> Chapter {
+            Chapter {
+                start_seconds: start,
+                end_seconds: end,
+                title: "Chapter".to_owned(),
+            }
+        }
+
+        fn crowd(start: f64, end: f64) -> SkipSegment {
+            SkipSegment { start, end }
+        }
+
+        /// Wayward Pines S01E07 (Panda Blu-ray rip): the title sequence fades
+        /// in at 304.3 and out at 349.6, chapter 3; IntroDB says 287.68–327.8.
+        fn wayward_pines_e07() -> Vec<Chapter> {
+            vec![
+                chapter(0.0, 59.476),
+                chapter(59.476, 304.304),
+                chapter(304.304, 349.558),
+                chapter(349.558, 1094.093),
+            ]
+        }
+
+        #[test]
+        fn a_crowd_intro_moves_to_the_title_sequence_chapter() {
+            let aligned = align_intro_to_chapters(crowd(287.68, 327.8), &wayward_pines_e07()).expect("aligned");
+            assert_eq!((aligned.start, aligned.end), (304.304, 349.558));
+            // S01E06: IntroDB starts 4 s late; the chapter is earlier.
+            let chapters = [chapter(77.703, 163.163), chapter(163.163, 208.25), chapter(208.25, 815.148)];
+            let aligned = align_intro_to_chapters(crowd(167.43, 209.91), &chapters).expect("aligned");
+            assert_eq!((aligned.start, aligned.end), (163.163, 208.25));
+        }
+
+        #[test]
+        fn a_matching_crowd_intro_stays() {
+            assert!(align_intro_to_chapters(crowd(304.0, 349.9), &wayward_pines_e07()).is_none());
+        }
+
+        #[test]
+        fn a_chapter_of_another_length_is_not_the_intro() {
+            // A 245 s story chapter starting near the crowd intro.
+            let chapters = [chapter(0.0, 59.476), chapter(59.476, 304.304)];
+            assert!(align_intro_to_chapters(crowd(70.0, 110.0), &chapters).is_none());
+        }
+
+        #[test]
+        fn a_far_chapter_is_not_the_same_intro() {
+            assert!(align_intro_to_chapters(crowd(250.0, 295.0), &wayward_pines_e07()).is_none());
+        }
+
+        #[test]
+        fn files_without_chapters_or_an_open_ended_intro_keep_crowd_timing() {
+            assert!(align_intro_to_chapters(crowd(287.68, 327.8), &[]).is_none());
+            assert!(align_intro_to_chapters(crowd(287.68, f64::MAX), &wayward_pines_e07()).is_none());
         }
     }
 

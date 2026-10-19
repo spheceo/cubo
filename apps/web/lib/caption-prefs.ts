@@ -63,8 +63,13 @@ export function saveCaptionPrefs(prefs: CaptionPrefs): void {
   }
 }
 
-/** Picks the track a saved preference points at: exact language match first,
- *  then anything at all when captions are enabled without a language. */
+/** English subtitle tracks come as `en`, `eng` or a region tag (`en-US`). */
+export function isEnglish(language: string): boolean {
+  return /^en(g|-|$)/i.test(language);
+}
+
+/** Picks the track a saved preference points at: the viewer's own language
+ *  first, then English, wherever either sits in the list, then anything. */
 export function preferredSubtitleId(
   tracks: { id: string; language: string }[],
   prefs: CaptionPrefs,
@@ -74,5 +79,5 @@ export function preferredSubtitleId(
     prefs.language != null
       ? tracks.find((track) => track.language.toLowerCase() === prefs.language?.toLowerCase())
       : undefined;
-  return (exact ?? tracks[0]).id;
+  return (exact ?? tracks.find((track) => isEnglish(track.language)) ?? tracks[0]).id;
 }

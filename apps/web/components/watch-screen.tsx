@@ -61,6 +61,7 @@ import {
 } from '@/lib/local-engine';
 import { supportsHevcRemux } from '@/lib/media-compatibility';
 import {
+  isEnglish,
   loadCaptionPrefs,
   preferredSubtitleId,
   saveCaptionPrefs,
@@ -331,16 +332,13 @@ export function WatchScreen({
   );
 
   const enableCaptions = useCallback(() => {
-    // Pick purely by saved language — prefs.enabled is false right now
-    // (that's why the viewer is toggling ON), so it must not gate the choice.
-    const language = captionPrefs.language?.toLowerCase();
-    const match = language
-      ? subtitleTracks.find((track) => track.language.toLowerCase() === language)
-      : undefined;
-    setActiveSubtitleId(match?.id ?? subtitleTracks[0]?.id ?? null);
+    // Pick purely by saved language (else English) — prefs.enabled is false
+    // right now (that's why the viewer is toggling ON), so it must not gate
+    // the choice.
+    setActiveSubtitleId(preferredSubtitleId(subtitleTracks, { ...captionPrefs, enabled: true }));
     updateCaptionPrefs({ enabled: true });
     saveCaptionsOff(mediaType, mediaId, false);
-  }, [subtitleTracks, captionPrefs.language, updateCaptionPrefs, mediaType, mediaId]);
+  }, [subtitleTracks, captionPrefs, updateCaptionPrefs, mediaType, mediaId]);
 
   // When a title's tracks arrive, apply whatever the viewer left behind:
   // captions on means this title opens with captions too, same language.
@@ -1207,7 +1205,7 @@ export function WatchScreen({
   const introSegment = skipSegments?.intro ?? null;
   useEffect(() => {
     setEnglishCues(null);
-    const track = subtitleTracks.find((entry) => /^en(g|-|$)/i.test(entry.language));
+    const track = subtitleTracks.find((entry) => isEnglish(entry.language));
     if (!track) return;
     let cancelled = false;
     void loadSubtitleCues(track.src).then((cues) => {
@@ -2001,12 +1999,20 @@ function PlayerEpisodes({
   );
 }
 
+const MAX_SUBTITLE_LANGUAGES = 18;
+
 function prepareSubtitles(tracks: SubtitleTrack[]): PlayerSubtitle[] {
   const seen = new Set<string>();
   const displayNames = new Intl.DisplayNames(['en'], { type: 'language' });
   const prepared: PlayerSubtitle[] = [];
+  // The menu keeps the provider's order but never cuts English: it is the
+  // caption default, and recap/credits detection reads it.
+  const english = tracks.find((track) => isEnglish(track.language));
 
   for (const track of tracks) {
+    if (prepared.length === MAX_SUBTITLE_LANGUAGES - 1 && english && !seen.has(english.language) && track !== english) {
+      continue;
+    }
     if (seen.has(track.language)) continue;
     seen.add(track.language);
     let label: string | undefined;
@@ -2022,7 +2028,7 @@ function prepareSubtitles(tracks: SubtitleTrack[]): PlayerSubtitle[] {
       language: track.language,
       label,
     });
-    if (prepared.length >= 18) break;
+    if (prepared.length >= MAX_SUBTITLE_LANGUAGES) break;
   }
 
   return prepared;

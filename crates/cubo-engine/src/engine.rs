@@ -40,7 +40,7 @@ use crate::session::{
 use crate::store::{self, CoreStore, PlaybackUpdate, WatchLaterUpdate};
 use crate::system;
 use crate::transcode::{
-    align_credits_to_chapters, chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager,
+    align_credits_to_chapters, align_intro_to_chapters, chapter_sections, chapter_skip_segments, SkipSegment, TranscodeManager,
 };
 use crate::update::UpdateManager;
 
@@ -2036,6 +2036,23 @@ async fn skip_segments(
                     crowd_start = section.segment.start,
                     aligned_start = aligned.start,
                     "crowd credits moved to the file's credits chapter"
+                );
+                section.segment = aligned;
+                section.source = "chapters";
+            }
+        }
+    }
+    if let Some(probe) = &probe {
+        for section in remote.iter_mut().filter(|section| section.kind == "intro") {
+            if let Some(aligned) = align_intro_to_chapters(section.segment, &probe.chapters) {
+                tracing::info!(
+                    target: "skip-segments",
+                    source = section.source,
+                    crowd_start = section.segment.start,
+                    crowd_end = section.segment.end,
+                    aligned_start = aligned.start,
+                    aligned_end = aligned.end,
+                    "crowd intro moved to the file's intro chapter"
                 );
                 section.segment = aligned;
                 section.source = "chapters";
