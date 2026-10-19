@@ -5,31 +5,22 @@ import {
   posterUrl,
   titleHref,
   watchHref,
-  type DiscoverPage,
-  type DiscoverSort,
+  type DiscoverQuery,
   type MediaSummary,
   type MediaType,
 } from '@cubo/core';
-import {
-  useInfiniteQuery,
-  useQuery,
-  type InfiniteData,
-  type UseInfiniteQueryResult,
-} from '@tanstack/react-query';
-import { useEffect, useMemo, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { IoArrowBack, IoPlay } from 'react-icons/io5';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
-import { ScrollRow } from '@cubo/ui';
+import { MediaCard, ScrollRow } from '@cubo/ui';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { CatalogError } from '@/components/catalog-error';
 import { useCore } from '@/components/core-provider';
-import { Dropdown } from '@/components/dropdown';
 import { Link } from '@/components/link';
-import { MediaGrid } from '@/components/media-grid';
-import { HeroSkeleton, MediaGridSkeleton } from '@/components/page-skeletons';
+import { HeroSkeleton } from '@/components/page-skeletons';
 import { WatchLaterButton } from '@/components/watch-later-button';
 import { parseCalendarDate } from '@/lib/air-date';
-import { SORTS } from '@/lib/discover-filters';
 import { latestHistoryForTitle, playButtonLabel, watchLaterItem } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
 import { regionName } from '@/lib/streaming-services';
@@ -38,6 +29,15 @@ import { useStreamingServices } from '@/lib/use-streaming-services';
 
 /** How far back "new" reaches for the hero. */
 const HERO_RECENT_DAYS = 120;
+
+/** Genre rows under the ranked, new and top-rated ones, in this order. */
+const GROUP_GENRES: Record<MediaType, number[]> = {
+  tv: [80, 18, 35, 10765, 10759, 9648, 16, 99, 10764],
+  movie: [28, 53, 35, 18, 878, 27, 16, 10749, 99],
+};
+
+/** Poster width, matching Home's rows. */
+const POSTER_WIDTH = 'w-[38vw] shrink-0 sm:w-[24vw] md:w-[14vw] xl:w-[11vw]';
 
 function isoDate(time: number): string {
   const date = new Date(time);
@@ -71,8 +71,6 @@ export function ServicePage() {
   const [params, setParams] = useSearchParams();
   const mediaType: MediaType = params.get('type') === 'movie' ? 'movie' : 'tv';
   const genreId = Number(params.get('genre')) || null;
-  const sort = (SORTS.find((entry) => entry.value === params.get('sort'))?.value ??
-    'popular') as DiscoverSort;
   const { region, all, services, loading } = useStreamingServices();
   const provider = all.find((entry) => entry.id === providerId);
   useDocumentTitle(provider?.name ?? 'Services');
@@ -103,7 +101,6 @@ export function ServicePage() {
     ...tmdbQueries.discoverPage({ ...filters, sortBy: 'newest', releasedBefore: today, minVoteCount: 5 }),
     enabled: ready,
   });
-  const everything = useInfiniteQuery({ ...tmdbQueries.discover({ ...filters, sortBy: sort }), enabled: ready });
 
   const hero =
     [newShows.data, newMovies.data, shows.data, movies.data]
@@ -140,7 +137,9 @@ export function ServicePage() {
 
   const total = (shows.data?.totalResults ?? 0) + (movies.data?.totalResults ?? 0);
   const genres = genresFor(mediaType);
-  const kindLabel = mediaType === 'tv' ? 'Shows' : 'Movies';
+  const groups = genreId
+    ? []
+    : GROUP_GENRES[mediaType].flatMap((id) => genres.filter((genre) => genre.id === id));
 
   return (
     <main className="min-h-dvh bg-background pb-16 text-white">
@@ -232,7 +231,7 @@ export function ServicePage() {
         <section>
           <h2 className="text-2xl font-semibold">Most popular on {provider?.name}</h2>
           {top.data?.results.length ? (
-            <TopTen items={top.data.results.slice(0, 10)} />
+            <TopTen items={top.data.results.filter((item) => item.posterPath).slice(0, 10)} />
           ) : (
             <RowPlaceholder loading={top.isLoading} tall />
           )}
@@ -244,7 +243,7 @@ export function ServicePage() {
             <div className="mt-2">
               <ScrollRow className="gap-4 pt-2 pb-2" label={`New on ${provider?.name}`}>
                 {fresh.data.results.slice(0, 12).map((item) => (
-                  <BackdropCard key={item.id} item={item} badge={shortDate(item.releaseDate)} />
+                  <NewCard key={item.id} item={item} date={shortDate(item.releaseDate)} />
                 ))}
               </ScrollRow>
             </div>
@@ -253,23 +252,21 @@ export function ServicePage() {
           )}
         </section>
 
-        <section>
-          <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-2xl font-semibold">
-              All {kindLabel.toLowerCase()} on {provider?.name}
-            </h2>
-            <Dropdown
-              className="ml-auto"
-              ariaLabel="Sort"
-              value={sort}
-              options={SORTS.map((entry) => ({ value: entry.value, label: entry.label }))}
-              onChange={(value) => update({ sort: value === 'popular' ? null : value })}
+        {ready ? (
+          <>
+            <GroupRow
+              title="Top rated"
+              query={{ ...filters, sortBy: 'rating', minVoteCount: 100 }}
             />
-          </div>
-          <div className="mt-4">
-            <EverythingGrid query={everything} />
-          </div>
-        </section>
+            {groups.map((genre) => (
+              <GroupRow
+                key={`${mediaType}:${genre.id}`}
+                title={genre.name}
+                query={{ ...filters, genreIds: [genre.id], sortBy: 'popular' }}
+              />
+            ))}
+          </>
+        ) : null}
       </div>
     </main>
   );
@@ -379,21 +376,104 @@ function TopTen({ items }: { items: MediaSummary[] }) {
   );
 }
 
-function BackdropCard({ item, badge }: { item: MediaSummary; badge: string | null }) {
+/** Continue Watching's card: the title's logo over its still, with a
+ *  frosted pill for when it arrived on the service. */
+function NewCard({ item, date }: { item: MediaSummary; date: string | null }) {
+  const details = useQuery(tmdbQueries.details(item.mediaType, item.id));
+  const [logoFailed, setLogoFailed] = useState(false);
+  const logo = logoFailed ? '' : logoUrl(details.data?.logoPath ?? null, 'w300');
+
   return (
-    <Link href={titleHref(item)} className="group block w-64 shrink-0 cursor-pointer sm:w-[264px]">
-      <span className="relative block aspect-video overflow-hidden rounded-xl bg-surface transition-transform duration-500 ease-[cubic-bezier(.22,1,.36,1)] group-hover:-translate-y-1.5">
+    <Link
+      href={titleHref(item)}
+      aria-label={date ? `${item.title}, new ${date}` : item.title}
+      className="group block w-72 shrink-0 cursor-pointer sm:w-80"
+    >
+      <span className="relative block aspect-video overflow-hidden rounded-xl bg-white/[0.06] shadow-[0_12px_30px_rgba(0,0,0,0.28)]">
         {item.backdropPath ? (
-          <img src={backdropUrl(item.backdropPath, 'w780')} alt="" loading="lazy" className="h-full w-full object-cover" />
+          <img
+            src={backdropUrl(item.backdropPath, 'w780')}
+            alt=""
+            loading="lazy"
+            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+          />
         ) : null}
-        {badge ? (
-          <span className="absolute left-2.5 top-2.5 rounded-md bg-black/70 px-2 py-1 font-mono text-[11px] uppercase tracking-[0.08em]">
-            {badge}
+        <span className="absolute inset-0 bg-linear-to-t from-black/80 via-black/20 to-transparent" />
+        {date ? (
+          <span className="absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-xs font-semibold text-white backdrop-blur-md">
+            <span aria-hidden className="size-1.5 rounded-full bg-white" />
+            {date}
           </span>
         ) : null}
+        <span className="absolute inset-x-0 bottom-0 p-4">
+          {details.isLoading ? null : logo ? (
+            <img
+              src={logo}
+              alt=""
+              onError={() => setLogoFailed(true)}
+              className="max-h-16 max-w-[72%] object-contain object-left-bottom"
+            />
+          ) : (
+            <span className="line-clamp-2 max-w-[72%] text-xl font-semibold leading-tight text-white">
+              {item.title}
+            </span>
+          )}
+        </span>
       </span>
-      <span className="mt-2.5 block truncate font-semibold">{item.title}</span>
     </Link>
+  );
+}
+
+/** True once `ref` comes within a screen or so of the viewport, so rows far
+ *  down the page only fetch when the viewer heads their way. */
+function useNearViewport(ref: RefObject<HTMLElement | null>): boolean {
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || near) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) setNear(true);
+      },
+      { rootMargin: '800px 0px' },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [ref, near]);
+  return near;
+}
+
+/** A titled row of posters for one slice of the service's catalogue;
+ *  disappears when that slice is empty. */
+function GroupRow({ title, query }: { title: string; query: DiscoverQuery }) {
+  const ref = useRef<HTMLElement>(null);
+  const near = useNearViewport(ref);
+  const page = useQuery({ ...tmdbQueries.discoverPage(query), enabled: near });
+  const items = (page.data?.results ?? []).filter((item) => item.posterPath);
+  if (page.isSuccess && items.length === 0) return null;
+  if (page.isError) return null;
+
+  return (
+    <section ref={ref}>
+      <h2 className="text-2xl font-semibold">{title}</h2>
+      {items.length ? (
+        <div className="mt-2">
+          <ScrollRow className="gap-3 pt-2 pb-2" label={title}>
+            {items.slice(0, 16).map((item) => (
+              <MediaCard
+                key={`${item.mediaType}-${item.id}`}
+                item={item}
+                href={titleHref(item)}
+                linkComponent={Link}
+                className={POSTER_WIDTH}
+              />
+            ))}
+          </ScrollRow>
+        </div>
+      ) : (
+        <RowPlaceholder loading tall />
+      )}
+    </section>
   );
 }
 
@@ -408,57 +488,5 @@ function RowPlaceholder({ loading, tall = false }: { loading: boolean; tall?: bo
         />
       ))}
     </div>
-  );
-}
-
-function EverythingGrid({
-  query,
-}: {
-  query: UseInfiniteQueryResult<InfiniteData<DiscoverPage>>;
-}) {
-  const items = useMemo(() => {
-    const seen = new Set<number>();
-    return (query.data?.pages ?? [])
-      .flatMap((page) => page.results)
-      .filter((item) => (seen.has(item.id) ? false : (seen.add(item.id), true)));
-  }, [query.data]);
-
-  // Auto-load the next page when the grid's tail scrolls into view; the
-  // button below remains the keyboard-accessible path.
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const { hasNextPage, fetchNextPage } = query;
-  useEffect(() => {
-    const sentinel = sentinelRef.current;
-    if (!sentinel || !hasNextPage) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) void fetchNextPage();
-    });
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [hasNextPage, fetchNextPage]);
-
-  if (query.isLoading) return <MediaGridSkeleton />;
-  if (query.error) {
-    return <p className="text-sm text-faint">Could not load this catalogue.</p>;
-  }
-  if (!items.length) return <p className="text-sm text-faint">Nothing here for this genre.</p>;
-
-  return (
-    <>
-      <MediaGrid items={items} />
-      <div ref={sentinelRef} />
-      {query.hasNextPage ? (
-        <div className="mt-8 flex justify-center">
-          <button
-            type="button"
-            disabled={query.isFetchingNextPage}
-            onClick={() => void query.fetchNextPage()}
-            className="cursor-pointer rounded-full bg-control px-6 py-2.5 font-semibold transition-colors hover:bg-control-hover disabled:cursor-wait disabled:opacity-60"
-          >
-            {query.isFetchingNextPage ? 'Loading…' : 'Load more'}
-          </button>
-        </div>
-      ) : null}
-    </>
   );
 }

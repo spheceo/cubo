@@ -145,6 +145,11 @@
   subscription in the viewer's country (`with_watch_monetization_types=
   flatrate`), from TMDB's availability data. The services row hides when
   the metadata source has none (Cinemeta).
+- A service page is grouped rows like Home, not one long grid: most
+  popular (ranked), new (Continue Watching's card: logo over the still,
+  date pill), top rated, then genre rows that only fetch as they near the
+  viewport and drop out when empty. Picking a genre chip narrows the
+  first three rows to it and drops the genre rows.
 - Featured heroes rotate across eligible catalog titles (last decade only),
   using recent history shared across Home, Movies, and TV. Each page holds
   its choice for several hours across refreshes; never revert to always
