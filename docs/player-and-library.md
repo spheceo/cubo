@@ -158,6 +158,9 @@
   It opens on the viewer's episode, then stays where they leave it:
   picking an episode, or stepping with the arrows or keys, only nudges
   it by the least amount that shows that card in full.
+- On arrival the strip is measured before it paints and appears where
+  it sits (`.strip-reveal`: fade and a short rise), never sliding over
+  from a guessed position; its gliding switches on only after that.
 - Hero stills are TMDB's w1280 (the originals are about 2 MB each) and
   strip thumbnails w780, which stay sharp on 2x screens when the picked
   one scales up. Its images are not

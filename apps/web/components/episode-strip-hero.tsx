@@ -277,18 +277,31 @@ function Strip({
   // The first layout lands in place; only later picks animate.
   const [animate, setAnimate] = useState(false);
 
+  // Measured before the first paint, so the strip is laid out at its real
+  // width from the start instead of sliding over from a guessed one.
   useLayoutEffect(() => {
     const frame = frameRef.current;
     if (!frame) return;
+    setFrameWidth(frame.getBoundingClientRect().width);
     const observer = new ResizeObserver(([entry]) => setFrameWidth(entry.contentRect.width));
     observer.observe(frame);
     return () => observer.disconnect();
   }, []);
 
+  // Gliding switches on only once the strip has painted in place: the
+  // first layout never animates.
+  const measured = frameWidth > 0;
   useEffect(() => {
-    const id = requestAnimationFrame(() => setAnimate(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
+    if (!measured) return;
+    let second = 0;
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => setAnimate(true));
+    });
+    return () => {
+      cancelAnimationFrame(first);
+      cancelAnimationFrame(second);
+    };
+  }, [measured]);
 
   useEffect(() => {
     if (!focusAfterStep.current) return;
@@ -443,6 +456,8 @@ function Strip({
           select(activeIndex + (event.key === 'ArrowLeft' ? -1 : 1));
         }}
       >
+        {measured ? (
+        <div className="strip-reveal absolute inset-0">
         <div
           className="absolute bottom-0 left-0"
           style={{
@@ -526,6 +541,8 @@ function Strip({
             );
           })}
         </div>
+        </div>
+        ) : null}
       </div>
     </div>
   );

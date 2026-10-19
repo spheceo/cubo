@@ -290,3 +290,20 @@
     animation: none;
   }
 }
+
+/* Home's episode strip: it appears where it sits, rising softly into
+   place, rather than sliding across from where it was first laid out. */
+.strip-reveal {
+  animation: strip-reveal 900ms cubic-bezier(0.22, 1, 0.36, 1) 120ms both;
+}
+@keyframes strip-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .strip-reveal {
+    animation: none;
+  }
+}
