@@ -63,11 +63,16 @@ export function EpisodeStripHero({
   const foundIndex = list.findIndex((episode) => episode.episodeNumber === pickedNumber);
   const activeIndex = foundIndex === -1 ? 0 : foundIndex;
   const active: Episode | undefined = list[activeIndex];
-  const isEntryEpisode = active?.episodeNumber === entry.episode;
 
-  const image = isEntryEpisode || !active?.stillPath
-    ? backdropUrl(show.backdropPath, 'w1280')
-    : stillUrl(active.stillPath, 'original');
+  // The picked episode's own still, the one on screen from the start
+  // included; the show's backdrop only stands in for episodes without one.
+  // Nothing until the season loads, so the backdrop never flashes up
+  // before the episode's still.
+  const image = episodes.isLoading
+    ? ''
+    : active?.stillPath
+      ? stillUrl(active.stillPath, 'original')
+      : backdropUrl(show.backdropPath, 'w1280');
 
   usePreloadedStills(list, show, activeIndex);
 
