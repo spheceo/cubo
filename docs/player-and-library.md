@@ -155,8 +155,8 @@
   a transform would trap fixed overlays inside the page).
 - "Your services" are the services the viewer picked, in their order,
   stored locally (`lib/streaming-services.ts`) and managed in the
-  Library's "Your services" section (Home's row is only the tiles and an
-  Edit link there; no add tile, no modal). Any service TMDB lists in any country can
+  Library's "Your services" section (Home's row is only the tiles: no edit
+  link, no add tile, no modal). Any service TMDB lists in any country can
   be picked; TMDB ids that share a name are one service (Amazon Prime
   Video is 9 and 119). Until the viewer picks, the tiles are Netflix,
   Apple TV, Disney Plus and Amazon Prime Video. Tiles take the logo's own

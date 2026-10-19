@@ -1,11 +1,10 @@
-import { IoPencil } from 'react-icons/io5';
 import { Link } from '@/components/link';
 import { useStreamingServices } from '@/lib/use-streaming-services';
 import { ServiceTile } from './service-tile';
 
 /** Home's "Your services": a brand tile per subscription, each opening that
- *  service's page. Picking services happens in the Library; Edit links
- *  there. Hidden with none picked or no availability data. */
+ *  service's page. Picking services happens in the Library. Hidden with
+ *  none picked or no availability data. */
 export function ServicesRow({ className = '' }: { className?: string }) {
   const { services, loading, error } = useStreamingServices();
 
@@ -13,18 +12,9 @@ export function ServicesRow({ className = '' }: { className?: string }) {
 
   return (
     <section className={className} aria-labelledby="services-heading">
-      <div className="flex items-baseline gap-3">
-        <h2 id="services-heading" className="text-2xl font-semibold">
-          Your services
-        </h2>
-        <Link
-          href="/library#services"
-          className="ml-auto flex cursor-pointer items-center gap-1.5 text-sm font-semibold text-muted transition-colors hover:text-white"
-        >
-          <IoPencil size={14} />
-          Edit
-        </Link>
-      </div>
+      <h2 id="services-heading" className="text-2xl font-semibold">
+        Your services
+      </h2>
 
       <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         {loading
