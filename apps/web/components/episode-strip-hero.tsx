@@ -7,7 +7,7 @@ import {
   type MediaDetails,
 } from '@cubo/core';
 import { useQuery } from '@tanstack/react-query';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { IoChevronBack, IoChevronForward } from 'react-icons/io5';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
 import { Link } from '@/components/link';
@@ -91,6 +91,23 @@ export function EpisodeStripHero({
   // picked (bigger, lifted) card is underneath it. The first position is
   // set before paint and never animates.
   const [lift, setLift] = useState(0);
+  // A raised card only reaches as high as the play button row, so only
+  // that row has to clear it: the synopsis above is never in the way.
+  const sectionRef = useRef<HTMLElement>(null);
+  const [actionsRight, setActionsRight] = useState(TEXT_WIDTH);
+  const actionsObserver = useRef<ResizeObserver | null>(null);
+  const actionsRef = useCallback((row: HTMLDivElement | null) => {
+    actionsObserver.current?.disconnect();
+    if (!row) return;
+    const measure = () => {
+      const section = sectionRef.current?.getBoundingClientRect().left ?? 0;
+      const buttons = [...row.children].map((child) => child.getBoundingClientRect().right);
+      setActionsRight(Math.max(0, ...buttons) - section);
+    };
+    measure();
+    actionsObserver.current = new ResizeObserver(measure);
+    actionsObserver.current.observe(row);
+  }, []);
   const [liftAnimates, setLiftAnimates] = useState(false);
   useEffect(() => {
     const timer = window.setTimeout(() => setLiftAnimates(true), 400);
@@ -100,6 +117,7 @@ export function EpisodeStripHero({
 
   return (
     <section
+      ref={sectionRef}
       aria-label={`Continue watching ${show.title}`}
       className="relative flex min-h-[max(720px,92dvh)] flex-col overflow-hidden"
     >
@@ -127,6 +145,7 @@ export function EpisodeStripHero({
               show={show}
               episode={active}
               newEpisode={entry.newEpisode && active.episodeNumber === entry.episode}
+              actionsRef={actionsRef}
             />
           ) : (
             <div className="h-40" />
@@ -141,6 +160,7 @@ export function EpisodeStripHero({
           showId={show.id}
           onPick={setPicked}
           onLift={setLift}
+          clearRight={actionsRight}
         />
       ) : (
         <div className="h-60" />
@@ -203,10 +223,12 @@ function EpisodeDetails({
   show,
   episode,
   newEpisode,
+  actionsRef,
 }: {
   show: MediaDetails;
   episode: Episode;
   newEpisode: boolean;
+  actionsRef: (row: HTMLDivElement | null) => void;
 }) {
   const { library } = useCore();
   const row = historyForEpisode(
@@ -244,7 +266,7 @@ function EpisodeDetails({
       </div>
       {/* No reserved lines: a short synopsis lets the block sit lower. */}
       <p className="line-clamp-3">{episode.overview}</p>
-      <div className="flex flex-wrap items-center gap-4">
+      <div ref={actionsRef} className="flex flex-wrap items-center gap-4">
         <WatchPlayLink
           href={watchHref(show, episode.seasonNumber, episode.episodeNumber)}
           label={started ? `Continue ${code}` : `Watch ${code}`}
@@ -268,6 +290,7 @@ function Strip({
   showId,
   onPick,
   onLift,
+  clearRight,
 }: {
   episodes: Episode[];
   activeIndex: number;
@@ -275,6 +298,8 @@ function Strip({
   onPick: (episodeNumber: number) => void;
   /** How far the hero text must rise to clear the picked card. */
   onLift: (pixels: number) => void;
+  /** Right edge of the hero's button row, from the section's left. */
+  clearRight: number;
 }) {
   const { library } = useCore();
   const frameRef = useRef<HTMLDivElement>(null);
@@ -436,8 +461,7 @@ function Strip({
   const band = height * (PICKED_SCALE - 1) + PICKED_LIFT + PICKED_HEADROOM;
   const cardLeft = gutter - scroll + activeIndex * stride;
   const cardRight = cardLeft + width + grow;
-  const textRight = gutter + Math.min(TEXT_WIDTH, frameWidth - gutter * 2);
-  const covered = measured && cardLeft < textRight + 24 && cardRight > gutter - 24;
+  const covered = measured && cardLeft < clearRight + 4 && cardRight > gutter;
   const lift = covered ? Math.round(height * (PICKED_SCALE - 1) + PICKED_LIFT + 12) : 0;
   useLayoutEffect(() => {
     onLift(lift);

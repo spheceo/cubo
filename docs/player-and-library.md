@@ -161,7 +161,9 @@
 - The hero text sits just above the thumbnails. The band above them is
   only for the picked card growing and lifting, so the strip pulls up
   under the text (clicks pass through the empty band) and the text rises,
-  gliding with the strip, only while the picked card is underneath it.
+  gliding with the strip, only while the picked card is under the play
+  button row: a raised card only reaches that high, so a card beside the
+  buttons (even under the synopsis's width) leaves the text where it is.
   The synopsis reserves no lines, so a short one lets the block sit
   lower. The strip pages with round arrows floating at its edges on
   hover (no fading panel: it would cover the picked card at the edge);
