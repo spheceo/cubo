@@ -162,8 +162,10 @@
   only for the picked card growing and lifting, so the strip pulls up
   under the text (clicks pass through the empty band) and the text rises,
   gliding with the strip, only while the picked card is underneath it.
-  The strip pages with Home rows' fading edge arrows on hover; arrow
-  keys still step episodes.
+  The synopsis reserves no lines, so a short one lets the block sit
+  lower. The strip pages with round arrows floating at its edges on
+  hover (no fading panel: it would cover the picked card at the edge);
+  arrow keys still step episodes.
 - On arrival the strip is measured before it paints and appears where
   it sits (`.strip-reveal`: fade and a short rise), never sliding over
   from a guessed position; its gliding switches on only after that.

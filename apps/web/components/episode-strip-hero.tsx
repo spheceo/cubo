@@ -242,7 +242,8 @@ function EpisodeDetails({
           </div>
         ))}
       </div>
-      <p className="line-clamp-3 min-h-[4.5rem]">{episode.overview}</p>
+      {/* No reserved lines: a short synopsis lets the block sit lower. */}
+      <p className="line-clamp-3">{episode.overview}</p>
       <div className="flex flex-wrap items-center gap-4">
         <WatchPlayLink
           href={watchHref(show, episode.seasonNumber, episode.episodeNumber)}
@@ -568,7 +569,9 @@ function Strip({
   );
 }
 
-/** Home rows' fading edge arrow, paging the strip; shown on hover. */
+/** A round arrow floating over the strip's edge, paging it; shown on
+ *  hover. No fading panel behind it: one would sit over the picked card
+ *  when that card is at the edge and look like it cut its corners. */
 function StripEdge({
   side,
   enabled,
@@ -590,16 +593,12 @@ function StripEdge({
       tabIndex={-1}
       onPointerDown={(event) => event.stopPropagation()}
       onClick={() => onPage(left ? -1 : 1)}
-      className={`absolute z-10 hidden w-28 cursor-pointer items-center transition-opacity duration-200 md:flex ${
-        left ? 'left-0 justify-start pl-4' : 'right-0 justify-end pr-4'
+      className={`absolute z-10 hidden cursor-pointer items-center transition-opacity duration-200 md:flex ${
+        left ? 'left-3' : 'right-3'
       } ${enabled ? 'pointer-events-auto opacity-0 group-hover/strip:opacity-100' : 'pointer-events-none opacity-0'}`}
-      style={{
-        bottom,
-        height,
-        background: `linear-gradient(to ${left ? 'right' : 'left'}, var(--color-background) 30%, transparent)`,
-      }}
+      style={{ bottom, height }}
     >
-      <span className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-white/[0.08] text-white backdrop-blur-sm transition-colors hover:bg-white/[0.14]">
+      <span className="flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-black/50 text-white backdrop-blur-md transition-colors hover:bg-black/70">
         {left ? <IoChevronBack size={18} /> : <IoChevronForward size={18} />}
       </span>
     </button>
