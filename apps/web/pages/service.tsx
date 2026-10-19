@@ -19,6 +19,7 @@ import {
 import { useEffect, useMemo, useRef } from 'react';
 import { IoArrowBack, IoPlay } from 'react-icons/io5';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
+import { ScrollRow } from '@cubo/ui';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { CatalogError } from '@/components/catalog-error';
 import { useCore } from '@/components/core-provider';
@@ -240,10 +241,12 @@ export function ServicePage() {
         <section>
           <h2 className="text-2xl font-semibold">New on {provider?.name}</h2>
           {fresh.data?.results.length ? (
-            <div className="no-scrollbar -mx-6 mt-4 flex gap-4 overflow-x-auto px-6 sm:-mx-10 sm:px-10">
-              {fresh.data.results.slice(0, 12).map((item) => (
-                <BackdropCard key={item.id} item={item} badge={shortDate(item.releaseDate)} />
-              ))}
+            <div className="mt-2">
+              <ScrollRow className="gap-4 pt-2 pb-2" label={`New on ${provider?.name}`}>
+                {fresh.data.results.slice(0, 12).map((item) => (
+                  <BackdropCard key={item.id} item={item} badge={shortDate(item.releaseDate)} />
+                ))}
+              </ScrollRow>
             </div>
           ) : (
             <RowPlaceholder loading={fresh.isLoading} />
@@ -349,13 +352,14 @@ function GenreChip({ label, active, onClick }: { label: string; active: boolean;
 /** Posters behind outlined rank numerals. */
 function TopTen({ items }: { items: MediaSummary[] }) {
   return (
-    <ol className="no-scrollbar -mx-6 mt-4 flex gap-1.5 overflow-x-auto px-6 pb-2 sm:-mx-10 sm:px-10">
-      {items.map((item, index) => (
-        <li key={item.id} className="shrink-0">
+    <div className="mt-2">
+      <ScrollRow className="gap-1.5 pt-2 pb-2" label="Ranked">
+        {items.map((item, index) => (
           <Link
+            key={item.id}
             href={titleHref(item)}
             aria-label={`${index + 1}. ${item.title}`}
-            className="group flex cursor-pointer items-end"
+            className="group flex shrink-0 cursor-pointer items-end"
           >
             <span
               aria-hidden
@@ -369,9 +373,9 @@ function TopTen({ items }: { items: MediaSummary[] }) {
               ) : null}
             </span>
           </Link>
-        </li>
-      ))}
-    </ol>
+        ))}
+      </ScrollRow>
+    </div>
   );
 }
 

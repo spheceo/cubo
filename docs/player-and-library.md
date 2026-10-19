@@ -97,6 +97,10 @@
   view, so a right-side drawer snaps open instead of sliding.
 - Native scrolling only — Lenis was removed on purpose; do not reintroduce
   scroll-hijacking.
+- Sideways rows use `ScrollRow` (`@cubo/ui`): it scrolls sideways only
+  (a bare `overflow-x-auto` also scrolls vertically by whatever pokes out,
+  so a trackpad swipe wobbles it), keeps end-of-row swipes from turning
+  into browser back/forward, and pages with the fading edge arrows.
 
 ## Library and browsing
 
