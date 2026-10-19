@@ -146,7 +146,8 @@
   slowly (about 0.9 s): keep new motion off layout properties. Keep the
   hero sparse: episode number and name under each thumbnail, nothing
   more, and no counters. Its text is FeaturedHero's: the show's title,
-  then "Episode name • S1 E10 • 21m left", the synopsis, and
+  then "Episode name • S1 E10 • 21m left" on one line (a long name
+  truncates, full name on hover; the rest never wraps), the synopsis, and
   "Continue S1 E10" / "Watch S1 E8".
 - `CrossfadeImage` fades each new picture in with the Web Animations API
   after `decode()`, never by flipping a class on load: a cached picture

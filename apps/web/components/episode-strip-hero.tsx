@@ -210,10 +210,14 @@ function EpisodeDetails({
 
   return (
     <div className="hero-swap space-y-5">
-      <div className="flex flex-wrap items-center gap-2">
-        <h2 className="text-xl font-semibold">{episode.name}</h2>
+      {/* One line, always: a long episode name gives way (ellipsis, full name
+          on hover) so the episode and time never wrap onto a line of their own. */}
+      <div className="flex items-center gap-2">
+        <h2 className="min-w-0 truncate text-xl font-semibold" title={episode.name}>
+          {episode.name}
+        </h2>
         {details.map((detail) => (
-          <div key={detail} className="flex items-center gap-2">
+          <div key={detail} className="flex shrink-0 items-center gap-2 whitespace-nowrap">
             <p>•</p>
             <p>{detail}</p>
           </div>
