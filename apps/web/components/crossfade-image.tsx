@@ -58,7 +58,7 @@ function FadeLayer({
       onTransitionEnd={(event) => {
         if (event.propertyName === 'opacity' && loaded) onShown();
       }}
-      className={`absolute inset-0 h-full w-full object-cover motion-safe:transition-[opacity,transform] motion-safe:duration-[700ms,2200ms] motion-safe:ease-[ease,cubic-bezier(.22,1,.36,1)] ${
+      className={`absolute inset-0 h-full w-full object-cover motion-safe:transition-[opacity,transform] motion-safe:duration-[1000ms,2600ms] motion-safe:ease-[ease,cubic-bezier(.22,1,.36,1)] ${
         loaded ? 'scale-100 opacity-100' : 'scale-[1.06] opacity-0'
       }`}
     />

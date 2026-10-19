@@ -77,10 +77,12 @@ function animateRemoveFromGrid(grid: HTMLElement, card: HTMLElement): Promise<vo
   });
 }
 
-/** Continue Watching's cards, shared by the row and the home hero. */
-export function useContinueWatchingEntries(
-  mediaType?: LibraryItem['mediaType'],
-): ContinueWatchingEntry[] {
+/** Continue Watching's cards, shared by the row and the home hero.
+ *  `settled` once the shows whose cards hang on TMDB details have them. */
+export function useContinueWatching(mediaType?: LibraryItem['mediaType']): {
+  entries: ContinueWatchingEntry[];
+  settled: boolean;
+} {
   const { library } = useCore();
   const candidates = continueWatchingCandidates(library?.history, mediaType);
   // A finished episode's card depends on what has aired since.
@@ -89,7 +91,10 @@ export function useContinueWatchingEntries(
   const detailsById = new Map(
     shows.flatMap((query) => (query.data ? [[query.data.id, query.data] as const] : [])),
   );
-  return continueWatchingEntries(candidates, (id) => detailsById.get(id));
+  return {
+    entries: continueWatchingEntries(candidates, (id) => detailsById.get(id)),
+    settled: shows.every((query) => !query.isLoading),
+  };
 }
 
 export function ContinueWatching({
@@ -104,7 +109,7 @@ export function ContinueWatching({
   excludeKey?: string;
 }) {
   const { removeFromHistory, connection } = useCore();
-  const items = useContinueWatchingEntries(mediaType);
+  const { entries: items } = useContinueWatching(mediaType);
 
   // Warm the first few play targets so "continue" starts at once: Core
   // fetches metadata, header and probe, then parks each torrent.

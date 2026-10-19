@@ -32,7 +32,10 @@ function SiteLayout() {
   return (
     <>
       <SiteHeader />
-      <Outlet />
+      {/* Keyed by path so each page (and each service) fades in fresh. */}
+      <div key={pathname} className="route-enter">
+        <Outlet />
+      </div>
       {!isTitlePage ? <SiteFooter /> : null}
     </>
   );

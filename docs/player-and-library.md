@@ -123,16 +123,23 @@
   history, not just Continue Watching, built from the cached TMDB details
   and next-episode season queries. Keep it to Week / Month / List views.
 - Home's hero is the episode strip while a show is in progress: the
-  first Continue Watching card that is a show with an episode to play
-  (so a new episode leads), with that season's aired episodes along the
-  bottom (`episode-strip-hero.tsx`). Picking an episode moves the hero
+  first Continue Watching card that is a show with an episode out to
+  play (so a new episode leads) and that the viewer is really into
+  (`investedInShow`: an episode finished, or 20 minutes in across its
+  episodes; ten seconds of a pilot does not count), with that season's
+  aired episodes along the bottom (`episode-strip-hero.tsx`). A show
+  caught up and waiting on its next episode gives way to the next one. Picking an episode moves the hero
   onto it without leaving the page; Play starts the picked one. That
   show's card stays out of the Continue Watching row below. Without one,
   Home falls back to the rotating featured hero. The hero waits for the
   library so it never swaps a moment after the page appears.
 - The strip and backdrop move on transforms and crossfades only
-  (`CrossfadeImage` keeps the old picture until the new one covers it);
-  keep new motion there off layout properties.
+  (`CrossfadeImage` keeps the old picture until the new one covers it),
+  slowly (about 0.9 s): keep new motion off layout properties. Keep the
+  hero sparse: episode number and name under each thumbnail, nothing
+  more, and no counters or extra meta beside the play button.
+- Pages fade in when the path changes (`.route-enter`, opacity only:
+  a transform would trap fixed overlays inside the page).
 - "Your services" are the services the viewer picked, in their order,
   stored locally (`lib/streaming-services.ts`) and managed in the
   Library's "Your services" section (Home's Edit and Add tiles link
@@ -153,11 +160,13 @@
   per request, and without a country it ignores the filter. A service in
   none of those reads its own leading countries. The services row hides
   when the metadata source has none (Cinemeta).
-- A service page is grouped rows like Home, not one long grid: Top 10
-  (ranked, viewer's country), new (Continue Watching's card: logo over the still,
-  date pill), top rated, then genre rows that only fetch as they near the
-  viewport and drop out when empty. Picking a genre chip narrows the
-  first three rows to it and drops the genre rows.
+- A service page is a few grouped rows, not one long grid: Top 10
+  (ranked, viewer's country), new (Continue Watching's card: logo over
+  the still, date pill), top rated, and two genre rows that only fetch
+  as they near the viewport and drop out when empty. Keep it to that;
+  the genre menu reaches the rest. Picking a genre narrows the first
+  three rows to it and drops the genre rows. The header is the logo and
+  a menu to switch between the viewer's services.
 - Featured heroes rotate across eligible catalog titles (last decade only),
   using recent history shared across Home, Movies, and TV. Each page holds
   its choice for several hours across refreshes; never revert to always

@@ -17,6 +17,7 @@ import { IoMdInformationCircleOutline } from 'react-icons/io';
 import { MediaCard, ScrollRow } from '@cubo/ui';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { CatalogError } from '@/components/catalog-error';
+import { Dropdown } from '@/components/dropdown';
 import { useCore } from '@/components/core-provider';
 import { Link } from '@/components/link';
 import { HeroSkeleton } from '@/components/page-skeletons';
@@ -37,10 +38,11 @@ import { useStreamingServices } from '@/lib/use-streaming-services';
 /** How far back "new" reaches for the hero. */
 const HERO_RECENT_DAYS = 120;
 
-/** Genre rows under the ranked, new and top-rated ones, in this order. */
+/** Genre rows under the ranked, new and top-rated ones, in this order.
+ *  Kept short: the genre menu reaches the rest. */
 const GROUP_GENRES: Record<MediaType, number[]> = {
-  tv: [80, 18, 35, 10765, 10759, 9648, 16, 99, 10764],
-  movie: [28, 53, 35, 18, 878, 27, 16, 10749, 99],
+  tv: [80, 35],
+  movie: [28, 35],
 };
 
 /** Poster width, matching Home's rows. */
@@ -190,15 +192,21 @@ export function ServicePage() {
     );
   }
 
-  const total = shows.total + movies.total;
   const genres = genresFor(mediaType);
+  // Hop between the viewer's services from the header; the one on screen
+  // stays in the list even when it is not one of theirs.
+  const switchOptions = [
+    ...(provider && !services.includes(provider) ? [provider] : []),
+    ...services,
+  ].map((entry) => ({ value: entry.id, label: entry.name }));
+  const switchable = switchOptions.length > 1;
   const groups = genreId
     ? []
     : GROUP_GENRES[mediaType].flatMap((id) => genres.filter((genre) => genre.id === id));
 
   return (
     <main className="min-h-dvh bg-background pb-16 text-white">
-      <div className="relative h-[78dvh] min-h-[600px] overflow-hidden">
+      <div className="relative h-[72dvh] min-h-[560px] overflow-hidden">
         {heroLoading || !provider ? (
           <HeroSkeleton />
         ) : hero ? (
@@ -215,38 +223,20 @@ export function ServicePage() {
             <IoArrowBack size={18} />
           </button>
           {provider?.logoPath ? (
-            <img src={logoUrl(provider.logoPath, 'w300')} alt="" className="h-12 w-12 rounded-xl" />
+            <img src={logoUrl(provider.logoPath, 'w300')} alt="" className="h-10 w-10 rounded-[10px]" />
           ) : null}
-          <div>
-            <h1 className="text-xl font-semibold tracking-[-0.02em]">{provider?.name ?? ' '}</h1>
-            <p className="text-sm text-white/60">
-              {total ? `${total.toLocaleString()}+ titles` : '\u00a0'}
-            </p>
-          </div>
-          {services.length > 1 ? (
-            <nav aria-label="Your services" className="ml-auto hidden items-center gap-2.5 sm:flex">
-              {services.map((entry) => (
-                <Link
-                  key={entry.id}
-                  href={`/services/${entry.id}${mediaType === 'movie' ? '?type=movie' : ''}`}
-                  aria-label={entry.name}
-                  aria-current={entry.id === providerId ? 'page' : undefined}
-                  className={`block cursor-pointer rounded-[10px] transition-opacity ${
-                    entry.id === providerId
-                      ? 'shadow-[0_0_0_2px_#0a0a0a,0_0_0_4px_#fff]'
-                      : 'opacity-55 hover:opacity-100'
-                  }`}
-                >
-                  {entry.logoPath ? (
-                    <img src={logoUrl(entry.logoPath, 'w300')} alt="" className="h-10 w-10 rounded-[10px]" />
-                  ) : (
-                    <span className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-control text-xs font-semibold">
-                      {entry.name.slice(0, 2)}
-                    </span>
-                  )}
-                </Link>
-              ))}
-            </nav>
+          <h1 className={switchable ? 'sr-only' : 'text-lg font-semibold tracking-[-0.02em]'}>
+            {provider?.name ?? ''}
+          </h1>
+          {switchable && provider ? (
+            <Dropdown
+              ariaLabel="Service"
+              value={provider.id}
+              options={switchOptions}
+              onChange={(next) =>
+                navigate(`/services/${next}${mediaType === 'movie' ? '?type=movie' : ''}`)
+              }
+            />
           ) : null}
         </div>
       </div>
@@ -269,18 +259,15 @@ export function ServicePage() {
               </button>
             ))}
           </div>
-          <span aria-hidden className="mx-1.5 h-6 w-px bg-line-strong" />
-          <div className="no-scrollbar -mx-1 flex min-w-0 flex-1 gap-2 overflow-x-auto px-1">
-            <GenreChip label="All" active={genreId == null} onClick={() => update({ genre: null })} />
-            {genres.map((genre) => (
-              <GenreChip
-                key={genre.id}
-                label={genre.name}
-                active={genreId === genre.id}
-                onClick={() => update({ genre: String(genre.id) })}
-              />
-            ))}
-          </div>
+          <Dropdown
+            ariaLabel="Genre"
+            value={genreId ?? 0}
+            options={[
+              { value: 0, label: 'All genres' },
+              ...genres.map((genre) => ({ value: genre.id, label: genre.name })),
+            ]}
+            onChange={(value) => update({ genre: value ? String(value) : null })}
+          />
         </div>
 
         <section>
@@ -365,7 +352,7 @@ function ServiceHero({ item, providerName }: { item: MediaSummary; providerName:
           <p className="font-mono text-xs uppercase tracking-[0.14em] text-white/70">
             New on {providerName}
           </p>
-          <h2 className="mt-3 text-5xl font-medium leading-none tracking-[-0.04em] sm:text-7xl">
+          <h2 className="mt-3 text-5xl font-medium leading-none tracking-[-0.04em] sm:text-6xl">
             {item.title}
           </h2>
           <p className="mt-4 text-muted">
@@ -373,7 +360,7 @@ function ServiceHero({ item, providerName }: { item: MediaSummary; providerName:
               .filter(Boolean)
               .join(' · ')}
           </p>
-          <p className="mt-3 line-clamp-3 text-base leading-relaxed text-faint sm:text-lg">{item.overview}</p>
+          <p className="mt-2 line-clamp-2 max-w-lg text-[15px] leading-6 text-white/55">{item.overview}</p>
           <div className="mt-6 flex flex-wrap items-center gap-3">
             <Link
               href={playHref}
@@ -394,21 +381,6 @@ function ServiceHero({ item, providerName }: { item: MediaSummary; providerName:
         </div>
       </div>
     </>
-  );
-}
-
-function GenreChip({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      aria-pressed={active}
-      onClick={onClick}
-      className={`h-9 shrink-0 cursor-pointer rounded-full px-4 text-sm font-semibold whitespace-nowrap transition-colors ${
-        active ? 'bg-white text-black' : 'bg-surface text-white hover:bg-control'
-      }`}
-    >
-      {label}
-    </button>
   );
 }
 

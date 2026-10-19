@@ -17,6 +17,8 @@ export function useLogoColor(src: string): string | null {
     let cancelled = false;
     const image = new Image();
     image.crossOrigin = 'anonymous';
+    // Its own cache entry: the same logo shown elsewhere was fetched without
+    // CORS, and the browser would reuse that copy and refuse to read it.
     image.onload = () => {
       let sampled: string | null = null;
       try {
@@ -33,7 +35,8 @@ export function useLogoColor(src: string): string | null {
       colors.set(src, sampled);
       if (!cancelled) setColor(sampled);
     };
-    image.src = src;
+    image.onerror = () => colors.set(src, null);
+    image.src = `${src}?sample`;
     return () => {
       cancelled = true;
     };
@@ -63,7 +66,6 @@ export function ServiceTile({
         <img
           src={src}
           alt=""
-          crossOrigin="anonymous"
           loading="lazy"
           className="aspect-square h-full object-contain [mask-image:radial-gradient(circle,#000_52%,transparent_71%)]"
         />

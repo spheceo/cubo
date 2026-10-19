@@ -26,7 +26,11 @@ const PICKED_LIFT = 12;
 /** Room above the picked thumbnail for its ring and rounded corners; the
  *  strip clips its overflow so neighbours can bleed off the sides. */
 const PICKED_HEADROOM = 16;
+/** The episode name under each thumbnail. */
+const LABEL_HEIGHT = 32;
 const EASE = 'cubic-bezier(.22,1,.36,1)';
+/** Slow and smooth: the strip glides rather than snaps. */
+const MOVE_MS = 900;
 
 /**
  * Home's hero while a show is in progress: the show fills the screen with its
@@ -68,21 +72,21 @@ export function EpisodeStripHero({
       className="relative flex h-[max(720px,92dvh)] flex-col overflow-hidden"
     >
       <CrossfadeImage src={image} />
-      <div className="pointer-events-none absolute inset-0 bg-linear-to-r from-background/95 via-background/55 via-40% to-transparent to-75%" />
-      <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-background/80 via-25% to-transparent to-55%" />
+      <div className="pointer-events-none absolute inset-0 bg-linear-to-r from-background via-background/70 via-35% to-transparent to-70%" />
+      <div className="pointer-events-none absolute inset-0 bg-linear-to-t from-background via-background/85 via-30% to-transparent to-60%" />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-40 bg-linear-to-b from-background/80 to-transparent" />
 
       <div className="relative z-10 flex flex-1 flex-col justify-end px-6 sm:px-10">
         <p className="font-mono text-xs uppercase tracking-[0.14em] text-white/70">
           {entry.newEpisode ? 'New episode' : 'Continue watching'}
         </p>
-        <h1 className="mt-3 max-w-[14ch] text-5xl font-medium leading-none tracking-[-0.04em] sm:text-7xl lg:text-[5.5rem]">
+        <h1 className="mt-3 max-w-[14ch] text-5xl font-medium leading-none tracking-[-0.04em] sm:text-6xl lg:text-7xl">
           {show.title}
         </h1>
         {active ? (
           <EpisodeDetails key={active.episodeNumber} show={show} episode={active} />
         ) : (
-          <div className="h-[11.5rem]" />
+          <div className="h-36" />
         )}
       </div>
 
@@ -111,34 +115,22 @@ function EpisodeDetails({ show, episode }: { show: MediaDetails; episode: Episod
   );
   const finished = row ? completedNearEnd(row) : false;
   const started = row != null && !finished && row.positionSeconds >= 5;
-  const minutesLeft = started
-    ? Math.max(1, Math.round((row.durationSeconds - row.positionSeconds) / 60))
-    : null;
-  const label = started
-    ? `Resume episode ${episode.episodeNumber}`
-    : finished
-      ? 'Watch again'
-      : `Play episode ${episode.episodeNumber}`;
-  const meta = started
-    ? `${minutesLeft} min left`
-    : finished
-      ? 'Watched'
-      : episode.runtime
-        ? `${episode.runtime} min`
-        : null;
+  // The episode line above already names it; the button only says what
+  // pressing it does, and its bar shows how far in.
+  const label = started ? 'Resume' : finished ? 'Watch again' : 'Play';
 
   return (
     <div className="hero-swap">
-      <p className="mt-5 text-lg tracking-[-0.01em] sm:text-[1.375rem]">
+      <p className="mt-4 text-lg tracking-[-0.01em]">
         <span className="text-faint">
           S{episode.seasonNumber} · E{episode.episodeNumber}
         </span>
         <span className="ml-3">{episode.name}</span>
       </p>
-      <p className="mt-2 line-clamp-2 h-[3.25rem] max-w-xl text-base leading-[1.45] text-muted sm:h-14 sm:text-lg">
+      <p className="mt-1.5 line-clamp-2 h-12 max-w-lg text-[15px] leading-6 text-white/55">
         {episode.overview}
       </p>
-      <div className="mt-6 flex items-center gap-3">
+      <div className="mt-5 flex items-center gap-3">
         <Link
           href={watchHref(show, episode.seasonNumber, episode.episodeNumber)}
           className="relative flex h-12 cursor-pointer items-center gap-2.5 overflow-hidden rounded-full bg-white px-6 font-semibold text-black transition-colors hover:bg-white/85"
@@ -160,7 +152,6 @@ function EpisodeDetails({ show, episode }: { show: MediaDetails; episode: Episod
         >
           <IoMdInformationCircleOutline size={25} />
         </Link>
-        {meta ? <span className="ml-1 text-sm text-faint">{meta}</span> : null}
       </div>
     </div>
   );
@@ -219,15 +210,12 @@ function Strip({
   const stripWidth = (episodes.length - 1) * stride + width + grow;
   const maxScroll = Math.max(0, stripWidth + gutter * 2 - frameWidth);
   const scroll = Math.min(activeIndex * stride, frameWidth ? maxScroll : activeIndex * stride);
-  const transition = animate ? `transform 700ms ${EASE}` : 'none';
+  const transition = animate ? `transform ${MOVE_MS}ms ${EASE}` : 'none';
   const active = episodes[activeIndex];
 
   return (
     <div className="relative z-10 pb-8">
       <div className="mb-4 flex items-center justify-end gap-3 px-6 sm:px-10">
-        <span className="font-mono text-xs tracking-[0.12em] text-white/70 [text-shadow:0_1px_8px_rgb(0_0_0/0.6)]">
-          {String(active?.episodeNumber ?? 0).padStart(2, '0')} / {String(episodes.at(-1)?.episodeNumber ?? 0).padStart(2, '0')}
-        </span>
         <button
           type="button"
           aria-label="Previous episode"
@@ -252,8 +240,8 @@ function Strip({
         ref={frameRef}
         role="group"
         aria-label="Episodes"
-        className="relative overflow-hidden"
-        style={{ height: height * PICKED_SCALE + PICKED_LIFT + 52 + PICKED_HEADROOM }}
+        className="relative overflow-hidden [mask-image:linear-gradient(to_right,transparent,#000_3%,#000_97%,transparent)]"
+        style={{ height: height * PICKED_SCALE + PICKED_LIFT + LABEL_HEIGHT + PICKED_HEADROOM }}
         onKeyDown={(event) => {
           if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
           event.preventDefault();
@@ -264,7 +252,7 @@ function Strip({
         <div
           className="absolute bottom-0 left-0"
           style={{
-            height: height + 52,
+            height: height + LABEL_HEIGHT,
             transform: `translateX(${gutter - scroll}px)`,
             transition,
           }}
@@ -304,10 +292,10 @@ function Strip({
                     transform: isActive
                       ? `translateY(-${PICKED_LIFT}px) scale(${PICKED_SCALE})`
                       : 'none',
-                    opacity: isActive ? 1 : index < activeIndex ? 0.45 : 0.8,
+                    opacity: isActive ? 1 : index < activeIndex ? 0.3 : 0.55,
                     boxShadow: isActive ? '0 0 0 2px #fff' : '0 0 0 0 transparent',
                     transition: animate
-                      ? `transform 700ms ${EASE}, opacity 500ms ease, box-shadow 500ms ease`
+                      ? `transform ${MOVE_MS}ms ${EASE}, opacity 700ms ease, box-shadow 700ms ease`
                       : 'none',
                   }}
                 >
@@ -328,15 +316,13 @@ function Strip({
                     </span>
                   ) : null}
                 </div>
-                <span className="mt-3.5 block font-mono text-[11px] uppercase tracking-[0.12em] text-faint">
-                  Episode {String(episode.episodeNumber).padStart(2, '0')}
-                </span>
                 <span
-                  className={`mt-1 block truncate text-[15px] transition-colors duration-300 sm:text-base ${
-                    isActive ? 'text-white' : 'text-muted'
+                  className={`mt-3 block truncate text-sm transition-colors duration-500 ${
+                    isActive ? 'text-white' : 'text-faint'
                   }`}
                   style={{ width: isActive ? width + grow : width }}
                 >
+                  <span className="mr-1.5 tabular-nums text-faint">{episode.episodeNumber}</span>
                   {episode.name}
                 </span>
               </button>

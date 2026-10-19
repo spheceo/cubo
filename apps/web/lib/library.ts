@@ -94,6 +94,23 @@ export function completedNearEnd(item: LibraryItem): boolean {
   );
 }
 
+/** Playhead time, summed across a show's episodes, that counts as being
+ *  into it when no episode is finished yet. */
+export const INVESTED_SHOW_SECONDS = 20 * 60;
+
+/** The viewer is really watching this show, not just peeked at it: an
+ *  episode finished, or twenty minutes in across its episodes. Ten seconds
+ *  of episode one does not earn the Home hero. */
+export function investedInShow(history: LibraryItem[] | undefined, showId: number): boolean {
+  let seconds = 0;
+  for (const row of history ?? []) {
+    if (row.mediaType !== 'tv' || row.mediaId !== showId) continue;
+    if (completedNearEnd(row)) return true;
+    seconds += row.positionSeconds;
+  }
+  return seconds >= INVESTED_SHOW_SECONDS;
+}
+
 /** How many Continue Watching cards a row shows. */
 export const CONTINUE_WATCHING_LIMIT = 8;
 

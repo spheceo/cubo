@@ -5,6 +5,7 @@ import {
   continueWatchingCandidates,
   continueWatchingEntries,
   historyForEpisode,
+  investedInShow,
   latestHistoryForTitle,
   watchHistoryItems,
 } from './library';
@@ -261,4 +262,25 @@ test('finishing the final episode of an ended show finishes it, even watched out
 
 test('a finished show waits for its details before it gets a card', () => {
   assert.deepEqual(entriesFor([finishedEpisode(1, 1, 3, daysAgoMs(1))], []), []);
+});
+
+test('a show earns the Home hero once an episode is finished or twenty minutes are in', () => {
+  const peek = item({ key: 'tv:7:1:1', mediaId: 7, lastWatchedAt: 1, positionSeconds: 10, progress: 0.003 });
+  assert.equal(investedInShow([peek], 7), false);
+
+  const twoEpisodes = [
+    item({ key: 'tv:7:1:1', mediaId: 7, lastWatchedAt: 1, positionSeconds: 700 }),
+    item({ key: 'tv:7:1:2', mediaId: 7, episode: 2, lastWatchedAt: 2, positionSeconds: 600 }),
+  ];
+  assert.equal(investedInShow(twoEpisodes, 7), true);
+
+  const finished = item({
+    key: 'tv:7:1:1',
+    mediaId: 7,
+    lastWatchedAt: 1,
+    positionSeconds: 3590,
+    progress: 0.998,
+  });
+  assert.equal(investedInShow([finished, peek], 7), true);
+  assert.equal(investedInShow([finished], 8), false);
 });

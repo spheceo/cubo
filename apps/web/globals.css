@@ -244,7 +244,7 @@
 /* Home hero: the picked episode's details rise into place as the strip
    moves, rather than snapping. */
 .hero-swap {
-  animation: hero-swap 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: hero-swap 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 @keyframes hero-swap {
   from {
@@ -254,6 +254,23 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .hero-swap {
+    animation: none;
+  }
+}
+
+/* Moving between pages: the new page fades in rather than cutting. Opacity
+   only: a transform here would trap the page's fixed overlays (dialogs,
+   the header) inside the animating wrapper. */
+.route-enter {
+  animation: route-enter 600ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes route-enter {
+  from {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .route-enter {
     animation: none;
   }
 }

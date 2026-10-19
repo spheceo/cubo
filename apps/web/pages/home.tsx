@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { CatalogError } from '@/components/catalog-error';
-import { ContinueWatching, useContinueWatchingEntries } from '@/components/continue-watching';
+import { ContinueWatching, useContinueWatching } from '@/components/continue-watching';
 import { useCore } from '@/components/core-provider';
 import { EpisodeStripHero } from '@/components/episode-strip-hero';
 import { FeaturedHero } from '@/components/featured-hero';
@@ -9,6 +9,7 @@ import { MotionReveal } from '@/components/motion-reveal';
 import { HeroSkeleton, MediaRowsSkeleton } from '@/components/page-skeletons';
 import { ServicesRow } from '@/components/services-row';
 import { WatchLaterList } from '@/components/watch-later-list';
+import { investedInShow } from '@/lib/library';
 import { useFeaturedTitle } from '@/lib/use-featured-title';
 import { tmdbQueries } from '@/lib/queries';
 import { useDocumentTitle } from '@/lib/use-document-title';
@@ -28,15 +29,17 @@ export function HomePage() {
     enabled: featuredId != null,
   });
 
-  // A show in progress takes the hero: the most recent one with an episode
-  // to play (new episodes lead), shown with its season as a strip.
-  const entries = useContinueWatchingEntries();
+  // A show in progress takes the hero: the most recent one the viewer is
+  // really into with an episode out to play (new episodes lead). A show
+  // caught up and waiting on its next episode gives way to the next one.
+  const { entries, settled } = useContinueWatching();
   const stripEntry = entries.find(
     (entry) =>
       entry.item.mediaType === 'tv' &&
       entry.kind !== 'waiting' &&
       entry.season != null &&
-      entry.episode != null,
+      entry.episode != null &&
+      investedInShow(library?.history, entry.item.mediaId),
   );
   const stripShow = useQuery({
     ...tmdbQueries.details('tv', stripEntry?.item.mediaId ?? 0),
@@ -44,7 +47,8 @@ export function HomePage() {
   });
   // Decide the hero once the library is known, so it does not swap under
   // the viewer a moment after the page appears.
-  const libraryPending = !connectionChecked || (connection != null && library == null);
+  const libraryPending =
+    !connectionChecked || (connection != null && (library == null || !settled));
 
   const error = movies.error ?? shows.error;
   if (error) {
