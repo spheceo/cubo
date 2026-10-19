@@ -8,8 +8,9 @@ import {
   type DiscoverQuery,
   type MediaSummary,
   type MediaType,
+  type WatchProvider,
 } from '@cubo/core';
-import { useQuery } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { IoArrowBack, IoPlay } from 'react-icons/io5';
 import { IoMdInformationCircleOutline } from 'react-icons/io';
@@ -23,7 +24,13 @@ import { WatchLaterButton } from '@/components/watch-later-button';
 import { parseCalendarDate } from '@/lib/air-date';
 import { latestHistoryForTitle, playButtonLabel, watchLaterItem } from '@/lib/library';
 import { tmdbQueries } from '@/lib/queries';
-import { regionName } from '@/lib/streaming-services';
+import {
+  catalogRegions,
+  findService,
+  mergeCatalog,
+  regionName,
+  type CatalogOrder,
+} from '@/lib/streaming-services';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { useStreamingServices } from '@/lib/use-streaming-services';
 
@@ -58,11 +65,48 @@ function shortDate(value: string): string | null {
   });
 }
 
+/** Titles from several countries' first pages, merged into one list. */
+interface Pooled {
+  items: MediaSummary[];
+  /** The largest country's match count. */
+  total: number;
+  loading: boolean;
+  failed: boolean;
+}
+
+/** A discover query run once per catalogue country and merged in `order`.
+ *  TMDB only filters by service within one country at a time. */
+function usePooled(
+  provider: WatchProvider | undefined,
+  regions: string[],
+  query: Omit<DiscoverQuery, 'providerIds' | 'region'>,
+  order: CatalogOrder,
+  enabled = true,
+): Pooled {
+  const pages = useQueries({
+    queries: regions.map((code) => ({
+      ...tmdbQueries.discoverPage({ ...query, providerIds: provider?.ids ?? [], region: code }),
+      enabled: enabled && provider != null,
+    })),
+  });
+  const data = pages.flatMap((page) => (page.data ? [page.data] : []));
+  return {
+    items: mergeCatalog(
+      data.map((page) => page.results),
+      order,
+    ),
+    total: Math.max(0, ...data.map((page) => page.totalResults)),
+    loading: provider == null || pages.some((page) => page.isLoading),
+    failed: pages.length > 0 && pages.every((page) => page.isError),
+  };
+}
+
 /**
- * One subscription service's catalogue in the viewer's country: its newest
- * big release up top, then its most popular and newest titles, then all of
- * it. Shows/Movies and genre narrow the page in place; the viewer's other
- * services sit top-right to hop between.
+ * One streaming service's catalogue, across countries: what is on it in
+ * the viewer's country and in the big catalogues (US, UK), merged. Only the
+ * Top 10 is the viewer's country alone. Its newest big release leads, then
+ * grouped rows. Shows/Movies and genre narrow the page in place; the
+ * viewer's other services sit top-right to hop between.
  */
 export function ServicePage() {
   const { id } = useParams();
@@ -72,41 +116,52 @@ export function ServicePage() {
   const mediaType: MediaType = params.get('type') === 'movie' ? 'movie' : 'tv';
   const genreId = Number(params.get('genre')) || null;
   const { region, all, services, loading } = useStreamingServices();
-  const provider = all.find((entry) => entry.id === providerId);
+  const provider = findService(all, providerId);
   useDocumentTitle(provider?.name ?? 'Services');
 
   const today = useMemo(() => isoDate(Date.now()), []);
   const recent = useMemo(() => isoDate(Date.now() - HERO_RECENT_DAYS * 86_400_000), []);
-  const base = { providerIds: [providerId], region };
-  const ready = provider != null;
+  const regions = useMemo(() => (provider ? catalogRegions(provider, region) : []), [provider, region]);
+  // The Top 10 ranks by the viewer's country where the service runs there.
+  const rankRegion = provider?.priorities[region] != null ? region : regions[0];
 
-  const shows = useQuery({ ...tmdbQueries.discoverPage({ mediaType: 'tv', ...base }), enabled: ready });
-  const movies = useQuery({ ...tmdbQueries.discoverPage({ mediaType: 'movie', ...base }), enabled: ready });
-  const newShows = useQuery({
-    ...tmdbQueries.discoverPage({ mediaType: 'tv', ...base, releasedAfter: recent, releasedBefore: today }),
-    enabled: ready,
-  });
-  const newMovies = useQuery({
-    ...tmdbQueries.discoverPage({ mediaType: 'movie', ...base, releasedAfter: recent, releasedBefore: today }),
-    enabled: ready,
-  });
+  const shows = usePooled(provider, regions, { mediaType: 'tv' }, 'popular');
+  const movies = usePooled(provider, regions, { mediaType: 'movie' }, 'popular');
+  const newShows = usePooled(
+    provider,
+    regions,
+    { mediaType: 'tv', releasedAfter: recent, releasedBefore: today },
+    'popular',
+  );
+  const newMovies = usePooled(
+    provider,
+    regions,
+    { mediaType: 'movie', releasedAfter: recent, releasedBefore: today },
+    'popular',
+  );
 
-  const filters = {
-    mediaType,
-    ...base,
-    genreIds: genreId ? [genreId] : undefined,
-  };
-  const top = useQuery({ ...tmdbQueries.discoverPage({ ...filters, sortBy: 'popular' }), enabled: ready });
-  const fresh = useQuery({
-    ...tmdbQueries.discoverPage({ ...filters, sortBy: 'newest', releasedBefore: today, minVoteCount: 5 }),
-    enabled: ready,
+  const filters = { mediaType, genreIds: genreId ? [genreId] : undefined };
+  const top = useQuery({
+    ...tmdbQueries.discoverPage({
+      ...filters,
+      sortBy: 'popular',
+      providerIds: provider?.ids ?? [],
+      region: rankRegion ?? region,
+    }),
+    enabled: provider != null && rankRegion != null,
   });
+  const fresh = usePooled(
+    provider,
+    regions,
+    { ...filters, sortBy: 'newest', releasedBefore: today, minVoteCount: 5 },
+    'newest',
+  );
 
   const hero =
-    [newShows.data, newMovies.data, shows.data, movies.data]
-      .flatMap((page) => page?.results ?? [])
+    [newShows, newMovies, shows, movies]
+      .flatMap((pool) => pool.items)
       .find((item) => item.backdropPath) ?? null;
-  const heroLoading = !hero && [newShows, newMovies, shows, movies].some((query) => query.isLoading);
+  const heroLoading = !hero && [newShows, newMovies, shows, movies].some((pool) => pool.loading);
 
   const update = (patch: Record<string, string | null>) => {
     const next = new URLSearchParams(params);
@@ -128,14 +183,14 @@ export function ServicePage() {
       <CatalogError
         message={
           all.length
-            ? `That service has no catalogue in ${regionName(region)}.`
+            ? 'Cubo does not know that service.'
             : 'Streaming availability is not available right now.'
         }
       />
     );
   }
 
-  const total = (shows.data?.totalResults ?? 0) + (movies.data?.totalResults ?? 0);
+  const total = shows.total + movies.total;
   const genres = genresFor(mediaType);
   const groups = genreId
     ? []
@@ -165,7 +220,7 @@ export function ServicePage() {
           <div>
             <h1 className="text-xl font-semibold tracking-[-0.02em]">{provider?.name ?? ' '}</h1>
             <p className="text-sm text-white/60">
-              {total ? `${total.toLocaleString()} titles in ${regionName(region)}` : regionName(region)}
+              {total ? `${total.toLocaleString()}+ titles` : '\u00a0'}
             </p>
           </div>
           {services.length > 1 ? (
@@ -229,40 +284,51 @@ export function ServicePage() {
         </div>
 
         <section>
-          <h2 className="text-2xl font-semibold">Most popular on {provider?.name}</h2>
+          <h2 className="text-2xl font-semibold">
+            Top 10 on {provider?.name}
+            {rankRegion ? (
+              <span className="ml-3 text-base font-normal text-faint">{regionName(rankRegion)}</span>
+            ) : null}
+          </h2>
           {top.data?.results.length ? (
             <TopTen items={top.data.results.filter((item) => item.posterPath).slice(0, 10)} />
           ) : (
-            <RowPlaceholder loading={top.isLoading} tall />
+            <RowPlaceholder loading={!top.isError} tall />
           )}
         </section>
 
         <section>
           <h2 className="text-2xl font-semibold">New on {provider?.name}</h2>
-          {fresh.data?.results.length ? (
+          {fresh.items.length ? (
             <div className="mt-2">
               <ScrollRow className="gap-4 pt-2 pb-2" label={`New on ${provider?.name}`}>
-                {fresh.data.results.slice(0, 12).map((item) => (
+                {fresh.items.slice(0, 12).map((item) => (
                   <NewCard key={item.id} item={item} date={shortDate(item.releaseDate)} />
                 ))}
               </ScrollRow>
             </div>
           ) : (
-            <RowPlaceholder loading={fresh.isLoading} />
+            <RowPlaceholder loading={fresh.loading} />
           )}
         </section>
 
-        {ready ? (
+        {provider ? (
           <>
             <GroupRow
               title="Top rated"
+              provider={provider}
+              regions={regions}
               query={{ ...filters, sortBy: 'rating', minVoteCount: 100 }}
+              order="rating"
             />
             {groups.map((genre) => (
               <GroupRow
                 key={`${mediaType}:${genre.id}`}
                 title={genre.name}
+                provider={provider}
+                regions={regions}
                 query={{ ...filters, genreIds: [genre.id], sortBy: 'popular' }}
+                order="popular"
               />
             ))}
           </>
@@ -445,13 +511,24 @@ function useNearViewport(ref: RefObject<HTMLElement | null>): boolean {
 
 /** A titled row of posters for one slice of the service's catalogue;
  *  disappears when that slice is empty. */
-function GroupRow({ title, query }: { title: string; query: DiscoverQuery }) {
+function GroupRow({
+  title,
+  provider,
+  regions,
+  query,
+  order,
+}: {
+  title: string;
+  provider: WatchProvider;
+  regions: string[];
+  query: Omit<DiscoverQuery, 'providerIds' | 'region'>;
+  order: CatalogOrder;
+}) {
   const ref = useRef<HTMLElement>(null);
   const near = useNearViewport(ref);
-  const page = useQuery({ ...tmdbQueries.discoverPage(query), enabled: near });
-  const items = (page.data?.results ?? []).filter((item) => item.posterPath);
-  if (page.isSuccess && items.length === 0) return null;
-  if (page.isError) return null;
+  const pool = usePooled(provider, regions, query, order, near);
+  const items = pool.items.filter((item) => item.posterPath);
+  if (pool.failed || (near && !pool.loading && items.length === 0)) return null;
 
   return (
     <section ref={ref}>

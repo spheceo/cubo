@@ -42,10 +42,10 @@ export const tmdbQueries = {
       queryFn: () => catalog.tmdb.discover({ ...query, page: query.page ?? 1 }),
     }),
   /** Which services operate where changes rarely; a day is plenty fresh. */
-  providers: (region: string) =>
+  providers: () =>
     queryOptions({
-      queryKey: ['tmdb', 'providers', region],
-      queryFn: () => catalog.tmdb.providers(region),
+      queryKey: ['tmdb', 'providers'],
+      queryFn: () => catalog.tmdb.providers(),
       staleTime: 24 * 60 * 60 * 1000,
       gcTime: 24 * 60 * 60 * 1000,
     }),

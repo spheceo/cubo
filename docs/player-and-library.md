@@ -133,20 +133,28 @@
 - The strip and backdrop move on transforms and crossfades only
   (`CrossfadeImage` keeps the old picture until the new one covers it);
   keep new motion there off layout properties.
-- "Your services" are the subscriptions the viewer picked, in their order,
-  for their country (`lib/streaming-services.ts`, stored locally). Until
-  they pick, the country comes from the time zone (a US-English browser
-  in South Africa still means ZA), then the browser languages, and the
-  services are the country's leading known subscriptions: TMDB's
-  per-country list mixes rental stores in. Tiles take the logo's own
+- "Your services" are the services the viewer picked, in their order,
+  stored locally (`lib/streaming-services.ts`) and managed in the
+  Library's "Your services" section (Home's Edit and Add tiles link
+  there; there is no modal). Any service TMDB lists in any country can
+  be picked; TMDB ids that share a name are one service (Amazon Prime
+  Video is 9 and 119). Until the viewer picks, the tiles are Netflix,
+  Apple TV, Disney Plus and Amazon Prime Video. Tiles take the logo's own
   background colour (sampled from its corner) so no colour tokens are
   added per brand.
-- A service page (`/services/:id`) only shows titles included with that
-  subscription in the viewer's country (`with_watch_monetization_types=
-  flatrate`), from TMDB's availability data. The services row hides when
-  the metadata source has none (Cinemeta).
-- A service page is grouped rows like Home, not one long grid: most
-  popular (ranked), new (Continue Watching's card: logo over the still,
+- The viewer's country (time zone first, then browser languages, or the
+  Library's "Rank by") only orders things: its services list first, and
+  a service page's Top 10 ranks by it. It never limits what a catalogue
+  shows.
+- A service page (`/services/:id`) reads the service's subscription
+  catalogue (`with_watch_monetization_types=flatrate`) in the viewer's
+  country plus the big ones (US, UK) where the service runs, and merges
+  them (`mergeCatalog`): TMDB only filters by service within one country
+  per request, and without a country it ignores the filter. A service in
+  none of those reads its own leading countries. The services row hides
+  when the metadata source has none (Cinemeta).
+- A service page is grouped rows like Home, not one long grid: Top 10
+  (ranked, viewer's country), new (Continue Watching's card: logo over the still,
   date pill), top rated, then genre rows that only fetch as they near the
   viewport and drop out when empty. Picking a genre chip narrows the
   first three rows to it and drops the genre rows.

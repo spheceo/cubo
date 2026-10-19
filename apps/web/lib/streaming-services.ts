@@ -1,16 +1,14 @@
-import type { WatchProvider } from '@cubo/core';
+import type { MediaSummary, WatchProvider } from '@cubo/core';
 
 /**
  * The streaming services the viewer subscribes to, and the country whose
  * catalogues they see. Persisted locally like the other viewer prefs.
- * Until the viewer picks, the region is guessed from the browser and the
- * services are the region's most prominent ones.
+ * Until the viewer picks, the country is guessed from the browser and the
+ * services are the big four. The country only orders things (which
+ * services list first, what ranks top); catalogues span countries.
  */
 
 const STORAGE_KEY = 'cubo.services.v1';
-
-/** How many services show before the viewer has picked any. */
-export const DEFAULT_SERVICE_COUNT = 4;
 
 export interface ServicePrefs {
   region?: string;
@@ -119,38 +117,80 @@ export function regionName(code: string): string {
   }
 }
 
-/** Well-known subscription services (TMDB provider ids). TMDB's per-country
- *  list mixes rental stores (Apple TV Store, BoxOffice) in with them, so the
- *  defaults come from these. */
-const SUBSCRIPTION_SERVICES = new Set([
-  8, // Netflix
-  9, // Amazon Prime Video
-  119, // Amazon Prime Video (outside the US)
-  337, // Disney Plus
-  350, // Apple TV+
-  1899, // Max
-  384, // HBO Max
-  15, // Hulu
-  531, // Paramount Plus
-  386, // Peacock
-  283, // Crunchyroll
-  39, // NOW
-  230, // Crave
-  381, // Canal+
-  55, // Showmax
-]);
+/** Shown until the viewer picks their own: Netflix, Apple TV, Disney Plus,
+ *  Amazon Prime Video. */
+export const DEFAULT_SERVICE_IDS = [8, 350, 337, 9];
 
-/** The viewer's picks in their order, skipping services the region lacks;
- *  until they have picked, the region's leading subscription services. */
+/** Countries with the largest catalogues. A service page merges these with
+ *  the viewer's own so it shows the whole catalogue, not one country's. */
+export const CATALOG_REGIONS = ['US', 'GB'];
+
+/** Services in the viewer's country first (by TMDB's prominence there),
+ *  then everything else by prominence across countries. */
+export function rankServices(all: WatchProvider[], region: string): WatchProvider[] {
+  return [...all].sort((a, b) => {
+    const left = a.priorities[region];
+    const right = b.priorities[region];
+    if (left != null && right != null) return left - right || a.priority - b.priority;
+    if (left != null) return -1;
+    if (right != null) return 1;
+    return a.priority - b.priority;
+  });
+}
+
+/** The service a TMDB id belongs to, under any of its ids. */
+export function findService(all: WatchProvider[], id: number): WatchProvider | undefined {
+  return all.find((provider) => provider.ids.includes(id));
+}
+
+/** The viewer's picks in their order (the defaults until they pick),
+ *  skipping ids TMDB no longer lists. */
 export function chosenServices(all: WatchProvider[], ids?: number[]): WatchProvider[] {
-  if (!ids) {
-    const subscriptions = all.filter((provider) => SUBSCRIPTION_SERVICES.has(provider.id));
-    return (subscriptions.length ? subscriptions : all).slice(0, DEFAULT_SERVICE_COUNT);
+  const picked: WatchProvider[] = [];
+  for (const id of ids ?? DEFAULT_SERVICE_IDS) {
+    const provider = findService(all, id);
+    if (provider && !picked.includes(provider)) picked.push(provider);
   }
-  const byId = new Map(all.map((provider) => [provider.id, provider]));
-  return ids.flatMap((id) => {
-    const provider = byId.get(id);
-    return provider ? [provider] : [];
+  return picked;
+}
+
+/** Where to read a service's catalogue from: the viewer's country and the
+ *  big catalogues, where the service operates. A service in none of them
+ *  uses its own leading countries. The first is the ranking country. */
+export function catalogRegions(provider: WatchProvider, region: string): string[] {
+  const pool = [...new Set([region, ...CATALOG_REGIONS])].filter(
+    (code) => provider.priorities[code] != null,
+  );
+  if (pool.length) return pool;
+  return Object.entries(provider.priorities)
+    .sort(([, a], [, b]) => a - b)
+    .slice(0, CATALOG_REGIONS.length)
+    .map(([code]) => code);
+}
+
+export type CatalogOrder = 'popular' | 'newest' | 'rating';
+
+/** One list from several countries' pages: each title once, in the row's
+ *  order. Ties keep the earlier country's order, so the viewer's leads. */
+export function mergeCatalog(lists: MediaSummary[][], order: CatalogOrder): MediaSummary[] {
+  const seen = new Set<string>();
+  const merged: MediaSummary[] = [];
+  for (const item of lists.flat()) {
+    const key = `${item.mediaType}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  const score = (item: MediaSummary): number | string =>
+    order === 'newest'
+      ? item.releaseDate
+      : order === 'rating'
+        ? item.voteAverage
+        : (item.popularity ?? 0);
+  return merged.sort((a, b) => {
+    const left = score(a);
+    const right = score(b);
+    return left === right ? 0 : left > right ? -1 : 1;
   });
 }
 

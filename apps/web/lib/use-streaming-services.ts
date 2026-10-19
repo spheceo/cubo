@@ -1,9 +1,10 @@
 import { useQuery } from '@tanstack/react-query';
-import { useCallback, useSyncExternalStore } from 'react';
+import { useCallback, useMemo, useSyncExternalStore } from 'react';
 import { tmdbQueries } from './queries';
 import {
   chosenServices,
   guessRegion,
+  rankServices,
   loadServicePrefs,
   saveServicePrefs,
   type ServicePrefs,
@@ -33,12 +34,12 @@ export function setServicePrefs(prefs: ServicePrefs): void {
 export function useStreamingServices() {
   const prefs = useSyncExternalStore(subscribe, read, read);
   const region = prefs.region ?? guessRegion();
-  const providers = useQuery(tmdbQueries.providers(region));
-  const all = providers.data ?? [];
+  const providers = useQuery(tmdbQueries.providers());
+  const all = useMemo(() => rankServices(providers.data ?? [], region), [providers.data, region]);
   const update = useCallback((next: ServicePrefs) => setServicePrefs(next), []);
   return {
     region,
-    /** Every subscription service TMDB lists for the region. */
+    /** Every service TMDB lists anywhere, the viewer's country first. */
     all,
     services: chosenServices(all, prefs.ids),
     picked: prefs.ids != null,

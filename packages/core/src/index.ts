@@ -12,6 +12,9 @@ export interface MediaSummary {
   /** TMDB genre ids — used for client-side filter matching (e.g. related
    *  picks on Discover). Absent when the provider can't supply them. */
   genreIds?: number[];
+  /** TMDB's popularity score, for ordering lists merged from several
+   *  queries; absent when the provider has none. */
+  popularity?: number;
 }
 
 export interface SeasonSummary {
@@ -169,9 +172,9 @@ export interface CuboClient {
     details(mediaType: MediaType, id: number): Promise<MediaDetails>;
     season(id: number, seasonNumber: number): Promise<Episode[]>;
     search(query: string): Promise<MediaSummary[]>;
-    /** Subscription services with a catalogue in `region`, TMDB's most
-     *  prominent first. Empty when the metadata source cannot say. */
-    providers(region: string): Promise<WatchProvider[]>;
+    /** Every streaming service TMDB knows, in any country, most prominent
+     *  first. Empty when the metadata source cannot say. */
+    providers(): Promise<WatchProvider[]>;
     /** Countries TMDB has availability data for. */
     providerRegions(): Promise<WatchRegion[]>;
   };
@@ -221,9 +224,18 @@ export interface DiscoverPage {
 }
 
 export interface WatchProvider {
+  /** The service's lowest TMDB id; stable, so it addresses the service. */
   id: number;
+  /** Every TMDB id listed under this name. TMDB splits some services by
+   *  country (Amazon Prime Video is 9 in a few, 119 everywhere else). */
+  ids: number[];
   name: string;
   logoPath: string | null;
+  /** How prominent TMDB rates the service in each country it operates in
+   *  (lower leads); the keys are the countries. */
+  priorities: Record<string, number>;
+  /** Prominence across countries (lower leads). */
+  priority: number;
 }
 
 export interface WatchRegion {
@@ -306,6 +318,7 @@ export type TmdbListItemRaw = {
   release_date?: string;
   first_air_date?: string;
   vote_average?: number;
+  popularity?: number;
   genre_ids?: number[];
 };
 
@@ -601,6 +614,7 @@ export function normalizeSummary(item: TmdbListItemRaw, mediaType: MediaType): M
     releaseDate: item.release_date ?? item.first_air_date ?? '',
     voteAverage: item.vote_average ?? 0,
     genreIds: item.genre_ids,
+    popularity: item.popularity,
   };
 }
 
@@ -857,33 +871,47 @@ export function createClient(config?: CuboClientConfig): CuboClient {
           totalResults: data.total_results ?? 0,
         };
       },
-      async providers(region: string) {
+      async providers() {
         type Raw = {
           provider_id: number;
           provider_name: string;
           logo_path: string | null;
+          display_priority?: number;
           display_priorities?: Record<string, number>;
         };
         const lists = await Promise.all(
           (['movie', 'tv'] as const).map((mediaType) =>
-            request<{ results?: Raw[] }>(
-              `/api/tmdb/watch/providers/${mediaType}?watch_region=${encodeURIComponent(region)}`,
-            ),
+            request<{ results?: Raw[] }>(`/api/tmdb/watch/providers/${mediaType}`),
           ),
         );
-        const byId = new Map<number, { provider: WatchProvider; priority: number }>();
+        const byName = new Map<string, WatchProvider>();
         for (const raw of lists.flatMap((list) => list.results ?? [])) {
-          const priority = raw.display_priorities?.[region] ?? Number.MAX_SAFE_INTEGER;
-          const known = byId.get(raw.provider_id);
-          if (known && known.priority <= priority) continue;
-          byId.set(raw.provider_id, {
-            provider: { id: raw.provider_id, name: raw.provider_name, logoPath: raw.logo_path },
-            priority,
-          });
+          const key = raw.provider_name.trim().toLowerCase();
+          const known = byName.get(key);
+          const priority = raw.display_priority ?? Number.MAX_SAFE_INTEGER;
+          if (!known) {
+            byName.set(key, {
+              id: raw.provider_id,
+              ids: [raw.provider_id],
+              name: raw.provider_name,
+              logoPath: raw.logo_path,
+              priorities: { ...raw.display_priorities },
+              priority,
+            });
+            continue;
+          }
+          if (!known.ids.includes(raw.provider_id)) known.ids.push(raw.provider_id);
+          known.ids.sort((a, b) => a - b);
+          known.id = known.ids[0];
+          if (priority < known.priority) {
+            known.priority = priority;
+            known.logoPath = raw.logo_path ?? known.logoPath;
+          }
+          for (const [region, value] of Object.entries(raw.display_priorities ?? {})) {
+            known.priorities[region] = Math.min(known.priorities[region] ?? value, value);
+          }
         }
-        return [...byId.values()]
-          .sort((a, b) => a.priority - b.priority)
-          .map((entry) => entry.provider);
+        return [...byName.values()].sort((a, b) => a.priority - b.priority);
       },
       async providerRegions() {
         const data = await request<{
@@ -1038,7 +1066,7 @@ export function createClient(config?: CuboClientConfig): CuboClient {
       );
     },
     // Cinemeta has no availability data, so there are no services to show.
-    async providers(_region: string) {
+    async providers() {
       return [];
     },
     async providerRegions() {

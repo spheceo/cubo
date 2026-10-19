@@ -4,6 +4,7 @@ import { useEffect } from 'react';
 import { ContinueWatching } from '@/components/continue-watching';
 import { Link } from '@/components/link';
 import { ReleaseSchedule } from '@/components/release-schedule';
+import { ServicesManager } from '@/components/services-manager';
 import { asMediaSummary } from '@/lib/format';
 import { watchHistoryItems } from '@/lib/library';
 import { useCacheStatus } from '@/lib/use-cache-status';
@@ -66,6 +67,7 @@ export function LibraryScreen() {
       <ReleaseSchedule history={history} />
       <SavedGrid title="Watch Later" items={watchLater} />
       <HistoryGrid items={watchHistoryItems(history)} />
+      <ServicesManager />
 
       <section className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-8">
         <p className="text-sm text-faint">

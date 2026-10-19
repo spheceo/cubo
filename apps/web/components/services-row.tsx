@@ -1,16 +1,12 @@
-import { useState } from 'react';
 import { IoAdd, IoPencil } from 'react-icons/io5';
 import { Link } from '@/components/link';
-import { regionName } from '@/lib/streaming-services';
 import { useStreamingServices } from '@/lib/use-streaming-services';
 import { ServiceTile } from './service-tile';
-import { ServicesEditor } from './services-editor';
 
 /** Home's "Your services": a brand tile per subscription, each opening that
  *  service's page. Hidden when the metadata source has no availability. */
 export function ServicesRow({ className = '' }: { className?: string }) {
-  const { region, all, services, loading, error } = useStreamingServices();
-  const [editing, setEditing] = useState(false);
+  const { all, services, loading, error } = useStreamingServices();
 
   if (error || (!loading && all.length === 0)) return null;
 
@@ -20,15 +16,13 @@ export function ServicesRow({ className = '' }: { className?: string }) {
         <h2 id="services-heading" className="text-2xl font-semibold">
           Your services
         </h2>
-        <span className="text-sm text-faint">{regionName(region)}</span>
-        <button
-          type="button"
-          onClick={() => setEditing(true)}
+        <Link
+          href="/library#services"
           className="ml-auto flex cursor-pointer items-center gap-1.5 text-sm font-semibold text-muted transition-colors hover:text-white"
         >
           <IoPencil size={14} />
           Edit
-        </button>
+        </Link>
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
@@ -51,18 +45,15 @@ export function ServicesRow({ className = '' }: { className?: string }) {
               </Link>
             ))}
         {!loading ? (
-          <button
-            type="button"
-            onClick={() => setEditing(true)}
+          <Link
+            href="/library#services"
             className="flex aspect-[16/9] cursor-pointer flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-line-strong text-sm font-semibold text-muted transition-colors hover:border-white/40 hover:text-white"
           >
             <IoAdd size={26} />
             {services.length ? 'Add a service' : 'Pick your services'}
-          </button>
+          </Link>
         ) : null}
       </div>
-
-      {editing ? <ServicesEditor onClose={() => setEditing(false)} /> : null}
     </section>
   );
 }
