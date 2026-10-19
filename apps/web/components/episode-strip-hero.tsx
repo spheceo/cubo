@@ -34,6 +34,10 @@ const PICKED_LIFT = 12;
 /** Room above the picked thumbnail for its ring and rounded corners; the
  *  strip clips its overflow so neighbours can bleed off the sides. */
 const PICKED_HEADROOM = 16;
+/** The hero's still: sharp full-bleed, a tenth of the 2 MB original. The
+ *  thumbnails use w780, which stays sharp on a 2x screen once the picked
+ *  one is scaled up. */
+const HERO_STILL = 'w1280';
 /** Pixels a press must travel before it is a drag rather than a click. */
 const DRAG_THRESHOLD = 6;
 /** How far a release carries the strip on, in ms of the flick's speed. */
@@ -75,15 +79,11 @@ export function EpisodeStripHero({
   const image = episodes.isLoading
     ? ''
     : active?.stillPath
-      ? stillUrl(active.stillPath, 'original')
+      ? stillUrl(active.stillPath, HERO_STILL)
       : backdropUrl(show.backdropPath, 'w1280');
 
   usePreloadedStills(list, show, activeIndex);
 
-  const step = (delta: number) => {
-    const next = list[Math.min(list.length - 1, Math.max(0, activeIndex + delta))];
-    if (next) setPicked(next.episodeNumber);
-  };
 
   return (
     <section
@@ -121,7 +121,6 @@ export function EpisodeStripHero({
           activeIndex={activeIndex}
           showId={show.id}
           onPick={setPicked}
-          onStep={step}
         />
       ) : (
         <div className="h-60" />
@@ -145,7 +144,7 @@ function usePreloadedStills(episodes: Episode[], show: MediaDetails, activeIndex
       .sort((a, b) => Math.abs(a - start) - Math.abs(b - start))
       .map((index) => episodes[index].stillPath)
       .filter((path): path is string => Boolean(path))
-      .map((path) => stillUrl(path, 'original'));
+      .map((path) => stillUrl(path, HERO_STILL));
     ordered.push(backdropUrl(show.backdropPath, 'w1280'));
 
     let cancelled = false;
@@ -247,21 +246,20 @@ function Strip({
   activeIndex,
   showId,
   onPick,
-  onStep,
 }: {
   episodes: Episode[];
   activeIndex: number;
   showId: number;
   onPick: (episodeNumber: number) => void;
-  onStep: (delta: number) => void;
 }) {
   const { library } = useCore();
   const frameRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const focusAfterStep = useRef(false);
   const [frameWidth, setFrameWidth] = useState(0);
-  // Where the viewer has dragged or swiped the strip to; null follows the
-  // picked episode. Picking an episode hands control back.
+  // Where the strip sits; null until the viewer first moves it or picks,
+  // while it opens on the episode they are on. After that it stays put:
+  // picking an episode only nudges it if that card would be off screen.
   const [manualScroll, setManualScroll] = useState<number | null>(null);
   const [live, setLive] = useState(false);
   const drag = useRef<{
@@ -275,9 +273,7 @@ function Strip({
   } | null>(null);
   const suppressClick = useRef(false);
 
-  useEffect(() => {
-    setManualScroll(null);
-  }, [activeIndex]);
+
   // The first layout lands in place; only later picks animate.
   const [animate, setAnimate] = useState(false);
 
@@ -313,8 +309,21 @@ function Strip({
   const stripWidth = (episodes.length - 1) * stride + width + grow;
   const maxScroll = Math.max(0, stripWidth + gutter * 2 - frameWidth);
   const autoScroll = Math.min(activeIndex * stride, frameWidth ? maxScroll : activeIndex * stride);
-  const scroll = manualScroll ?? autoScroll;
   const clampScroll = (value: number) => Math.max(0, Math.min(maxScroll, value));
+  const scroll = manualScroll == null ? autoScroll : clampScroll(manualScroll);
+  /** The least movement that brings card `index` fully into view, once it
+   *  has grown as the picked one. */
+  const reveal = (from: number, index: number) => {
+    const visible = frameWidth - gutter * 2;
+    const start = index * stride;
+    return clampScroll(Math.min(start, Math.max(start + width + grow - visible, from)));
+  };
+  const select = (index: number) => {
+    const target = episodes[index];
+    if (!target || index === activeIndex) return;
+    setManualScroll(reveal(scroll, index));
+    onPick(target.episodeNumber);
+  };
   // While a finger, mouse or trackpad drives the strip it follows exactly;
   // otherwise it glides.
   const transition = animate && !live ? `transform ${MOVE_MS}ms ${EASE}` : 'none';
@@ -392,7 +401,7 @@ function Strip({
           type="button"
           aria-label="Previous episode"
           disabled={activeIndex === 0}
-          onClick={() => onStep(-1)}
+          onClick={() => select(activeIndex - 1)}
           className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-40"
         >
           <IoChevronBack size={20} />
@@ -401,7 +410,7 @@ function Strip({
           type="button"
           aria-label="Next episode"
           disabled={activeIndex === episodes.length - 1}
-          onClick={() => onStep(1)}
+          onClick={() => select(activeIndex + 1)}
           className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-control transition-colors hover:bg-control-hover disabled:cursor-default disabled:opacity-40"
         >
           <IoChevronForward size={20} />
@@ -431,7 +440,7 @@ function Strip({
           if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
           event.preventDefault();
           focusAfterStep.current = true;
-          onStep(event.key === 'ArrowLeft' ? -1 : 1);
+          select(activeIndex + (event.key === 'ArrowLeft' ? -1 : 1));
         }}
       >
         <div
@@ -461,7 +470,7 @@ function Strip({
                 aria-current={isActive ? 'true' : undefined}
                 aria-label={`Episode ${episode.episodeNumber}: ${episode.name}`}
                 tabIndex={isActive ? 0 : -1}
-                onClick={() => onPick(episode.episodeNumber)}
+                onClick={() => select(index)}
                 className={`group absolute bottom-0 left-0 text-left outline-none ${
                   live ? 'cursor-grabbing' : 'cursor-pointer'
                 }`}
@@ -488,7 +497,7 @@ function Strip({
                 >
                   {episode.stillPath ? (
                     <img
-                      src={stillUrl(episode.stillPath, 'w300')}
+                      src={stillUrl(episode.stillPath, 'w780')}
                       alt=""
                       loading="lazy"
                       draggable={false}

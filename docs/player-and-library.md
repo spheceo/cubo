@@ -154,8 +154,13 @@
   loads before its first frame paints, so a CSS transition skips to the
   end and pops. Pictures underneath stay until the newest covers them.
 - The strip drags (mouse or touch, with a little fling on release) and
-  takes trackpad sideways swipes, without changing the picked episode;
-  picking one hands the position back to it. Its images are not
+  takes trackpad sideways swipes, without changing the picked episode.
+  It opens on the viewer's episode, then stays where they leave it:
+  picking an episode, or stepping with the arrows or keys, only nudges
+  it by the least amount that shows that card in full.
+- Hero stills are TMDB's w1280 (the originals are about 2 MB each) and
+  strip thumbnails w780, which stay sharp on 2x screens when the picked
+  one scales up. Its images are not
   draggable, and a drag's closing click is not a pick.
 - Once the page is idle, the strip preloads every episode's full-size
   still (nearest the picked one first, two at a time) so stepping along

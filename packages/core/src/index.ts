@@ -1147,7 +1147,7 @@ export function logoUrl(path: string | null, size: 'w300' | 'w500' | 'original' 
 
 export function stillUrl(
   path: string | null,
-  size: 'w300' | 'w780' | 'original' = 'w300',
+  size: 'w300' | 'w780' | 'w1280' | 'original' = 'w300',
 ): string {
   if (!path) return '';
   return path.startsWith('http') ? path : `https://image.tmdb.org/t/p/${size}${path}`;
