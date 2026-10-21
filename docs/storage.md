@@ -7,6 +7,12 @@
 - Maintenance never removes an open session's file (failed ones too: the
   player recovers on the same source) or a root still recorded in the
   cache index.
+- Eviction goes least recently used first, with titles the viewer is
+  part-way through (in history, started, under 95%, watched in the last
+  30 days, matched on the cache entry's media key) last. While Cubo is
+  within its own budget, a tight disk filled by something else does not
+  evict those unless the volume is critical (512 MiB): on 2026-10-21 it
+  took a pack the viewer was 72% into and the resume took two minutes.
 - A nearly full disk pauses every torrent and fails only sessions that
   still need to download. A session whose file is complete plays on from
   the paused torrent. Failing it let eviction delete the very season pack

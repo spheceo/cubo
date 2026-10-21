@@ -1566,17 +1566,28 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
 
     // The file an open session plays is never evicted, even after the
     // session failed: the player recovers on the same source. The budget
-    // applies to everything else, least recently used first. A closed
-    // session's file is ordinary cache.
+    // applies to everything else, least recently used first, with titles
+    // the viewer is part-way through last. While Cubo is within its own
+    // budget, a tight disk (someone else's files) does not take those
+    // unless the volume is about to run out. A closed session's file is
+    // otherwise ordinary cache.
     let live = state.sessions.open_info_hashes();
+    let unfinished = cache::unfinished_keys(&state.store.snapshot().await.history, store::now_millis());
+    let is_unfinished = |entry: &store::CacheEntry| {
+        entry.media_key.as_ref().is_some_and(|key| unfinished.contains(key))
+    };
+    let mut critical = cache::disk_is_critical(free_bytes);
     let mut deleted_files: Vec<String> = Vec::new();
     let mut entries = snapshot.cache_entries;
-    entries.sort_by_key(|entry| entry.last_accessed_at);
+    entries.sort_by_key(|entry| (is_unfinished(entry), entry.last_accessed_at));
     for entry in entries {
         if used_bytes <= snapshot.cache.max_bytes && !tight {
             break;
         }
         if live.contains(&entry.info_hash) {
+            continue;
+        }
+        if is_unfinished(&entry) && used_bytes <= snapshot.cache.max_bytes && !critical {
             continue;
         }
         let id = cache_entry_id(&entry);
@@ -1600,7 +1611,9 @@ async fn enforce_cache_limit(state: &BridgeState) -> Result<(), String> {
             deleted_files.extend(entry.files.iter().cloned());
             state.store.remove_cache_entry(&id).await?;
             used_bytes = cache_size(download_dir.clone()).await?;
-            tight = cache::disk_is_tight(system::volume_free_bytes(&download_dir));
+            let free_bytes = system::volume_free_bytes(&download_dir);
+            tight = cache::disk_is_tight(free_bytes);
+            critical = cache::disk_is_critical(free_bytes);
         }
     }
 
