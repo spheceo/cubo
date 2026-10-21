@@ -48,6 +48,14 @@ const STALL_FAILURE: Duration = Duration::from_secs(120);
 /// How long a closed session's torrent keeps its peers before pausing, in
 /// case the client opens a replacement session on the same source.
 const PAUSE_GRACE: Duration = Duration::from_secs(15);
+/// The next episode in a pack that is playing gets its opening pulled
+/// onto disk, not just its header: the player skips the recap on entry
+/// (often 60–110 s in), and that seek used to land on pieces nobody had
+/// fetched, stalling the episode seconds after auto-next.
+const PREFETCH_OPENING_SECONDS: f64 = 180.0;
+/// Caps the warm-up for high-bitrate files (about three minutes of 1080p).
+const PREFETCH_OPENING_MAX_BYTES: u64 = 192 * 1024 * 1024;
+const PREFETCH_OPENING_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1241,9 +1249,10 @@ impl SessionManager {
             let result = manager.run_prefetch(&key, &request).await;
             let torrent_id = manager.prefetching.lock().unwrap().remove(&key).flatten();
             match result {
-                Ok(source) => {
+                Ok((source, duration)) => {
                     let playing = manager.live_info_hashes().contains(&source.info_hash);
                     if playing {
+                        manager.warm_opening(&source, duration).await;
                         manager.deselect_prefetched(&source).await;
                     } else {
                         manager.parked.lock().unwrap().insert(source.torrent_id);
@@ -1312,7 +1321,54 @@ impl SessionManager {
         }
     }
 
-    async fn run_prefetch(self: &Arc<Self>, key: &str, request: &CreateSessionRequest) -> Result<Source, Failure> {
+    /// Reads the first minutes of a prefetched file through rqbit's stream,
+    /// which makes rqbit fetch those pieces first. Only for a torrent that
+    /// is already playing (the next episode of the pack): its swarm is
+    /// live and the bytes are a sliver of the pack, while a parked guess
+    /// stays a few megabytes. Best effort; the bytes are discarded.
+    async fn warm_opening(&self, source: &Source, duration: Option<f64>) {
+        let Some(duration) = duration.filter(|seconds| *seconds > PREFETCH_OPENING_SECONDS) else {
+            return;
+        };
+        let share = PREFETCH_OPENING_SECONDS / duration;
+        let end = ((source.file_len as f64 * share) as u64).min(PREFETCH_OPENING_MAX_BYTES);
+        if end == 0 {
+            return;
+        }
+        let url = self.stream_url(source.torrent_id, source.file_index);
+        let started = Instant::now();
+        let read = async {
+            let mut response = self
+                .http
+                .get(&url)
+                .header(reqwest::header::RANGE, format!("bytes=0-{}", end - 1))
+                .send()
+                .await?
+                .error_for_status()?;
+            let mut bytes = 0u64;
+            while let Some(chunk) = response.chunk().await? {
+                bytes += chunk.len() as u64;
+            }
+            Ok::<u64, reqwest::Error>(bytes)
+        };
+        match tokio::time::timeout(PREFETCH_OPENING_TIMEOUT, read).await {
+            Ok(Ok(bytes)) => tracing::info!(
+                target: "session",
+                file = %source.file_name,
+                bytes,
+                warm_ms = started.elapsed().as_millis() as u64,
+                "prefetch warmed the opening"
+            ),
+            Ok(Err(error)) => tracing::info!(target: "session", file = %source.file_name, %error, "prefetch could not warm the opening"),
+            Err(_) => tracing::info!(target: "session", file = %source.file_name, "prefetch opening warm-up timed out"),
+        }
+    }
+
+    async fn run_prefetch(
+        self: &Arc<Self>,
+        key: &str,
+        request: &CreateSessionRequest,
+    ) -> Result<(Source, Option<f64>), Failure> {
         let source = self
             .resolve(request, request.media_key.clone(), request.title.clone(), "prefetch")
             .await?;
@@ -1323,7 +1379,7 @@ impl SessionManager {
             .await
             .map_err(|_| Failure::new("metadata_timeout", "The torrent did not start in time."))?
             .map_err(|error| Failure::new("internal", format!("The torrent failed to start: {error:#}")))?;
-        let (_, _, timings) = self.media_info(&source).await?;
+        let (probe, index, timings) = self.media_info(&source).await?;
         tracing::info!(
             target: "session",
             file = %source.file_name,
@@ -1332,7 +1388,11 @@ impl SessionManager {
             cached = timings.cached,
             "prefetch probe timing"
         );
-        Ok(source)
+        let duration = index
+            .as_ref()
+            .and_then(|index| index.duration_seconds)
+            .or(probe.duration_seconds);
+        Ok((source, duration))
     }
 }
 

@@ -60,7 +60,12 @@ without a strong reason and maintainer approval.
   plays it); sources that close without ever serving media are parked too,
   so guesses and race losers never download whole files. A torrent that
   is playing (the next episode of the same season pack) cannot be parked,
-  so the prefetched file is dropped from its selection instead.
+  so the prefetched file is dropped from its selection instead — after
+  its first three minutes (at most 192 MiB) are read onto disk. The
+  player skips the recap on entry, often 60–110 s in, and that seek
+  landed on pieces nobody had fetched: auto-next stalled 6–54 s on three
+  of five Wayward Pines episodes (2026-10-19). Parked guesses stay
+  header-only.
 - A closed session pauses its torrent only after a grace period with no
   live session on it: recovery and audio switches open a replacement on
   the same torrent, and an immediate pause drops every peer.
@@ -77,7 +82,16 @@ without a strong reason and maintainer approval.
   an automatic session fails over to the next ranked source at the same
   position (`checkStarved` in `watch-screen.tsx`, `lib/starvation.ts`). Only
   measured throughput decides, never seeders, and only while an untried
-  source remains; a manually picked source is never switched.
+  source remains; a manually picked source is never switched. The one
+  exception to throughput: a single stall of 40 s with Core under a
+  second ready ahead fails over anyway (`stuckAtPlayhead`). A swarm can
+  download elsewhere in the file while the playhead's pieces never come;
+  that used to wait out Core's 55 s segment timeout first.
+- UPnP discovery failing with `No route to host (os error 65)` every
+  minute usually means macOS is blocking multicast — Local Network
+  access off for Cubo (System Settings → Privacy & Security → Local
+  Network) — or a VPN owns the route. No port mapping means fewer
+  incoming peers.
 
 ## Player buffer
 
