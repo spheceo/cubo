@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { recentStalls, stalledTooLong, stalledWithin, type Stall } from './starvation';
+import { recentStalls, stalledTooLong, stalledWithin, stuckAtPlayhead, type Stall } from './starvation';
 
 test('one long wait on the loader is starvation', () => {
   assert.equal(stalledTooLong([{ start: 0, end: null }], 19_000), false);
@@ -30,4 +30,14 @@ test('the odd hiccup is not', () => {
   assert.deepEqual(recentStalls([{ start: 0, end: 30_000 }, { start: 140_000, end: null }], 150_000), [
     { start: 140_000, end: null },
   ]);
+});
+
+test('a stall Core cannot feed moves on even when the swarm looks fast', () => {
+  const open: Stall[] = [{ start: 0, end: null }];
+  assert.equal(stuckAtPlayhead(open, 39_000, 0.4), false);
+  assert.equal(stuckAtPlayhead(open, 40_000, 0.4), true);
+  assert.equal(stuckAtPlayhead(open, 40_000, undefined), true);
+  // Core has segments ready: the wait is elsewhere, not the swarm.
+  assert.equal(stuckAtPlayhead(open, 60_000, 12), false);
+  assert.equal(stuckAtPlayhead([{ start: 0, end: 50_000 }], 60_000, 0), false);
 });

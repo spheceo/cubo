@@ -90,7 +90,7 @@ import { ProgressWriter } from '@/lib/progress-writer';
 import { needsReencode, rememberReencode } from '@/lib/decode-fallback';
 import { detectRecapPreview, endWindow, recapWindow, withDialogueCredits, withRecapPreview } from '@/lib/recap-preview';
 import { forgetSource, loadShowSource, loadSource, rememberShowSource, rememberSource } from '@/lib/source-affinity';
-import { recentStalls, stalledTooLong, stalledWithin, type Stall } from '@/lib/starvation';
+import { recentStalls, stalledTooLong, stuckAtPlayhead, stalledWithin, type Stall } from '@/lib/starvation';
 import { loadSubtitleCues, type SubtitleCue } from '@/lib/subtitles';
 import { useDrawerDialog } from '@/lib/use-drawer-dialog';
 import { prefetchTitle, rankForPlayback } from '@/lib/source-prefetch';
@@ -1520,7 +1520,8 @@ export function WatchScreen({
     if (!duration || !fileBytes) return;
     // downloadMbps is rqbit's MiB/s.
     const neededMbps = fileBytes / duration / (1024 * 1024);
-    if (torrent.downloadMbps >= neededMbps) return;
+    const stuck = stuckAtPlayhead(stalls, performance.now(), sessionStatus?.remux?.readyAheadSeconds);
+    if (torrent.downloadMbps >= neededMbps && !stuck) return;
     if (bufferingSinceRef.current !== since || stallsRef.current !== stalls) return;
     bufferingSinceRef.current = null;
     stallsRef.current = [];
@@ -1532,6 +1533,7 @@ export function WatchScreen({
       waited_ms: since == null ? undefined : Math.round(now - since),
       stalled_ms: Math.round(stalledWithin(stalls, now)),
       position: Math.round(lastPositionRef.current) || undefined,
+      stuck: stuck || undefined,
     });
     failOver();
   }

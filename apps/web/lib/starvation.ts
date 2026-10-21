@@ -13,6 +13,22 @@ export const STARVED_SWITCH_MS = 20_000;
 export const STARVED_WINDOW_MS = 90_000;
 export const STARVED_WINDOW_STALL_MS = 30_000;
 
+/** A swarm can download fast overall and still never deliver the pieces
+ *  at the playhead (Devil's Hour, 2026-10-21: 0.6 MiB/s against 0.97
+ *  needed, but the one segment waited 55 s until Core gave up). After
+ *  this long on one stall with Core holding under a second ahead, the
+ *  source moves on whatever its throughput says. */
+export const STARVED_HARD_SWITCH_MS = 40_000;
+const STUCK_READY_AHEAD_SECONDS = 1;
+
+/** Whether the open stall has outlasted any throughput excuse: long, and
+ *  Core has nothing ready past the playhead either. */
+export function stuckAtPlayhead(stalls: Stall[], now: number, readyAheadSeconds: number | undefined): boolean {
+  const open = stalls.find((stall) => stall.end == null);
+  if (!open || now - open.start < STARVED_HARD_SWITCH_MS) return false;
+  return readyAheadSeconds == null || readyAheadSeconds < STUCK_READY_AHEAD_SECONDS;
+}
+
 /** Overlay time within the trailing window, the open stall included. */
 export function stalledWithin(stalls: Stall[], now: number, windowMs = STARVED_WINDOW_MS): number {
   const from = now - windowMs;
