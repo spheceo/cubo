@@ -68,6 +68,12 @@
   media-key play), playback pauses at the credits instead of rolling on
   into the next episode (`viewer-activity.ts`). The episode still counts as
   watched there; pressing play resumes the countdown.
+- The countdown reads the pointer: a move that closes in on the credits
+  buttons eases the fill, more the nearer it gets (linear in closeness),
+  capped at 80% speed (`pointer-intent.ts`). Moves away or sideways — a
+  viewer hunting for the cursor — don't count, and the ease fades out
+  half a second after the pointer stops. It buys a reach for Watch credits
+  a beat more time without the fill visibly slowing.
 - Reaching the end window means the playhead (or a seek's target) is in
   it. A drag across the bar that has not been let go does not count: it
   would mark the episode done and could run out the countdown.

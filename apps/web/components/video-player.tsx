@@ -27,6 +27,7 @@ import {
 } from '@/lib/framing-prefs';
 import { cancelAutoplayUnmute, playInBackground } from '@/lib/background-playback';
 import { loadAutoPlayNextPref, saveAutoPlayNextPref } from '@/lib/auto-next-prefs';
+import { approachToward, countdownRate } from '@/lib/pointer-intent';
 import { loadAutoSkipIntroPref, saveAutoSkipIntroPref } from '@/lib/intro-skip-prefs';
 import {
   loadSectionPrefs,
@@ -51,6 +52,10 @@ const HIDE_DELAY_MS = 2600;
 const SKIP_SECONDS = 10;
 /** Seconds the Next episode fill takes to complete before auto-advancing. */
 const AUTO_NEXT_MS = 6_000;
+/** How long a move toward the credits buttons keeps easing the countdown
+ *  after the pointer stops, and how gently the ease follows the pointer. */
+const POINTER_INTENT_HOLD_MS = 500;
+const POINTER_INTENT_SMOOTH_MS = 250;
 /** Seconds the Skip intro fill takes to complete before auto-skipping. */
 const AUTO_SKIP_INTRO_MS = 4_000;
 /** Matches `.player-menu[data-closing]` in globals.css. */
@@ -967,7 +972,11 @@ export function VideoPlayer({
   // rAF writing a scaleX transform straight onto the node: compositor-smooth
   // and zero re-renders. Pausing freezes it; completing it auto-advances.
   // With auto-play next off there is no countdown, only the button.
+  // A pointer heading for the buttons eases the fill a little (never more
+  // than the cap in lib/pointer-intent), so a viewer reaching for Watch
+  // credits gets a beat longer without the countdown visibly slowing.
   const nextCountdown = onNextEpisode != null && autoPlayNext;
+  const creditsActionsRef = useRef<HTMLDivElement | null>(null);
   const nextFillRef = useRef<HTMLSpanElement | null>(null);
   const nextFillPos = useRef(0);
   const nextFired = useRef(false);
@@ -988,10 +997,28 @@ export function VideoPlayer({
       videoRef.current?.pause();
       return;
     }
+    let pointer: { x: number; y: number } | null = null;
+    let approach = 0;
+    let approachAt = 0;
+    let ease = 0;
+    const onPointerMove = (event: PointerEvent) => {
+      const next = { x: event.clientX, y: event.clientY };
+      const box = creditsActionsRef.current?.getBoundingClientRect();
+      if (pointer && box) {
+        const target = { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+        approach = approachToward(pointer, next, target, Math.hypot(window.innerWidth, window.innerHeight));
+        approachAt = performance.now();
+      }
+      pointer = next;
+    };
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
     let raf = 0;
     let last = performance.now();
     const tick = (now: number) => {
-      nextFillPos.current = Math.min(1, nextFillPos.current + (now - last) / AUTO_NEXT_MS);
+      const elapsed = now - last;
+      const wanted = now - approachAt < POINTER_INTENT_HOLD_MS ? approach : 0;
+      ease += (wanted - ease) * Math.min(1, elapsed / POINTER_INTENT_SMOOTH_MS);
+      nextFillPos.current = Math.min(1, nextFillPos.current + (elapsed * countdownRate(ease)) / AUTO_NEXT_MS);
       last = now;
       if (nextFillRef.current) nextFillRef.current.style.transform = `scaleX(${nextFillPos.current})`;
       if (nextFillPos.current >= 1) {
@@ -1004,7 +1031,10 @@ export function VideoPlayer({
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('pointermove', onPointerMove);
+    };
   }, [creditsTakeover, onNextEpisode, autoPlayNext, playing, markUserPaused, stopPlayLoop]);
 
   const revealControls = useCallback(() => {
@@ -1582,6 +1612,7 @@ export function VideoPlayer({
       ) : null}
       {creditsTakeover && creditsWindow ? (
         <div
+          ref={creditsActionsRef}
           className={`absolute right-4 z-20 flex items-center gap-3 transition-[bottom] duration-300 sm:right-6 ${
             controlsVisible ? 'bottom-24' : 'bottom-6'
           }`}
