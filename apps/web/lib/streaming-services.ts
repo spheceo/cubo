@@ -9,6 +9,9 @@ import type { MediaSummary, WatchProvider } from '@cubo/core';
  */
 
 const STORAGE_KEY = 'cubo.services.v1';
+/** The viewer's services as last loaded, so Home's row shows at once and
+ *  survives the catalog failing (a rate limit, a Worker missing a path). */
+const TILES_KEY = 'cubo.services.tiles.v1';
 
 export interface ServicePrefs {
   region?: string;
@@ -214,5 +217,34 @@ export function saveServicePrefs(prefs: ServicePrefs): void {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
   } catch {
     // Private-mode quota errors are fine to ignore; the pick just won't stick.
+  }
+}
+
+/** The services last shown, for when the catalog has not answered. */
+export function loadServiceTiles(): WatchProvider[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(TILES_KEY) ?? 'null');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is WatchProvider =>
+        !!item
+        && typeof item === 'object'
+        && Number.isInteger(item.id)
+        && Array.isArray(item.ids)
+        && typeof item.name === 'string'
+        && typeof item.priorities === 'object'
+        && item.priorities !== null,
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveServiceTiles(tiles: WatchProvider[]): void {
+  try {
+    window.localStorage.setItem(TILES_KEY, JSON.stringify(tiles));
+  } catch {
+    // Quota errors only cost the instant row on the next visit.
   }
 }

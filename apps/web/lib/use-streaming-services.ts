@@ -1,12 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
-import { useCallback, useMemo, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { tmdbQueries } from './queries';
 import {
   chosenServices,
   guessRegion,
   rankServices,
   loadServicePrefs,
+  loadServiceTiles,
   saveServicePrefs,
+  saveServiceTiles,
   type ServicePrefs,
 } from './streaming-services';
 
@@ -36,15 +38,27 @@ export function useStreamingServices() {
   const region = prefs.region ?? guessRegion();
   const providers = useQuery(tmdbQueries.providers());
   const all = useMemo(() => rankServices(providers.data ?? [], region), [providers.data, region]);
+  const live = useMemo(() => chosenServices(all, prefs.ids), [all, prefs.ids]);
+  // Until the catalog answers, or if it fails, the viewer's services as
+  // last loaded stand in, so the row neither flashes nor disappears.
+  const [saved] = useState(loadServiceTiles);
+  useEffect(() => {
+    if (providers.data && live.length) saveServiceTiles(live);
+  }, [providers.data, live]);
+  const services = providers.data ? live : chosenServices(saved, prefs.ids);
   const update = useCallback((next: ServicePrefs) => setServicePrefs(next), []);
   return {
     region,
     /** Every service TMDB lists anywhere, the viewer's country first. */
     all,
-    services: chosenServices(all, prefs.ids),
+    services,
     picked: prefs.ids != null,
-    loading: providers.isLoading,
-    error: providers.error,
+    /** Nothing to show yet, or ever: the row's skeleton and hiding. */
+    loading: providers.isLoading && services.length === 0,
+    error: services.length ? null : providers.error,
+    /** The full list's own state, for picking services. */
+    listLoading: providers.isLoading,
+    listError: providers.error,
     update,
   };
 }

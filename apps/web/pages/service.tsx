@@ -113,7 +113,7 @@ export function ServicePage() {
   const mediaType: MediaType = params.get('type') === 'movie' ? 'movie' : 'tv';
   const genreId = Number(params.get('genre')) || null;
   const { region, all, services, loading } = useStreamingServices();
-  const provider = findService(all, providerId);
+  const provider = findService(all, providerId) ?? findService(services, providerId);
   useDocumentTitle(provider?.name ?? 'Services');
 
   const today = useMemo(() => isoDate(Date.now()), []);

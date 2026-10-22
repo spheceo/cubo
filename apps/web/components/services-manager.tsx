@@ -18,7 +18,7 @@ const COLLAPSED_COUNT = 24;
  * rank by it). Changes save as they are made.
  */
 export function ServicesManager() {
-  const { region, all, services, loading, error, update } = useStreamingServices();
+  const { region, all, services, listLoading: loading, listError: error, update } = useStreamingServices();
   const regions = useQuery(tmdbQueries.providerRegions());
   const [filter, setFilter] = useState('');
   const [expanded, setExpanded] = useState(false);

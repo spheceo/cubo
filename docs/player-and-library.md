@@ -196,6 +196,12 @@
   Apple TV, Disney Plus and Amazon Prime Video. Tiles take the logo's own
   background colour (sampled from its corner) so no colour tokens are
   added per brand.
+- Home's row shows the services as last loaded (saved locally) until the
+  catalog answers, and keeps them if it fails, so the row never flashes
+  in and out with Continue Watching jumping into its place. TMDB's
+  `watch/providers` lists come through the catalog Worker: a new TMDB
+  path needs the Worker redeployed (`wrangler deploy` in `apps/catalog`)
+  as well as Core's allowlist.
 - The viewer's country (time zone first, then browser languages, or the
   Library's "Rank by") only orders things: its services list first, and
   a service page's Top 10 ranks by it. It never limits what a catalogue
