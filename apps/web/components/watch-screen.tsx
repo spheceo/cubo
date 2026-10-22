@@ -380,6 +380,9 @@ export function WatchScreen({
   /** Core's view of the session as the latest buffering began; a stall
    *  report describes the stall, not the moment after it cleared. */
   const bufferingStatusRef = useRef<Promise<PlaybackSessionStatus | null> | null>(null);
+  /** The session `recoverSession` is already handling: the player's error
+   *  and a stalled heartbeat can both report the same failure. */
+  const recoveringRef = useRef<string | null>(null);
   const activeInfoHashRef = useRef<string | null>(null);
   const lastDurationRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
@@ -1503,18 +1506,30 @@ export function WatchScreen({
   // the video plays moves on to the next ranked source at the same
   // position. Measured throughput (never seeder counts) decides, and only
   // while an untried source remains.
+  //
+  // While the viewer waits it also asks whether Core has given up on the
+  // source: Core fails a session after two minutes without data, but
+  // hls.js keeps retrying its segment and never tells the page (The
+  // Outsider S01E02, 2026-10-22: eight minutes on a dead session). A
+  // failed session recovers like a player error.
   async function checkStarved(session: { connection: LocalEngineConnection; id: string }) {
     const since = bufferingSinceRef.current;
     const stalls = stallsRef.current;
-    if (!stalledTooLong(stalls, performance.now())) return;
-    if (!activeAutoRef.current) return;
+    const tooLong = stalledTooLong(stalls, performance.now());
+    if (since == null && !tooLong) return;
+    const sessionStatus = await getSession(session.connection, session.id).catch(() => null);
+    if (sessionRef.current?.id !== session.id) return;
+    if (sessionStatus?.phase === 'failed') {
+      void recoverSession(session);
+      return;
+    }
+    if (!tooLong || !activeAutoRef.current) return;
     const alternative = sources.some(
       (stream) => streamKey(stream) !== activeKey && !failedSourcesRef.current.has(stream.infoHash),
     );
     if (!alternative) return;
-    const sessionStatus = await getSession(session.connection, session.id).catch(() => null);
     const torrent = sessionStatus?.torrent;
-    if (!torrent || torrent.finished || sessionRef.current?.id !== session.id) return;
+    if (!torrent || torrent.finished) return;
     const duration = sessionStatus?.durationSeconds || lastDurationRef.current;
     const fileBytes = activeSourceRef.current?.sizeBytes || torrent.totalBytes;
     if (!duration || !fileBytes) return;
@@ -1546,6 +1561,8 @@ export function WatchScreen({
     session: { connection: LocalEngineConnection; id: string },
     failure?: PlayerFailure,
   ) {
+    if (recoveringRef.current === session.id) return;
+    recoveringRef.current = session.id;
     const attempt = attemptRef.current;
     let sessionStatus: PlaybackSessionStatus | null = null;
     let gone = false;

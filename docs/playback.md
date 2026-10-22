@@ -87,6 +87,12 @@ without a strong reason and maintainer approval.
   second ready ahead fails over anyway (`stuckAtPlayhead`). A swarm can
   download elsewhere in the file while the playhead's pieces never come;
   that used to wait out Core's 55 s segment timeout first.
+- Core fails a session after two minutes without data (`stalled`), but
+  hls.js keeps retrying the segment against the dead session and never
+  tells the page. So while the overlay is up, every heartbeat also reads
+  the session, and a `failed` phase recovers as a player error would:
+  the source is forgotten and the next one plays from the same position,
+  whether or not it was picked by hand.
 - UPnP discovery failing with `No route to host (os error 65)` every
   minute usually means macOS is blocking multicast — Local Network
   access off for Cubo (System Settings → Privacy & Security → Local
