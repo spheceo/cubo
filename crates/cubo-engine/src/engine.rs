@@ -262,6 +262,7 @@ pub async fn start(download_dir: PathBuf) -> Result<u16, String> {
             tokio::spawn(async move {
                 cache_maintenance_loop(maintenance_state).await;
             });
+            tokio::spawn(runtime_watchdog());
 
             tracing::info!(
                 target: "engine",
@@ -1536,6 +1537,23 @@ fn wipe_dir_contents(dir: &std::path::Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Logs when Core's async workers fall behind: a one-second timer firing
+/// late means something blocked them, and every request, session and
+/// torrent waits with it. On 2026-11-04 a session took 24 s to reuse a
+/// torrent rqbit already had while the web app's library read took 8 s,
+/// and nothing in the log said why.
+async fn runtime_watchdog() {
+    const TICK: Duration = Duration::from_secs(1);
+    loop {
+        let started = std::time::Instant::now();
+        tokio::time::sleep(TICK).await;
+        let late = started.elapsed().saturating_sub(TICK);
+        if late >= Duration::from_secs(1) {
+            tracing::warn!(target: "engine", late_ms = late.as_millis() as u64, "async runtime stalled");
+        }
+    }
 }
 
 async fn cache_maintenance_loop(state: BridgeState) {

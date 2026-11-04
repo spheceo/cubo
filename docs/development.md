@@ -69,6 +69,12 @@ Reading a stall:
   says why it closed (`no heartbeat`, `page closed`, `source deleted`, …).
   Core also logs whether a source was deleted by the viewer or by cache
   eviction.
+- `session source resolved` carries `lookup_ms` (find or add the
+  torrent), `select_ms` (file selection, unpause) and `record_ms` (cache
+  index write). A reused torrent resolves in milliseconds; a slow step
+  says where it waited.
+- `async runtime stalled` (`late_ms`) means Core's async workers were
+  blocked: every request, session and torrent waited with them.
 
 To reproduce without touching the
 real cache, run a dev Core with `HOME` pointed at a scratch directory (it

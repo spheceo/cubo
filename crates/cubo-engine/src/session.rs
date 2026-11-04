@@ -1181,6 +1181,7 @@ impl SessionManager {
         title: Option<String>,
         log_id: &str,
     ) -> Result<Source, Failure> {
+        let started = Instant::now();
         let download_dir = self.download_dir.read().await.clone();
         let options = AddTorrentOptions {
             overwrite: true,
@@ -1227,6 +1228,8 @@ impl SessionManager {
         };
         let info_hash = handle.info_hash().as_string();
         self.save_metadata(&info_hash, &handle);
+        // Per-step timings: a reused torrent should resolve in milliseconds.
+        let lookup_ms = started.elapsed().as_millis() as u64;
 
         let file_index = match request.file_index {
             Some(index) => Some(index),
@@ -1254,6 +1257,7 @@ impl SessionManager {
             }
         }
 
+        let select_ms = started.elapsed().as_millis() as u64 - lookup_ms;
         let absolute = handle.output_folder().join(&relative);
         if let Err(error) = self
             .store
@@ -1281,6 +1285,9 @@ impl SessionManager {
             file = %file_name,
             file_bytes = file_len,
             reused = existing,
+            lookup_ms,
+            select_ms,
+            record_ms = started.elapsed().as_millis() as u64 - lookup_ms - select_ms,
             "session source resolved"
         );
         Ok(Source {
