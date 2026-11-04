@@ -68,7 +68,15 @@ without a strong reason and maintainer approval.
   header-only.
 - A closed session pauses its torrent only after a grace period with no
   live session on it: recovery and audio switches open a replacement on
-  the same torrent, and an immediate pause drops every peer.
+  the same torrent, and an immediate pause drops every peer. A session
+  still resolving counts as live on the torrent its magnet names, and so
+  does a prefetch still warming it. Play on a title page closes the
+  preview, and the preview's delayed pause used to land while the full
+  player's session was still resolving the same torrent: every peer
+  dropped and startup took 80 s (It Happened One Night, 2026-11-04).
+- A prefetch whose file is the one a session plays (the title page warmed
+  what Play opened) does nothing more: no opening warm-up, which would
+  only read the same file over a second stream on a slow swarm.
 
 ## Swarm
 

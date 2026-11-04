@@ -17,6 +17,7 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::storage::filesystem::FilesystemStorageFactory;
 use librqbit::storage::StorageFactoryExt;
 use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent};
+use librqbit_core::hash_id::Id20;
 use librqbit_core::magnet::Magnet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -193,6 +194,11 @@ pub struct PlaybackSession {
     title: Option<String>,
     resume_seconds: f64,
     created: Instant,
+    /// The torrent and file the request names, known before resolving: a
+    /// session still resolving already wants that torrent, so neither a
+    /// closing session's delayed pause nor maintenance may stop it.
+    requested_hash: Option<Id20>,
+    requested_file: Option<usize>,
     inner: Mutex<Inner>,
     startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -290,6 +296,27 @@ impl PlaybackSession {
 
     pub fn torrent_id(&self) -> Option<usize> {
         self.update(|inner| inner.source.as_ref().map(|source| source.torrent_id))
+    }
+
+    /// The torrent this session plays, or, while it is still resolving,
+    /// the one its magnet names.
+    fn wanted_info_hash(&self) -> Option<String> {
+        self.info_hash()
+            .or_else(|| self.requested_hash.map(|hash| hash.as_string()))
+    }
+
+    /// Whether this live session plays (or is about to play) the file.
+    fn wants_file(&self, info_hash: &str, file_index: usize) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        self.update(|inner| match inner.source.as_ref() {
+            Some(source) => source.info_hash == info_hash && source.file_index == file_index,
+            None => {
+                self.requested_hash.map(|hash| hash.as_string()).as_deref() == Some(info_hash)
+                    && self.requested_file == Some(file_index)
+            }
+        })
     }
 
     pub fn mode(&self) -> Option<Mode> {
@@ -469,11 +496,12 @@ impl SessionManager {
             .unwrap()
             .values()
             .filter(|session| session.update(|inner| !matches!(inner.phase, Phase::Closed)))
-            .filter_map(|session| session.info_hash())
+            .filter_map(|session| session.wanted_info_hash())
             .collect()
     }
 
-    /// Info hashes of every session still playing or starting. Cache
+    /// Info hashes of every session still playing or starting, including
+    /// sessions still resolving the torrent their magnet names. Cache
     /// maintenance never pauses these.
     pub fn live_info_hashes(&self) -> HashSet<String> {
         self.sessions
@@ -481,22 +509,37 @@ impl SessionManager {
             .unwrap()
             .values()
             .filter(|session| session.is_live())
-            .filter_map(|session| session.info_hash())
+            .filter_map(|session| session.wanted_info_hash())
             .collect()
     }
 
     /// rqbit torrent ids (as the HTTP API spells them) of live sessions and
-    /// prefetches still warming up.
+    /// prefetches still warming up. A session still resolving a torrent
+    /// rqbit already manages counts too: pausing it there drops every peer
+    /// just before the session needs them.
     pub fn live_torrent_ids(&self) -> HashSet<String> {
-        let mut ids: HashSet<String> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|session| session.is_live())
-            .filter_map(|session| session.torrent_id())
-            .map(|id| id.to_string())
-            .collect();
+        let (mut ids, requested): (HashSet<usize>, Vec<Id20>) = {
+            let sessions = self.sessions.lock().unwrap();
+            let mut ids = HashSet::new();
+            let mut requested = Vec::new();
+            for session in sessions.values().filter(|session| session.is_live()) {
+                match (session.torrent_id(), session.requested_hash) {
+                    (Some(id), _) => {
+                        ids.insert(id);
+                    }
+                    (None, Some(hash)) => requested.push(hash),
+                    (None, None) => {}
+                }
+            }
+            (ids, requested)
+        };
+        ids.extend(
+            requested
+                .into_iter()
+                .filter_map(|hash| self.rqbit.get(TorrentIdOrHash::Hash(hash)))
+                .map(|handle| handle.id()),
+        );
+        let mut ids: HashSet<String> = ids.into_iter().map(|id| id.to_string()).collect();
         ids.extend(
             self.prefetching
                 .lock()
@@ -506,6 +549,23 @@ impl SessionManager {
                 .map(|id| id.to_string()),
         );
         ids
+    }
+
+    fn is_prefetching(&self, torrent_id: usize) -> bool {
+        self.prefetching
+            .lock()
+            .unwrap()
+            .values()
+            .any(|id| *id == Some(torrent_id))
+    }
+
+    /// Whether a live session plays (or is resolving to play) this file.
+    fn file_wanted(&self, info_hash: &str, file_index: usize) -> bool {
+        let sessions: Vec<Arc<PlaybackSession>> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        sessions
+            .iter()
+            .any(|session| session.wants_file(info_hash, file_index))
     }
 
     /// Torrents a prefetch warmed and parked. Maintenance keeps them paused
@@ -588,6 +648,10 @@ impl SessionManager {
             title: request.title.clone(),
             resume_seconds: request.resume_seconds.unwrap_or(0.0).max(0.0),
             created: Instant::now(),
+            requested_hash: Magnet::parse(&request.magnet)
+                .ok()
+                .and_then(|magnet| magnet.as_id20()),
+            requested_file: request.file_index,
             inner: Mutex::new(Inner {
                 phase: Phase::Resolving,
                 failure: None,
@@ -657,12 +721,16 @@ impl SessionManager {
         // once nothing is playing. Pausing drops every peer, and the client
         // replaces a session on the same source when it recovers from a
         // player error or switches audio, so wait to see whether one
-        // follows before pausing.
+        // follows before pausing. A follower still resolving counts (a
+        // title page preview closes when Play opens the full player on the
+        // same torrent), and so does a prefetch still warming it.
         if let Some(source) = source {
             let manager = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(PAUSE_GRACE).await;
-                if manager.live_info_hashes().contains(&source.info_hash) {
+                if manager.live_info_hashes().contains(&source.info_hash)
+                    || manager.is_prefetching(source.torrent_id)
+                {
                     return;
                 }
                 if !served {
@@ -1251,7 +1319,12 @@ impl SessionManager {
             match result {
                 Ok((source, duration)) => {
                     let playing = manager.live_info_hashes().contains(&source.info_hash);
-                    if playing {
+                    if manager.file_wanted(&source.info_hash, source.file_index) {
+                        // The prefetched file is the one being played (the
+                        // title page warmed what Play then opened). Its
+                        // session drives the download; a second stream over
+                        // the opening only splits a slow swarm.
+                    } else if playing {
                         manager.warm_opening(&source, duration).await;
                         manager.deselect_prefetched(&source).await;
                     } else {
@@ -1294,15 +1367,7 @@ impl SessionManager {
     /// instead. Its header pieces stay on disk, and a session for it
     /// selects it again.
     async fn deselect_prefetched(&self, source: &Source) {
-        let played = self.sessions.lock().unwrap().values().any(|session| {
-            session.is_live()
-                && session.update(|inner| {
-                    inner.source.as_ref().is_some_and(|playing| {
-                        playing.info_hash == source.info_hash && playing.file_index == source.file_index
-                    })
-                })
-        });
-        if played {
+        if self.file_wanted(&source.info_hash, source.file_index) {
             return;
         }
         let selected: HashSet<usize> = match source.handle.only_files() {
@@ -1687,5 +1752,43 @@ mod tests {
         let (plan, origin) = plan_for(Some(&index), 110.0);
         assert_eq!(origin, 10.0);
         assert_eq!(plan.start(1), 6.0);
+    }
+
+    /// Play on a title page closes its preview, and the preview's delayed
+    /// pause fired while the full player's session on the same torrent was
+    /// still resolving: every peer dropped and startup took 80 s
+    /// (It Happened One Night, 2026-11-04). A resolving session already
+    /// wants the torrent its magnet names.
+    #[tokio::test]
+    async fn a_resolving_session_keeps_its_torrent_live() {
+        let root = std::env::temp_dir().join(format!("cubo-resolving-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = CoreStore::load(root.join("state.json")).await.unwrap();
+        let manager = SessionManager::for_tests(&root, Arc::new(TranscodeManager::new()), store).await;
+        let hash = "dd6623eaab97e1a784ea43095a922057a89e7439";
+        // The current-thread test runtime does not run the startup task
+        // until this test yields, so the session is still resolving below.
+        let session = manager.create(CreateSessionRequest {
+            magnet: format!("magnet:?xt=urn:btih:{hash}"),
+            media_key: Some("movie:3078:-:-".into()),
+            title: None,
+            file_index: Some(0),
+            resume_seconds: None,
+            hevc: false,
+            audio_language: None,
+            transcode_video: false,
+            peers: Vec::new(),
+        });
+        assert!(session.is_live());
+        assert!(session.info_hash().is_none());
+        assert!(manager.live_info_hashes().contains(hash));
+        assert!(manager.open_info_hashes().contains(hash));
+        assert!(manager.file_wanted(hash, 0));
+        assert!(!manager.file_wanted(hash, 1));
+
+        manager.close(&session.id, "test").await;
+        assert!(!manager.live_info_hashes().contains(hash));
+        assert!(!manager.file_wanted(hash, 0));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
