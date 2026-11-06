@@ -135,6 +135,13 @@ Interlaced sources always re-encode, deinterlaced. Re-encodes use `-force_key_fr
 no B-frames, so segments keep the plan. Restarting such a file unchanged
 only loops; never treat it as healthy.
 
+The re-encode bitrate follows the source file's own average (size ÷
+duration), kept between half and all of a ceiling for its height (8 Mbps
+at 1080p). Don't go back to the fixed ceiling: a ~5 Mbps 1080i HDTV
+capture became an 8 Mbps stream, which filled a 10 Mbps link to a viewer
+on another device, and the player stalled at every segment of a fully
+downloaded file (2026-11-06).
+
 Re-encoding is far faster than real time on an idle machine but falls
 behind when the encoder is shared (another app exporting video). The file
 is then on disk while segments arrive late, so the grey bar runs ahead of

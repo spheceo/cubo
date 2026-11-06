@@ -76,16 +76,29 @@ pub struct VideoTranscode {
     pub deinterlace: bool,
     /// Source height, to size the bitrate.
     pub height: Option<u32>,
+    /// The source file's average bitrate (size / duration), audio included.
+    pub source_bits_per_second: Option<u64>,
 }
 
 impl VideoTranscode {
-    fn bitrate(&self) -> &'static str {
-        match self.height.unwrap_or(1080) {
-            height if height > 1080 => "16M",
-            height if height > 720 => "8M",
-            height if height > 480 => "5M",
-            _ => "3M",
-        }
+    /// Target video bitrate in bits per second. Follows the source's own
+    /// bitrate, within a range for its height: a fixed 8 Mbps at 1080p
+    /// turned a 5 Mbps HDTV capture into a stream that filled a 10 Mbps
+    /// link to another device, and the player stalled at every segment
+    /// (The Celebrity Traitors over Tailscale, 2026-11-06).
+    fn bits_per_second(&self) -> u64 {
+        let ceiling: u64 = match self.height.unwrap_or(1080) {
+            height if height > 1080 => 16_000_000,
+            height if height > 720 => 8_000_000,
+            height if height > 480 => 5_000_000,
+            _ => 3_000_000,
+        };
+        let floor = ceiling / 2;
+        self.source_bits_per_second.map_or(ceiling, |source| source.clamp(floor, ceiling))
+    }
+
+    fn bitrate(&self) -> String {
+        format!("{}k", self.bits_per_second() / 1000)
     }
 
     fn args(&self) -> Vec<String> {
@@ -100,14 +113,16 @@ impl VideoTranscode {
             // The hardware encoder runs several times faster than real
             // time on any Apple Silicon Mac; allow_sw covers Macs without it.
             args.extend(
-                ["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-profile:v", "high", "-b:v", self.bitrate()]
+                ["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-profile:v", "high", "-b:v"]
                     .map(String::from),
             );
+            args.push(self.bitrate());
         } else {
             args.extend(
-                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-maxrate", self.bitrate(), "-bufsize", "16M"]
-                    .map(String::from),
+                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-maxrate"].map(String::from),
             );
+            args.push(self.bitrate());
+            args.extend(["-bufsize", "16M"].map(String::from));
         }
         // Keyframes only where the source has them (the plan's boundaries);
         // ffmpeg's default GOP of 12 would cut a fragment every few frames.
@@ -706,6 +721,19 @@ mod tests {
     use crate::mkv_index::{read_index, SliceSource};
     use crate::test_support::{ffmpeg, fixture_mkv, fragment_times, FixtureSpec};
 
+    #[test]
+    fn re_encode_bitrate_follows_the_source_within_its_height_range() {
+        let at = |height, source| {
+            VideoTranscode { deinterlace: true, height: Some(height), source_bits_per_second: source }.bits_per_second()
+        };
+        // A 2.69 GB, 77.5 min 1080i HDTV capture (~5 Mbps) stays near 5 Mbps.
+        assert_eq!(at(1080, Some(4_965_000)), 4_965_000);
+        assert_eq!(at(1080, Some(40_000_000)), 8_000_000);
+        assert_eq!(at(1080, Some(1_000_000)), 4_000_000);
+        assert_eq!(at(2160, None), 16_000_000);
+        assert_eq!(at(576, Some(3_000_000)), 3_000_000);
+    }
+
     async fn remuxer_for(spec: FixtureSpec) -> Option<Arc<Remuxer>> {
         remuxer_with(spec, None).await
     }
@@ -801,7 +829,7 @@ mod tests {
             (FixtureSpec::default(), false),
             (FixtureSpec { hevc: true, keyframe_every: 5.3, ..FixtureSpec::default() }, true),
         ] {
-            let transcode = VideoTranscode { deinterlace, height: Some(240) };
+            let transcode = VideoTranscode { deinterlace, height: Some(240), source_bits_per_second: None };
             let Some(remuxer) = remuxer_with(spec, Some(transcode)).await else {
                 eprintln!("skipping: ffmpeg or fixture unavailable");
                 return;

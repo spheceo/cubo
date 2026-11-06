@@ -971,6 +971,8 @@ impl SessionManager {
                         transcode: video_transcode.then(|| VideoTranscode {
                             deinterlace: probe.interlaced,
                             height: probe.video_height,
+                            source_bits_per_second: (duration > 0.0)
+                                .then(|| (source.file_len as f64 * 8.0 / duration) as u64),
                         }),
                         origin,
                     },
