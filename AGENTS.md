@@ -27,6 +27,7 @@ you are touching before changing it.
 | [storage.md](docs/storage.md) | Cache deletion and eviction, rqbit quirks |
 | [security.md](docs/security.md) | Tokens, pairing, CORS, proxy allowlists, ffmpeg pinning |
 | [releases.md](docs/releases.md) | Release ritual, ffmpeg sidecars, CLI targets |
+| [cubo-player.md](docs/cubo-player.md) | Native macOS player: native sessions, byte cache, sidecar decoding, web handoff |
 | [development.md](docs/development.md) | Repo map, `just` recipes, verification, debugging production playback |
 
 ## Commands

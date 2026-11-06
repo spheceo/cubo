@@ -60,3 +60,7 @@ test:
 # CUBO_SOAK_EPISODE_SECONDS, and CUBO_SOAK_BANDWIDTH (see soak_tests.rs).
 soak:
     cargo test -p cubo-engine --release playback_soak -- --ignored --nocapture
+
+# Cubo Player.app (macOS, Apple Silicon) in target/player
+player-app:
+    scripts/player-app.sh

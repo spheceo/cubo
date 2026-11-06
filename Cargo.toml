@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cubo-engine",
     "crates/cubo-cli",
+    "crates/cubo-player",
 ]
 
 [workspace.package]

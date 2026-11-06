@@ -36,6 +36,10 @@ without a strong reason and maintainer approval.
    MP4/MKV index. The player draws the contiguous watchable span from the
    playhead, never the browser's constant-bitrate guess for direct MP4.
 
+A `native` session (Cubo Player, see [cubo-player.md](cubo-player.md))
+always plays `Direct`: Core serves the original file and never remuxes or
+re-encodes it; the player decodes on the viewing Mac.
+
 ## Starting a session
 
 - Session starts race sources (`raceSessions` in `watch-screen.tsx`): the

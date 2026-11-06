@@ -44,3 +44,12 @@ token; the loopback check gates only direct :8765 connections.
 6. **ffmpeg sidecars are pinned + checksum-verified**
    (`scripts/fetch-ffmpeg.mjs`): exact upstream build URLs with recorded
    SHA-256 per file. To bump ffmpeg, update URL and hash together.
+7. **Cubo Player links carry the token to the viewer's own Mac.** The web
+   player's "Play in Cubo Player" opens `cubo-player://play?core=…&token=…`,
+   handing the token the page already holds to the app on the same
+   device; it never travels to Core or a third party. The player accepts
+   only `http(s)` Core addresses from a link, and plays from it only what
+   that Core serves. Any app on the Mac can open such a link, so treat the
+   player like any media player that opens URLs: it decodes untrusted files
+   in an ffmpeg subprocess and writes nothing but its own cache
+   (`~/Library/Caches/Cubo Player`, removed on exit).

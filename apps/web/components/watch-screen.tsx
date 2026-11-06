@@ -15,7 +15,8 @@ import {
 } from '@cubo/core';
 import { IoIosArrowBack } from 'react-icons/io';
 import { IoClose } from 'react-icons/io5';
-import { LuGalleryVerticalEnd } from 'react-icons/lu';
+import { LuGalleryVerticalEnd, LuMonitorPlay } from 'react-icons/lu';
+import { canHandOffToCuboPlayer, cuboPlayerLink } from '@/lib/cubo-player';
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -1403,6 +1404,48 @@ export function WatchScreen({
     });
   }, [navigate, backHref, finishPlayback]);
 
+  /** Hands playback to Cubo Player on this Mac: it opens its own native
+   *  session on the same Core (the original file, a large local buffer) at
+   *  the current position and saves progress itself, so the page leaves. */
+  const playInCuboPlayer = useCallback(() => {
+    const connection = playbackConnection.current;
+    const stream = activeSourceRef.current;
+    if (!connection || !stream) return;
+    playerFlushRef.current?.();
+    const link = cuboPlayerLink(connection, {
+      magnet: buildMagnet(stream),
+      fileIndex: stream.fileIdx ?? null,
+      mediaKey: itemKey,
+      title: subtitle ? `${title} · ${subtitle}` : title,
+      startSeconds: lastPositionRef.current,
+      audioLanguage: sessionAudioLanguage(audioTargetRef.current),
+      progress: {
+        key: itemKey,
+        mediaId,
+        mediaType,
+        imdbId,
+        title,
+        subtitle,
+        posterPath,
+        backdropPath,
+        logoPath,
+        season: season ?? null,
+        episode: episode ?? null,
+        progressDeviceId: playheadDeviceId(),
+        watchHref: `/watch/${mediaType}/${mediaId}${season != null && episode != null ? `?season=${season}&episode=${episode}` : ''}`,
+        detailHref: backHref,
+      },
+    });
+    if (playbackConnection.current) {
+      shipClientLog(playbackConnection.current, 'info', 'cubo_player_handoff', {
+        position: Math.round(lastPositionRef.current),
+      });
+    }
+    window.location.href = link;
+    // Let the browser hand the link to macOS before the player unmounts.
+    window.setTimeout(goBack, 400);
+  }, [itemKey, title, subtitle, mediaId, mediaType, imdbId, posterPath, backdropPath, logoPath, season, episode, backHref, goBack]);
+
   // The credits prompt's Next episode: flush this episode's progress first,
   // same as any other way of leaving the player.
   const goToNextEpisode = useCallback(() => {
@@ -1693,12 +1736,20 @@ export function WatchScreen({
         <div className="relative min-h-0 flex-1">
           <VideoPlayer
           fullscreenTargetRef={fullscreenTargetRef}
-          topRightControls={mediaType === 'tv' && season != null && episode != null && seasons?.length ? (
+          topRightControls={(() => {
+            const hasEpisodes = mediaType === 'tv' && season != null && episode != null && Boolean(seasons?.length);
+            const handoff = canHandOffToCuboPlayer(playbackConnection.current) ? (
+              <CuboPlayerButton besideEpisodes={hasEpisodes} onClick={playInCuboPlayer} />
+            ) : null;
+            return hasEpisodes || handoff ? (
+              <>
+                {handoff}
+                {hasEpisodes ? (
             <PlayerEpisodes
               showId={mediaId}
-              seasons={seasons}
-              season={season}
-              episode={episode}
+              seasons={seasons!}
+              season={season!}
+              episode={episode!}
               open={episodesOpen}
               onOpen={() => setEpisodesOpen(true)}
               onClose={() => setEpisodesOpen(false)}
@@ -1707,7 +1758,10 @@ export function WatchScreen({
                 setEpisodesOpen(false);
               }}
             />
-          ) : null}
+                ) : null}
+              </>
+            ) : null;
+          })()}
           menuOpen={episodesOpen}
           src={videoUrl}
           hls={videoIsHls}
@@ -1898,6 +1952,22 @@ function AudioPrompt({
         </button>
       </div>
     </div>
+  );
+}
+
+function CuboPlayerButton({ besideEpisodes, onClick }: { besideEpisodes: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-label="Play in Cubo Player"
+      title="Play in Cubo Player"
+      onClick={onClick}
+      className={`pointer-events-auto absolute top-4 z-20 flex h-10 w-10 cursor-pointer items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-md transition-colors hover:bg-black/80 sm:top-6 ${
+        besideEpisodes ? 'right-16 sm:right-[4.5rem]' : 'right-4 sm:right-6'
+      }`}
+    >
+      <LuMonitorPlay size={20} />
+    </button>
   );
 }
 

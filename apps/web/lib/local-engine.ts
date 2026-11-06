@@ -87,6 +87,9 @@ export interface LocalEngineConnection {
   /** True when Core runs playback sessions (`/v1/sessions`): full-length
    *  playlists and Core-owned playback state. Older Cores lack it. */
   sessions?: boolean;
+  /** True when Core opens `native` sessions for Cubo Player (the original
+   *  file, never remuxed or re-encoded). */
+  nativePlayer?: boolean;
   /** Origin of the Vite/dev UI this Core was started for, when known. */
   webUrl?: string | null;
 }
@@ -194,6 +197,7 @@ async function probeEndpoint(
       sessionToken?: string;
       transcode?: boolean;
       sessions?: boolean;
+      nativePlayer?: boolean;
       pairingRequired?: boolean;
       webUrl?: string | null;
     };
@@ -222,6 +226,7 @@ async function probeEndpoint(
       version: health.version ?? 'unknown',
       transcode: health.transcode === true,
       sessions: health.sessions === true,
+      nativePlayer: health.nativePlayer === true,
       webUrl: typeof health.webUrl === 'string' && health.webUrl ? health.webUrl : null,
     };
   } finally {

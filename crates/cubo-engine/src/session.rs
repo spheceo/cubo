@@ -82,6 +82,11 @@ pub struct CreateSessionRequest {
     /// releases carry frames Apple's hardware decoder rejects mid-stream).
     #[serde(default)]
     pub transcode_video: bool,
+    /// The client is Cubo Player, which demuxes and decodes every format
+    /// itself: always serve the file as it is (`Direct`), never remux or
+    /// re-encode it.
+    #[serde(default)]
+    pub native: bool,
     /// Extra peers to connect to immediately (tests, local seeds).
     #[serde(default)]
     pub peers: Vec<SocketAddr>,
@@ -914,8 +919,10 @@ impl SessionManager {
         session.update(|inner| inner.timeline.probed_ms = Some(probed));
         let probe = probe.with_audio_language(request.audio_language.as_deref());
 
-        let video_transcode = request.transcode_video || probe.interlaced;
-        let mode = if video_transcode {
+        let video_transcode = !request.native && (request.transcode_video || probe.interlaced);
+        let mode = if request.native {
+            Mode::Direct
+        } else if video_transcode {
             Mode::Hls
         } else {
             choose_mode(&probe, &source.file_name, request.hevc)?
@@ -1786,6 +1793,7 @@ mod tests {
             hevc: false,
             audio_language: None,
             transcode_video: false,
+            native: false,
             peers: Vec::new(),
         });
         assert!(session.is_live());

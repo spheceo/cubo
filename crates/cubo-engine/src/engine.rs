@@ -918,6 +918,8 @@ async fn health(
         // Clients use /v1/sessions (full-length playlists, Core-owned
         // playback state) when this is set.
         "sessions": true,
+        // Cubo Player (crates/cubo-player) asks for `native` sessions.
+        "nativePlayer": true,
         "pairingRequired": !is_local_caller,
     });
     if is_local_caller {
