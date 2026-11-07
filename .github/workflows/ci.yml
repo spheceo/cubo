@@ -40,5 +40,6 @@ jobs:
       # and play them through a local swarm (they skip without it).
       - name: Install build dependencies and ffmpeg
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev ffmpeg
+      # Cubo Player is macOS-only for now (CoreAudio, Metal, Apple Events).
       - name: Core tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude cubo-player
